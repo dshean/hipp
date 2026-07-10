@@ -1,6 +1,7 @@
 """
 Copyright (c) 2026 HIPP developers
-Description: Click CLI exposing ``preproc`` and ``batch-preproc`` commands for KH-9 PC preprocessing.
+Description: Click CLI exposing ``preproc``, ``batch-preproc`` and
+    ``flatten-collimation`` commands for KH-9 PC preprocessing.
 """
 
 # mypy: disable-error-code="misc"
@@ -10,6 +11,7 @@ from pathlib import Path
 
 import click
 
+from hipp.kh9pc.collimation_flatten import DEFAULT_BAND_PX, flatten_collimation_band
 from hipp.kh9pc.pipeline import batch_preprocess_kh9pc, preprocess_kh9pc
 
 
@@ -83,4 +85,64 @@ def batch_preproc(
         keep_work=keep_work,
         n_jobs=n_jobs,
         dry_run=dry_run,
+    )
+
+
+@main.command(name="flatten-collimation")
+@click.argument("input_file", type=click.Path(exists=True, dir_okay=False, path_type=Path))
+@click.argument("output_file", type=click.Path(dir_okay=False, path_type=Path))
+@click.option(
+    "--band-px",
+    default=DEFAULT_BAND_PX,
+    show_default=True,
+    help="Rows at each edge examined for the brightness curve",
+)
+@click.option(
+    "--taper-px",
+    default=DEFAULT_TAPER_PX,
+    show_default=True,
+    help="Rows over which the correction fades to zero at the interior end of the band",
+)
+@click.option(
+    "--match-spread",
+    is_flag=True,
+    help="Also restore per-row contrast (gain = nmad_ref/nmad_row, clamped to [1, gain-cap])",
+)
+@click.option("--gain-cap", default=DEFAULT_GAIN_CAP, show_default=True, help="Upper clamp for the match-spread gain")
+@click.option(
+    "--saturation-dn",
+    type=float,
+    default=None,
+    help="Optional: pixels >= this DN -> nodata (clipped highlights). Default: disabled, all pixels preserved",
+)
+@click.option("--overwrite", is_flag=True, help="Overwrite existing output")
+@click.option("-v", "--verbose", count=True, help="Increase verbosity (-v INFO, -vv DEBUG)")
+def flatten_collimation(
+    input_file: Path,
+    output_file: Path,
+    band_px: int,
+    taper_px: int,
+    match_spread: bool,
+    gain_cap: float,
+    saturation_dn: float | None,
+    overwrite: bool,
+    verbose: int,
+) -> None:
+    """Radiometrically flatten the collimation band of a restituted KH-9 PC image.
+
+    Subtracts the per-row median brightness excess of the collimation line and
+    its halo at the top and bottom image edges, preserving the background pixels
+    (ground signal shows through the line). Run this on BOTH images of a
+    same-sensor stereo pair before correlation.
+    """
+    _configure_logging(verbose if verbose else 1)
+    flatten_collimation_band(
+        input_file,
+        output_file,
+        band_px=band_px,
+        taper_px=taper_px,
+        match_spread=match_spread,
+        gain_cap=gain_cap,
+        saturation_dn=saturation_dn,
+        overwrite=overwrite,
     )

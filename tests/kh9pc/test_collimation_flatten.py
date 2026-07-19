@@ -187,3 +187,50 @@ def test_match_spread_restores_contrast(tmp_path: Path) -> None:
     for p in (out_plain, out_gain):
         with rasterio.open(p) as ds:
             assert abs(np.median(ds.read(1)[150].astype(float)) - np.median(ds.read(1)[600].astype(float))) <= 4
+
+
+# ---- composite-VRT mode (2026-07-18): band sidecars + passthrough interior ----
+
+def test_vrt_mode_matches_rewrite_and_never_clips(tmp_path):
+    """flatten_collimation_band_vrt: interior passes through byte-identical,
+    band rows match the full-rewrite output (±1 rounding) wherever the rewrite
+    did NOT clip, and pixels the uint8 rewrite CLIPPED at 255 are preserved
+    unclipped in the UInt16 composite (the whole point of the mode)."""
+    from hipp.kh9pc.collimation_flatten import flatten_collimation_band_vrt
+
+    src = tmp_path / "src.tif"
+    _synthetic(src)
+    # bright specks in the dark top margin rows: match_spread gain pushes them
+    # past 255 -> the rewrite clips, the VRT must not
+    with rasterio.open(src, "r+") as ds:
+        a = ds.read(1)
+        a[40:60, ::7] = 250
+        ds.write(a, 1)
+
+    out_rw = tmp_path / "rw.tif"
+    flatten_collimation_band(src, out_rw, band_px=400, match_spread=True)
+    out_vrt = tmp_path / "comp.vrt"
+    flatten_collimation_band_vrt(src, out_vrt, band_px=400, match_spread=True)
+
+    with rasterio.open(src) as d:
+        orig = d.read(1).astype(np.int64)
+    with rasterio.open(out_rw) as d:
+        rw = d.read(1).astype(np.int64)
+    with rasterio.open(out_vrt) as d:
+        assert d.dtypes[0] == "uint16"
+        assert (d.width, d.height) == (W, H)
+        v = d.read(1).astype(np.int64)
+
+    interior = slice(400, H - 400)
+    assert np.array_equal(v[interior], orig[interior]), "interior must pass through untouched"
+
+    band_rows = np.r_[0:400, H - 400 : H]
+    vb, rb = v[band_rows], rw[band_rows]
+    ok = rb < 255
+    assert np.abs(vb[ok] - rb[ok]).max() <= 1, "band values must match rewrite within rounding"
+    preserved = (rb == 255) & (vb > 255)
+    assert preserved.sum() > 0, "uint8-clipped pixels must be preserved >255 in the VRT"
+    assert v.max() < 65535, "no new ceiling saturation"
+    # sidecars exist and are small
+    assert (tmp_path / "comp_flatband_top.tif").exists()
+    assert (tmp_path / "comp_flatband_bot.tif").exists()

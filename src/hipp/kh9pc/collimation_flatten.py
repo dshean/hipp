@@ -197,6 +197,224 @@ def flatten_collimation_band(
     if output_path.exists() and not overwrite:
         raise FileExistsError(f"{output_path} exists (use overwrite=True)")
 
+    return _flatten_impl(
+        input_path, output_path, band_px, taper_px, match_spread, gain_cap,
+        saturation_dn, nodata,
+    )
+
+
+def _flatten_band_windowed(
+    band: NDArray[np.floating],
+    nodata: float,
+    dtype_max: float,
+    side: str,
+    taper_px: int = DEFAULT_TAPER_PX,
+    match_spread: bool = False,
+    gain_cap: float = DEFAULT_GAIN_CAP,
+    window_px: int = 8000,
+    min_valid: int = 200,
+) -> tuple[NDArray[np.floating], EdgeFlattenStats]:
+    """Moving-window flavor of :func:`_flatten_band` (David 2026-07-19).
+
+    The full-row-median model assumes edge rows are radiometrically
+    homogeneous artifact (film margin / collimation line). Iceland-class
+    strips violate this: edge rows contain REAL heterogeneous scene (dark
+    ocean + bright ice), and a row-wide shift+gain computed from an
+    ocean-dominated median blows local bright ice up to ~4x (measured
+    +545 DN on D3C1216-200533A022; the old uint8 clip disguised it as
+    saturation). Here the reference level, per-row median and NMAD are
+    computed in overlapping column windows (half-``window_px`` step) and
+    linearly interpolated along the row, so the correction tracks the
+    LOCAL artifact while preserving local scene radiometry.
+    """
+    n_rows, n_cols = band.shape
+    win = max(int(window_px), 4 * min_valid)
+    step = max(win // 2, 1)
+    centers = np.arange(step // 2, n_cols, step)
+    n_win = len(centers)
+    m = np.full((n_rows, n_win), np.nan)
+    nm = np.full((n_rows, n_win), np.nan)
+    valid = band != nodata
+    for k, c in enumerate(centers):
+        x0, x1 = max(0, int(c) - win // 2), min(n_cols, int(c) + win // 2)
+        sub = band[:, x0:x1]
+        vsub = valid[:, x0:x1]
+        for r in range(n_rows):
+            rv = sub[r][vsub[r]]
+            if rv.size >= min_valid:
+                m[r, k] = np.median(rv)
+                nm[r, k] = 1.4826 * np.median(np.abs(rv - m[r, k]))
+    ref = np.nanmedian(m[-_REF_PX:, :], axis=0)          # per-window reference
+    nmad_ref = np.nanmedian(nm[-_REF_PX:, :], axis=0)
+    shift = np.nan_to_num(ref[None, :] - m, nan=0.0)      # (n_rows, n_win)
+    gain = np.ones((n_rows, n_win))
+    if match_spread:
+        with np.errstate(divide="ignore", invalid="ignore"):
+            gain = np.clip(np.nan_to_num(nmad_ref[None, :] / nm, nan=1.0,
+                                         posinf=gain_cap), 1.0, gain_cap)
+    taper = np.ones(n_rows)
+    if taper_px > 0:
+        ramp = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, taper_px)))
+        taper[n_rows - taper_px:] = ramp
+    xs = np.arange(n_cols, dtype=np.float64)
+    out = band.copy()
+    pivot_row = np.empty(n_cols)
+    for r in range(n_rows):
+        sh = shift[r] * taper[r]
+        gn = 1.0 + (gain[r] - 1.0) * taper[r]
+        if not (np.any(sh != 0) or np.any(gn != 1.0)):
+            continue
+        sh_x = np.interp(xs, centers, sh)
+        gn_x = np.interp(xs, centers, gn)
+        np.copyto(pivot_row, np.interp(xs, centers, np.nan_to_num(m[r], nan=0.0)))
+        rowv = valid[r]
+        corrected = ((band[r][rowv] - pivot_row[rowv]) * gn_x[rowv]
+                     + pivot_row[rowv] + sh_x[rowv])
+        out[r][rowv] = np.clip(corrected, nodata + 1, dtype_max)
+    stats = EdgeFlattenStats(
+        side=side,
+        reference_dn=float(np.nanmedian(ref)),
+        max_excess_dn=float(-np.nanmin(shift * taper[:, None])),
+        max_deficit_dn=float(np.nanmax(shift * taper[:, None])),
+        rows_darkened=int((np.nanmin(shift, axis=1) < 0).sum()),
+        rows_brightened=int((np.nanmax(shift, axis=1) > 0).sum()),
+        max_gain=float(np.nanmax(gain)),
+        saturated_px=0,
+    )
+    return out, stats
+
+
+def flatten_collimation_band_vrt(
+    input_path: str | Path,
+    output_vrt_path: str | Path,
+    band_px: int = DEFAULT_BAND_PX,
+    taper_px: int = DEFAULT_TAPER_PX,
+    match_spread: bool = False,
+    gain_cap: float = DEFAULT_GAIN_CAP,
+    nodata: float = 0.0,
+    overwrite: bool = False,
+    window_px: int | None = None,
+) -> list[EdgeFlattenStats]:
+    """Composite-VRT flavor of :func:`flatten_collimation_band` (2026-07-18).
+
+    Instead of rewriting the full multi-GB image, materialize ONLY the two
+    corrected edge bands as small UInt16 sidecar TIFFs and emit a composite
+    VRT that stacks [top band file | interior window of the ORIGINAL image |
+    bottom band file]. ~50x less I/O than the full rewrite, the original is
+    never touched, and every GDAL reader (incl. ASP's bundled GDAL — plain
+    SimpleSource, no pixel functions) sees a seamless flattened image.
+
+    Radiometric contract (David 2026-07-18): the flatten must introduce NO
+    saturation. The full-rewrite flavor clips corrected band values at the
+    input dtype ceiling (255 for Byte scans) — measured to inflate the
+    saturated-pixel population 5x-15,000x on KH-9 PC missions 1214/1216.
+    Here the bands are written UInt16 with the correction UNclipped (values
+    may legitimately exceed 255 where ``match_spread`` restores contrast;
+    ceiling 65535 is unreachable for 8-bit sources with gain_cap<=4), and the
+    interior passes through byte-identical (SimpleSource type promotion).
+
+    Outputs (next to ``output_vrt_path``, stem-derived):
+        <stem>_flatband_top.tif / <stem>_flatband_bot.tif   (UInt16, LZW)
+        <stem>.vrt                                          (the composite)
+
+    ``saturation_dn`` is deliberately not offered here: original saturated
+    pixels remain data, exactly as in the source.
+    """
+    input_path = Path(input_path)
+    output_vrt_path = Path(output_vrt_path)
+    if output_vrt_path.exists() and not overwrite:
+        raise FileExistsError(f"{output_vrt_path} exists (use overwrite=True)")
+    stem = output_vrt_path.stem
+    top_path = output_vrt_path.parent / f"{stem}_flatband_top.tif"
+    bot_path = output_vrt_path.parent / f"{stem}_flatband_bot.tif"
+    for p in (top_path, bot_path):
+        if p.exists() and not overwrite:
+            raise FileExistsError(f"{p} exists (use overwrite=True)")
+
+    out_dtype = np.uint16
+    out_max = float(np.iinfo(out_dtype).max)
+    with rasterio.open(input_path) as src:
+        height, width = src.height, src.width
+        if 2 * band_px >= height:
+            raise ValueError(f"image height {height} too small for band_px {band_px}")
+
+        top_raw = src.read(1, window=Window(0, 0, width, band_px)).astype(np.float64)
+        bot_raw = src.read(1, window=Window(0, height - band_px, width, band_px)).astype(np.float64)
+        # out_max = UInt16 ceiling: the [nodata+1, out_max] clip in _flatten_band
+        # becomes a no-op for 8-bit sources (max corrected ~255*gain_cap+shift
+        # << 65535) — i.e. NO saturation is introduced.
+        if window_px is not None:
+            top, top_stats = _flatten_band_windowed(
+                top_raw, nodata, out_max, "top", taper_px, match_spread,
+                gain_cap, window_px)
+            bot_flip, bot_stats = _flatten_band_windowed(
+                bot_raw[::-1], nodata, out_max, "bottom", taper_px,
+                match_spread, gain_cap, window_px)
+        else:
+            top, top_stats = _flatten_band(
+                top_raw, None, nodata, out_max, "top", taper_px, match_spread, gain_cap
+            )
+            bot_flip, bot_stats = _flatten_band(
+                bot_raw[::-1], None, nodata, out_max, "bottom", taper_px, match_spread, gain_cap
+            )
+        bot = bot_flip[::-1]
+        for s in (top_stats, bot_stats):
+            logger.info(
+                "%s: %s edge ref=%.0f DN, removed up to %.0f DN over %d rows, added up to %.0f DN "
+                "over %d rows, max contrast gain %.1fx (VRT mode: unclipped UInt16 bands)",
+                input_path.name, s.side, s.reference_dn, s.max_excess_dn,
+                s.rows_darkened, s.max_deficit_dn, s.rows_brightened, s.max_gain,
+            )
+
+        band_profile = {
+            "driver": "GTiff", "width": width, "height": band_px, "count": 1,
+            "dtype": "uint16", "compress": "lzw", "tiled": True,
+            "blockxsize": 256, "blockysize": 256, "BIGTIFF": "IF_SAFER",
+        }
+        with rasterio.open(top_path, "w", **band_profile) as dst:
+            dst.write(np.rint(top).astype(out_dtype), 1)
+        with rasterio.open(bot_path, "w", **band_profile) as dst:
+            dst.write(np.rint(bot).astype(out_dtype), 1)
+
+    # ---- composite VRT: top band | interior passthrough | bottom band ----
+    import os
+    vdir = str(output_vrt_path.parent)
+    rel_src = os.path.relpath(str(input_path), vdir)
+    interior_h = height - 2 * band_px
+
+    def _simple_source(fname: str, src_yoff: int, src_h: int, dst_yoff: int) -> str:
+        return (
+            "    <SimpleSource>\n"
+            f'      <SourceFilename relativeToVRT="1">{fname}</SourceFilename>\n'
+            "      <SourceBand>1</SourceBand>\n"
+            f'      <SrcRect xOff="0" yOff="{src_yoff}" xSize="{width}" ySize="{src_h}"/>\n'
+            f'      <DstRect xOff="0" yOff="{dst_yoff}" xSize="{width}" ySize="{src_h}"/>\n'
+            "    </SimpleSource>\n"
+        )
+
+    vrt_xml = (
+        f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">\n'
+        '  <VRTRasterBand dataType="UInt16" band="1">\n'
+        + _simple_source(top_path.name, 0, band_px, 0)
+        + _simple_source(rel_src, band_px, interior_h, band_px)
+        + _simple_source(bot_path.name, 0, band_px, height - band_px)
+        + "  </VRTRasterBand>\n</VRTDataset>\n"
+    )
+    output_vrt_path.write_text(vrt_xml)
+    return [top_stats, bot_stats]
+
+
+def _flatten_impl(
+    input_path: Path,
+    output_path: Path,
+    band_px: int,
+    taper_px: int,
+    match_spread: bool,
+    gain_cap: float,
+    saturation_dn: float | None,
+    nodata: float,
+) -> list[EdgeFlattenStats]:
+
     with rasterio.open(input_path) as src:
         height, width = src.height, src.width
         if 2 * band_px >= height:

@@ -425,11 +425,14 @@ def remap_tif_blockwise(
                 grid_x_local = tf_xgrid - src_x0
                 grid_y_local = tf_ygrid - src_y0
 
-                # Remap
+                # Remap. Defensive float32/contiguous cast: cv2.remap asserts
+                # CV_32FC1 maps, and upstream dtype promotion can yield
+                # float64 on some blocks (hit on the WA merge-only
+                # restitution test 2026-07-19, cv2 4.10 / skimage 0.25 env).
                 remapped_block = cv2.remap(
-                    src_block,
-                    grid_x_local,
-                    grid_y_local,
+                    np.ascontiguousarray(src_block),
+                    np.ascontiguousarray(grid_x_local, dtype=np.float32),
+                    np.ascontiguousarray(grid_y_local, dtype=np.float32),
                     interpolation=interpolation,
                     borderMode=cv2.BORDER_CONSTANT,
                     borderValue=0,

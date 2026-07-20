@@ -234,3 +234,34 @@ def test_vrt_mode_matches_rewrite_and_never_clips(tmp_path):
     # sidecars exist and are small
     assert (tmp_path / "comp_flatband_top.tif").exists()
     assert (tmp_path / "comp_flatband_bot.tif").exists()
+
+
+def test_vrt_mode_dark_margin_mask(tmp_path):
+    """mask_dark_margin: a TILTED black film margin (per-column height, the
+    WA merge-only signature) is zeroed per column in the edge bands, content
+    is untouched, and the composite VRT carries NoDataValue 0."""
+    from hipp.kh9pc.collimation_flatten import flatten_collimation_band_vrt
+
+    src = tmp_path / "src.tif"
+    _synthetic(src)
+    with rasterio.open(src, "r+") as ds:
+        a = ds.read(1)
+        # tilted margin: black (DN 3) depth ramps 20 -> 120 px across width
+        for c in range(a.shape[1]):
+            d = 20 + int(100 * c / a.shape[1])
+            a[:d, c] = 3
+            a[-d:, c] = 3
+        ds.write(a, 1)
+
+    out_vrt = tmp_path / "comp.vrt"
+    flatten_collimation_band_vrt(src, out_vrt, band_px=400, match_spread=True,
+                                 window_px=256, mask_dark_margin=True)
+    with rasterio.open(out_vrt) as d:
+        assert d.nodata == 0
+        v = d.read(1)
+    W = v.shape[1]
+    for c in (0, W // 2, W - 1):
+        depth = 20 + int(100 * c / W)
+        assert (v[:depth, c] == 0).all(), f"col {c}: margin not zeroed"
+        assert (v[-depth:, c] == 0).all(), f"col {c}: bottom margin not zeroed"
+        assert (v[depth + 30:400, c] > 0).all(), f"col {c}: content zeroed"

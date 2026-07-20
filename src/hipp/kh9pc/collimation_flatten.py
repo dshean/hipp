@@ -284,6 +284,34 @@ def _flatten_band_windowed(
     return out, stats
 
 
+def _mask_dark_margin(
+    band: NDArray[np.floating],
+    raw: NDArray[np.floating],
+    dark_thresh: float = 20.0,
+    min_run: int = 25,
+) -> int:
+    """Zero the per-column dark film margin of an edge band, IN PLACE.
+
+    ``band``/``raw`` are oriented physical-edge-at-row-0 (the bottom band is
+    passed flipped). Per column, the content start = first row where a
+    sustained ``min_run``-row run of raw >= ``dark_thresh`` begins; every
+    pixel edge-side of it is set 0. Columns with no such run (margin deeper
+    than the band, or all-dark) are zeroed entirely. Returns px zeroed.
+    """
+    ok = raw >= dark_thresh
+    n_rows, n_cols = ok.shape
+    if min_run > n_rows:
+        min_run = n_rows
+    csum = np.cumsum(ok, axis=0)
+    runsum = csum[min_run - 1:] - np.vstack(
+        [np.zeros((1, n_cols), dtype=csum.dtype), csum[:-min_run]])
+    full = runsum >= min_run          # row i => rows [i, i+min_run) all ok
+    start = np.where(full.any(axis=0), full.argmax(axis=0), n_rows)
+    mask = np.arange(n_rows)[:, None] < start[None, :]
+    band[mask] = 0.0
+    return int(mask.sum())
+
+
 def flatten_collimation_band_vrt(
     input_path: str | Path,
     output_vrt_path: str | Path,
@@ -294,6 +322,9 @@ def flatten_collimation_band_vrt(
     nodata: float = 0.0,
     overwrite: bool = False,
     window_px: int | None = None,
+    mask_dark_margin: bool = False,
+    dark_thresh: float = 20.0,
+    dark_min_run: int = 25,
 ) -> list[EdgeFlattenStats]:
     """Composite-VRT flavor of :func:`flatten_collimation_band` (2026-07-18).
 
@@ -319,6 +350,19 @@ def flatten_collimation_band_vrt(
 
     ``saturation_dn`` is deliberately not offered here: original saturated
     pixels remain data, exactly as in the source.
+
+    ``mask_dark_margin`` (2026-07-19, WA merge-only frames): rigid per-tile
+    placement in ``image_mosaic`` leaves a TILTED/stepped black film margin
+    (height varies per column; docs/wa_residual_crop_analysis_2026-07-19.md
+    in kh9pc_stereo) that no rectangular crop can remove without content
+    loss. When True, each edge band gets a per-column content-start (first
+    sustained ``dark_min_run``-row run of >= ``dark_thresh`` DN scanning
+    inward from the physical edge) and every pixel edge-side of it is set
+    to 0 = nodata in the UInt16 sidecar (the flatten correction never
+    produces 0 — its clip floor is nodata+1 — and the downstream anchor
+    normalization keeps genuine content strictly above 0). The composite
+    VRT band is tagged NoDataValue 0. Choose ``band_px`` >= the deepest
+    margin residual so the mask can reach it.
     """
     input_path = Path(input_path)
     output_vrt_path = Path(output_vrt_path)
@@ -357,6 +401,11 @@ def flatten_collimation_band_vrt(
             bot_flip, bot_stats = _flatten_band(
                 bot_raw[::-1], None, nodata, out_max, "bottom", taper_px, match_spread, gain_cap
             )
+        if mask_dark_margin:
+            n_top = _mask_dark_margin(top, top_raw, dark_thresh, dark_min_run)
+            n_bot = _mask_dark_margin(bot_flip, bot_raw[::-1], dark_thresh, dark_min_run)
+            logger.info("%s: dark-margin mask zeroed %d px (top) / %d px (bottom)",
+                        input_path.name, n_top, n_bot)
         bot = bot_flip[::-1]
         for s in (top_stats, bot_stats):
             logger.info(
@@ -395,6 +444,7 @@ def flatten_collimation_band_vrt(
     vrt_xml = (
         f'<VRTDataset rasterXSize="{width}" rasterYSize="{height}">\n'
         '  <VRTRasterBand dataType="UInt16" band="1">\n'
+        + ('    <NoDataValue>0</NoDataValue>\n' if mask_dark_margin else '')
         + _simple_source(top_path.name, 0, band_px, 0)
         + _simple_source(rel_src, band_px, interior_h, band_px)
         + _simple_source(bot_path.name, 0, band_px, height - band_px)

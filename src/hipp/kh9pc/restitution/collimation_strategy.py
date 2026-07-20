@@ -21,7 +21,7 @@ from skimage.transform import ThinPlateSplineTransform
 from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
-from hipp.kh9pc.restitution.base import fit_ransac_poly
+from hipp.kh9pc.restitution.base import fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
 
@@ -198,7 +198,7 @@ class CollimationStrategy(RestitutionStrategy):
         dst = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_dst, y_bot_dst))))
 
         # inverse source destination (important)
-        deformation = ThinPlateSplineTransform().from_estimate(dst, src)
+        deformation = tps_from_estimate(dst, src)
 
         # ---- CENTERING TO OUTPUT ----
         pad_x = (output_width - detected_width) / 2

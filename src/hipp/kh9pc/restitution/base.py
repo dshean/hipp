@@ -24,6 +24,22 @@ DEFAULT_OUTPUT_HEIGHT: int = 22064
 """Standard output height in pixels for restituted KH-9 PC images (22064 px at nominal scan resolution)."""
 
 
+def tps_from_estimate(src_pts, dst_pts):
+    """skimage-version-agnostic ThinPlateSplineTransform estimation.
+
+    ``from_estimate`` landed after scikit-image 0.25; the older API is
+    ``estimate(src, dst) -> bool`` mutating the instance. hipp must run on
+    both (HECC env carries 0.25.0 — 2026-07-19)."""
+    from skimage.transform import ThinPlateSplineTransform
+
+    if hasattr(ThinPlateSplineTransform, "from_estimate"):
+        return ThinPlateSplineTransform.from_estimate(src_pts, dst_pts)
+    tf = ThinPlateSplineTransform()
+    if not tf.estimate(src_pts, dst_pts):
+        raise RuntimeError("ThinPlateSplineTransform estimation failed")
+    return tf
+
+
 class DetectionError(Exception):
     """Raised when no valid detections are found during fitting."""
 

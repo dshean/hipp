@@ -29,7 +29,7 @@ from hipp.kh9pc.fiducial_patterns import (
     evaluate_pattern,
 )
 from hipp.kh9pc.kh9_image_spec import KH9ImageSpec
-from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, DetectionError, RestitutionStrategy, Transformation
+from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, DetectionError, RestitutionStrategy, Transformation, tps_from_estimate
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
 
 
@@ -383,7 +383,7 @@ class FiducialStrategy(RestitutionStrategy):
         y_center = (dst_pts[:, 1].min() + dst_pts[:, 1].max()) / 2
 
         # map vertical edges from src space to dst space to get a correct x_center
-        forward_tps = ThinPlateSplineTransform().from_estimate(src_pts, dst_pts)
+        forward_tps = tps_from_estimate(src_pts, dst_pts)
         col_left, col_right = self.poly_strategy.vertical_detector.edges_
         edges_dst = forward_tps(np.array([[col_left, y_center], [col_right, y_center]], dtype=np.float32))
         x_center = float((edges_dst[0, 0] + edges_dst[1, 0]) / 2)
@@ -392,7 +392,7 @@ class FiducialStrategy(RestitutionStrategy):
         crop_offset = (int(x_center - final_width / 2), int(y_center - final_height / 2))
 
         # inverse source destination (important)
-        deformation = ThinPlateSplineTransform().from_estimate(dst_pts, src_pts)
+        deformation = tps_from_estimate(dst_pts, src_pts)
 
         # test for the moment without any crop to detect an other time for quality control and qc
         return Transformation(

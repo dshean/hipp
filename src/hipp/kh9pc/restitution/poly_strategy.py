@@ -18,7 +18,8 @@ from skimage.transform import ThinPlateSplineTransform
 from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
-from hipp.kh9pc.restitution.base import detect_ruptures, fit_ransac_poly, tps_from_estimate
+from hipp.kh9pc.redaction_mask import detect_ruptures_skip_redacted, redacted_region_mask
+from hipp.kh9pc.restitution.base import fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.vertical_detector import VerticalDetector
 
@@ -127,10 +128,18 @@ class PolyStrategy(RestitutionStrategy):
         return self
 
     def _process_side(self, sub_image: SubImage, side: str) -> PolyResult:
-        """Sample column-wise ruptures, fit a RANSAC polynomial, and compute the distortion curve."""
+        """Sample column-wise ruptures, fit a RANSAC polynomial, and compute the distortion curve.
+
+        DIGITALLY REDACTED runs (redaction rectangles / hard margin fill —
+        constant near-black DN, unlike noisy dark scanned film) are masked
+        first and the rupture scan skips through them, so the edge cannot
+        snap to a redaction boundary instead of the true film edge."""
+        redacted = redacted_region_mask(sub_image.band)
         res = []
         for i in range(sub_image.band.shape[1]):
-            ruptures = detect_ruptures(sub_image.band[:, i], self.background_threshold, reverse_scan=(side == "top"))
+            ruptures = detect_ruptures_skip_redacted(
+                sub_image.band[:, i], self.background_threshold, redacted[:, i],
+                reverse_scan=(side == "top"))
             if len(ruptures) > 0:
                 res.append((i, ruptures[0]))
 

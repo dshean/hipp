@@ -363,7 +363,13 @@ def remap_tif_blockwise(
         )
         Path(output_path).parent.mkdir(exist_ok=True, parents=True)
 
-        with rasterio.open(output_path, "w", **profile) as dst:
+        # ATOMIC output: the remap writes blockwise, so a crash mid-loop
+        # leaves a valid-looking partial tif at output_path that downstream
+        # exists-checks mistake for a product (two partials shipped on
+        # D3C1210-200323A022 before the sliver fix). Write to a .part name
+        # and rename only on success.
+        part_path = Path(output_path).with_name(Path(output_path).name + ".part.tif")
+        with rasterio.open(part_path, "w", **profile) as dst:
             blocks = [
                 (dst_x0, dst_y0)
                 for dst_x0 in range(0, output_size[0], block_size)
@@ -450,6 +456,7 @@ def remap_tif_blockwise(
                 dst.write(remapped_block, 1, window=dst_window)
 
             pbar.close()
+        part_path.replace(output_path)
 
 
 def match_multiple_templates(

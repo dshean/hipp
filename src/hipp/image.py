@@ -380,15 +380,23 @@ def remap_tif_blockwise(
                 # Full-res grid for this block
                 ygrid, xgrid = np.mgrid[dst_y0:dst_y1, dst_x0:dst_x1]
 
-                if lowres_step is not None and lowres_step > 1:
-                    # subsample
+                # sliver guard: the trailing block can be a few px tall/wide,
+                # leaving < 4 subsampled nodes on an axis — below the bicubic
+                # RectBivariateSpline minimum (dfitpack "Number of columns or
+                # rows must be non-negative"). Exact full-res transform is
+                # cheap for such a block, so fall through to it.
+                use_lowres = lowres_step is not None and lowres_step > 1
+                if use_lowres:
                     y_idx = list(range(0, ygrid.shape[0], lowres_step))
                     x_idx = list(range(0, xgrid.shape[1], lowres_step))
                     if y_idx[-1] != ygrid.shape[0] - 1:
                         y_idx.append(ygrid.shape[0] - 1)
                     if x_idx[-1] != xgrid.shape[1] - 1:
                         x_idx.append(xgrid.shape[1] - 1)
+                    if len(y_idx) < 4 or len(x_idx) < 4:
+                        use_lowres = False
 
+                if use_lowres:
                     ygrid_lr = ygrid[y_idx][:, x_idx]
                     xgrid_lr = xgrid[y_idx][:, x_idx]
 

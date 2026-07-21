@@ -7,6 +7,7 @@ Description: CollimationStrategy — refines the polynomial edge estimate using 
     collimation lines is used to set the output height precisely.
 """
 
+import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
@@ -24,6 +25,8 @@ from hipp.image import SubImage, remap_tif_blockwise
 from hipp.kh9pc.restitution.base import fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -77,6 +80,10 @@ class CollimationStrategy(RestitutionStrategy):
     collimation_line_dist: int = (
         21770  # known physical distance between top/bottom collimation lines at nominal scan resolution
     )
+    separation_tolerance: float = 0.02  # accepted |top-bottom separation - collimation_line_dist| as a fraction
+    # of collimation_line_dist. Real per-frame scan-scale deviation is ~0.3-0.9%
+    # (D3C1217 F004: +0.28% line spacing, +0.9% detected width), so 2% separates
+    # scan-scale variation from a genuinely wrong line lock.
     min_inliers_threshold: float = 0.5
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
@@ -85,10 +92,14 @@ class CollimationStrategy(RestitutionStrategy):
         super().__init__()
         self._results: dict[str, CollimationResult] = {}
         self.__transformation_: Transformation | None = None
+        self._separation_ok: bool = True
 
     @property
     def is_failed(self) -> bool:
-        """True if either collimation line inlier ratio is below ``min_inliers_threshold``."""
+        """True if either line's inlier ratio is below ``min_inliers_threshold`` or the
+        top-bottom separation could not be reconciled with ``collimation_line_dist``."""
+        if not self._separation_ok:
+            return True
         return min(self.top_.inlier_ratio, self.bottom_.inlier_ratio) < self.min_inliers_threshold
 
     @property
@@ -113,7 +124,16 @@ class CollimationStrategy(RestitutionStrategy):
         return self.__transformation_
 
     def _fit(self, raster_filepath: Path) -> Self:
-        """Run PolyStrategy first, then detect collimation peaks in a narrow refinement strip."""
+        """Run PolyStrategy first, then detect collimation peaks in a narrow refinement strip.
+
+        The two detected lines are cross-validated against the known physical
+        separation ``collimation_line_dist``: when they disagree beyond
+        ``separation_tolerance`` (a corrupted edge estimate — e.g. a digital
+        redaction band — parks one search strip away from its line), the bad
+        side is re-detected in a wider window anchored at the OTHER side's line
+        plus/minus the known separation. This is invariant to the mark-train /
+        edge distances, which differ between fore and aft frames.
+        """
         if not self.poly_strategy.is_fitted or raster_filepath != self.poly_strategy.raster_filepath_:
             self.poly_strategy.fit(raster_filepath)
 
@@ -123,7 +143,6 @@ class CollimationStrategy(RestitutionStrategy):
 
         with rasterio.open(raster_filepath) as src:
             window_height = int(src.height * self.refinement_fraction)
-            out_shape = (1, window_height // self.stride, self.grid_shape[0])
 
             top_edge = int(self.poly_strategy.top_.model.predict(np.array([[col_center]])).flat[0])
             bot_edge = int(self.poly_strategy.bottom_.model.predict(np.array([[col_center]])).flat[0])
@@ -134,10 +153,72 @@ class CollimationStrategy(RestitutionStrategy):
                 "top": Window(col_off, top_edge, window_width, window_height),
                 "bottom": Window(col_off, bot_edge - window_height, window_width, window_height),
             }.items():
-                sub_image = SubImage(src, window, out_shape, resampling=Resampling.average)
+                sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
                 self._results[side] = self._process_side(sub_image, side)
 
+            self._validate_separation(src, col_off, window_width, window_height)
+
         return self
+
+    def _out_shape(self, window: Window) -> tuple[int, int, int]:
+        """Decimated read shape for a search window (rows strided, columns gridded)."""
+        return (1, max(int(window.height) // self.stride, 1), self.grid_shape[0])
+
+    def _line_row(self, side: str) -> int:
+        """Median full-raster row of a fitted collimation line across the detected span."""
+        left, right = self.poly_strategy.vertical_detector.edges_
+        x = np.linspace(left, right, self.grid_shape[0])
+        return int(np.median(self._results[side].model.predict(x.reshape(-1, 1))))
+
+    def _validate_separation(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
+        """Cross-check the detected line separation against ``collimation_line_dist``;
+        re-detect the corrupted side anchored on the good side when they disagree."""
+        dist = self.collimation_line_dist
+        tol = self.separation_tolerance * dist
+        sep = self._line_row("bottom") - self._line_row("top")
+        if abs(sep - dist) <= tol:
+            self._separation_ok = True
+            return
+
+        logger.warning(
+            "[CollimationStrategy] line separation %d deviates from expected %d by %+d px "
+            "(tol %.0f) - re-detecting each side anchored on the other",
+            sep, dist, sep - dist, tol,
+        )
+
+        candidates: list[tuple[float, str, CollimationResult, int]] = []
+        for bad, good, sign in (("top", "bottom", -1), ("bottom", "top", +1)):
+            center = self._line_row(good) + sign * dist
+            # Wider (2x) window CENTERED on the expected row: tolerates the
+            # anchor's own scan-scale deviation (~+-3% of raster height covered).
+            row0 = max(center - window_height, 0)
+            row1 = min(center + window_height, src.height)
+            if row1 - row0 < 2 * self.stride:
+                continue
+            window = Window(col_off, row0, window_width, row1 - row0)
+            sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
+            result = self._process_side(sub_image, bad)
+            x = np.linspace(col_off, col_off + window_width, self.grid_shape[0])
+            cand_row = int(np.median(result.model.predict(x.reshape(-1, 1))))
+            cand_sep = (self._line_row(good) - cand_row) if bad == "top" else (cand_row - self._line_row(good))
+            candidates.append((abs(cand_sep - dist), bad, result, cand_sep))
+
+        candidates.sort(key=lambda c: c[0])
+        if candidates and candidates[0][0] <= tol:
+            err, bad, result, cand_sep = candidates[0]
+            logger.info(
+                "[CollimationStrategy] adopted re-detected %s line: separation %d (%+d px from expected)",
+                bad, cand_sep, cand_sep - dist,
+            )
+            self._results[bad] = result
+            self._separation_ok = True
+        else:
+            logger.error(
+                "[CollimationStrategy] separation could not be reconciled with the known "
+                "line distance - marking fit FAILED (best candidate off by %s px)",
+                f"{candidates[0][0]:.0f}" if candidates else "n/a",
+            )
+            self._separation_ok = False
 
     def _process_side(self, sub_image: SubImage, side: str) -> CollimationResult:
         """Detect collimation peaks column-by-column, fit a RANSAC polynomial, and compute the distortion curve."""

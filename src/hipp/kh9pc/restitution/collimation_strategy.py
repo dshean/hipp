@@ -228,14 +228,59 @@ class CollimationStrategy(RestitutionStrategy):
             )
             self._results[bad] = result
             self._separation_ok = True
-        else:
-            logger.error(
-                "[CollimationStrategy] separation could not be reconciled with the known "
-                "line distance - marking fit FAILED (candidates: %s)",
-                "; ".join(f"{c[1]}: {c[0]:.0f} px off, inliers {c[2].inlier_ratio:.2f}"
-                          for c in candidates) or "none",
+            return
+
+        logger.warning(
+            "[CollimationStrategy] anchored re-detects unreconciled (candidates: %s) - "
+            "retrying with wider edge-anchored windows",
+            "; ".join(f"{c[1]}: {c[0]:.0f} px off, inliers {c[2].inlier_ratio:.2f}"
+                      for c in candidates) or "none",
+        )
+        # Ladder rung 3: BOTH lines may sit deeper inside the content than the
+        # primary strips reach (the line-to-edge distance is NOT constant across
+        # missions: D3C1210 1975 frames carry both lines >1 window inside the
+        # edges, unlike D3C1217 1982). Re-run both sides with progressively
+        # wider windows anchored at the poly edges, extending inward; the line
+        # dominates per-column detection (its prominence is ~5x any mark-train /
+        # secondary band), and the separation + inlier gates still decide.
+        top_edge = int(self.poly_strategy.top_.model.predict(
+            np.array([[col_off + window_width // 2]])).flat[0])
+        bot_edge = int(self.poly_strategy.bottom_.model.predict(
+            np.array([[col_off + window_width // 2]])).flat[0])
+        for factor in (2, 4):
+            wh = factor * window_height
+            wide = {}
+            for side, window in {
+                "top": Window(col_off, top_edge, window_width,
+                              min(wh, src.height - top_edge)),
+                "bottom": Window(col_off, max(bot_edge - wh, 0), window_width,
+                                 min(wh, bot_edge)),
+            }.items():
+                sub_image = SubImage(src, window, resampling=Resampling.average,
+                                     out_shape=self._out_shape(window))
+                wide[side] = self._process_side(sub_image, side)
+            x = np.linspace(col_off, col_off + window_width, self.grid_shape[0])
+            rows = {s: int(np.median(r.model.predict(x.reshape(-1, 1))))
+                    for s, r in wide.items()}
+            wide_sep = rows["bottom"] - rows["top"]
+            quality = min(r.inlier_ratio for r in wide.values())
+            logger.info(
+                "[CollimationStrategy] wide-window (%dx) pair: separation %d "
+                "(%+d px from expected), min inliers %.2f",
+                factor, wide_sep, wide_sep - dist, quality,
             )
-            self._separation_ok = False
+            if abs(wide_sep - dist) <= tol and quality >= self.min_inliers_threshold:
+                logger.info(
+                    "[CollimationStrategy] adopted wide-window (%dx) line pair", factor)
+                self._results.update(wide)
+                self._separation_ok = True
+                return
+
+        logger.error(
+            "[CollimationStrategy] separation could not be reconciled with the known "
+            "line distance - marking fit FAILED",
+        )
+        self._separation_ok = False
 
     def _process_side(self, sub_image: SubImage, side: str) -> CollimationResult:
         """Detect collimation peaks column-by-column, fit a RANSAC polynomial, and compute the distortion curve."""

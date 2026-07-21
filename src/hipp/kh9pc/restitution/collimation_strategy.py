@@ -75,7 +75,15 @@ class CollimationStrategy(RestitutionStrategy):
     ransac_max_trials: int = 1000
     grid_shape: tuple[int, int] = (100, 50)
     stride: int = 10
-    refinement_fraction: float = 0.03
+    refinement_fraction: float = 0.10
+    # 0.10 (was 0.03): the line-to-edge inset is NOT constant across missions —
+    # measured D3C1217 (1982): top line ~1150 px inside the edge; D3C1210
+    # (1975): BOTH lines ~1300 px inside with a ~450 px cross-scan slope. The
+    # old 3%-height strip (~740 px) missed those and locked secondary bands;
+    # 10% (~2400-2500 px) covers every measured case with margin, and the
+    # line's ~5x prominence over any mark-train/secondary band keeps the
+    # per-column detection on it (David 2026-07-21: size the window to fit the
+    # line instead of rescuing a too-small window).
     max_width_peak: int = 200
     collimation_line_dist: int = (
         21770  # known physical distance between top/bottom collimation lines at nominal scan resolution
@@ -124,15 +132,17 @@ class CollimationStrategy(RestitutionStrategy):
         return self.__transformation_
 
     def _fit(self, raster_filepath: Path) -> Self:
-        """Run PolyStrategy first, then detect collimation peaks in a narrow refinement strip.
+        """Run PolyStrategy first, then detect collimation peaks in an edge-anchored strip.
 
-        The two detected lines are cross-validated against the known physical
-        separation ``collimation_line_dist``: when they disagree beyond
-        ``separation_tolerance`` (a corrupted edge estimate — e.g. a digital
-        redaction band — parks one search strip away from its line), the bad
-        side is re-detected in a wider window anchored at the OTHER side's line
-        plus/minus the known separation. This is invariant to the mark-train /
-        edge distances, which differ between fore and aft frames.
+        The strip extends ``refinement_fraction`` of the raster height INWARD
+        from each poly edge — sized to cover the full measured range of
+        line-to-edge insets (see the field comment), so a locally-corrupted
+        edge estimate (e.g. a digital redaction band) still leaves the line
+        inside the search strip. The two detected lines are then validated
+        against the known physical separation ``collimation_line_dist``
+        (invariant across fore/aft frames, unlike mark-train/edge distances);
+        an unreconciled separation marks the fit FAILED rather than silently
+        producing a wrong rectification.
         """
         if not self.poly_strategy.is_fitted or raster_filepath != self.poly_strategy.raster_filepath_:
             self.poly_strategy.fit(raster_filepath)
@@ -156,7 +166,7 @@ class CollimationStrategy(RestitutionStrategy):
                 sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
                 self._results[side] = self._process_side(sub_image, side)
 
-            self._validate_separation(src, col_off, window_width, window_height)
+        self._validate_separation()
 
         return self
 
@@ -170,117 +180,31 @@ class CollimationStrategy(RestitutionStrategy):
         x = np.linspace(left, right, self.grid_shape[0])
         return int(np.median(self._results[side].model.predict(x.reshape(-1, 1))))
 
-    def _validate_separation(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
-        """Cross-check the detected line separation against ``collimation_line_dist``;
-        re-detect the corrupted side anchored on the good side when they disagree."""
+    def _validate_separation(self) -> None:
+        """Validate the detected line separation against ``collimation_line_dist``.
+
+        The spacing between the two collimation lines is a printed physical
+        constant; the observed per-frame deviation is only the scan-scale
+        variation (~0.2-0.9% measured across D3C1210/D3C1217). A separation
+        outside ``separation_tolerance`` means at least one detection locked a
+        secondary band, so the fit is marked FAILED (``is_failed``) instead of
+        silently rectifying to a wrong height.
+        """
         dist = self.collimation_line_dist
         tol = self.separation_tolerance * dist
         sep = self._line_row("bottom") - self._line_row("top")
-        if abs(sep - dist) <= tol:
-            self._separation_ok = True
-            return
-
-        logger.warning(
-            "[CollimationStrategy] line separation %d deviates from expected %d by %+d px "
-            "(tol %.0f) - re-detecting each side anchored on the other",
-            sep, dist, sep - dist, tol,
-        )
-
-        candidates: list[tuple[float, str, CollimationResult, int]] = []
-        for bad, good, sign in (("top", "bottom", -1), ("bottom", "top", +1)):
-            center = self._line_row(good) + sign * dist
-            # Wider (2x) window CENTERED on the expected row: tolerates the
-            # anchor's own scan-scale deviation (~+-3% of raster height covered).
-            row0 = max(center - window_height, 0)
-            row1 = min(center + window_height, src.height)
-            if row1 - row0 < 2 * self.stride:
-                continue
-            window = Window(col_off, row0, window_width, row1 - row0)
-            sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
-            result = self._process_side(sub_image, bad)
-            x = np.linspace(col_off, col_off + window_width, self.grid_shape[0])
-            cand_row = int(np.median(result.model.predict(x.reshape(-1, 1))))
-            cand_sep = (self._line_row(good) - cand_row) if bad == "top" else (cand_row - self._line_row(good))
+        self._separation_ok = abs(sep - dist) <= tol
+        if self._separation_ok:
             logger.info(
-                "[CollimationStrategy] candidate re-detect %s (anchor %s): separation %d "
-                "(%+d px from expected), inliers %.2f",
-                bad, good, cand_sep, cand_sep - dist, result.inlier_ratio,
+                "[CollimationStrategy] line separation %d vs expected %d (%+d px, tol %.0f) - OK",
+                sep, dist, sep - dist, tol,
             )
-            candidates.append((abs(cand_sep - dist), bad, result, cand_sep))
-
-        # Acceptance needs BOTH separation agreement and a healthy re-detected
-        # fit: a spurious anchor (the corrupted side) can place the re-detect
-        # window over content where RANSAC "finds" a line at almost exactly the
-        # expected distance from the WRONG anchor — separation error alone
-        # scored such a 0.21-inlier lock at +3 px on D3C1217-200742F004 while
-        # the true line (anchored on the good side, +61 px) sat in the other
-        # candidate. Inlier filtering keeps only re-detects that landed on a
-        # real continuous line.
-        ok = [c for c in candidates
-              if c[0] <= tol and c[2].inlier_ratio >= self.min_inliers_threshold]
-        ok.sort(key=lambda c: c[0])
-        if ok:
-            err, bad, result, cand_sep = ok[0]
-            logger.info(
-                "[CollimationStrategy] adopted re-detected %s line: separation %d "
-                "(%+d px from expected), inliers %.2f",
-                bad, cand_sep, cand_sep - dist, result.inlier_ratio,
+        else:
+            logger.error(
+                "[CollimationStrategy] line separation %d deviates from expected %d "
+                "by %+d px (tol %.0f) - marking fit FAILED",
+                sep, dist, sep - dist, tol,
             )
-            self._results[bad] = result
-            self._separation_ok = True
-            return
-
-        logger.warning(
-            "[CollimationStrategy] anchored re-detects unreconciled (candidates: %s) - "
-            "retrying with wider edge-anchored windows",
-            "; ".join(f"{c[1]}: {c[0]:.0f} px off, inliers {c[2].inlier_ratio:.2f}"
-                      for c in candidates) or "none",
-        )
-        # Ladder rung 3: BOTH lines may sit deeper inside the content than the
-        # primary strips reach (the line-to-edge distance is NOT constant across
-        # missions: D3C1210 1975 frames carry both lines >1 window inside the
-        # edges, unlike D3C1217 1982). Re-run both sides with progressively
-        # wider windows anchored at the poly edges, extending inward; the line
-        # dominates per-column detection (its prominence is ~5x any mark-train /
-        # secondary band), and the separation + inlier gates still decide.
-        top_edge = int(self.poly_strategy.top_.model.predict(
-            np.array([[col_off + window_width // 2]])).flat[0])
-        bot_edge = int(self.poly_strategy.bottom_.model.predict(
-            np.array([[col_off + window_width // 2]])).flat[0])
-        for factor in (2, 4):
-            wh = factor * window_height
-            wide = {}
-            for side, window in {
-                "top": Window(col_off, top_edge, window_width,
-                              min(wh, src.height - top_edge)),
-                "bottom": Window(col_off, max(bot_edge - wh, 0), window_width,
-                                 min(wh, bot_edge)),
-            }.items():
-                sub_image = SubImage(src, window, resampling=Resampling.average,
-                                     out_shape=self._out_shape(window))
-                wide[side] = self._process_side(sub_image, side)
-            x = np.linspace(col_off, col_off + window_width, self.grid_shape[0])
-            rows = {s: int(np.median(r.model.predict(x.reshape(-1, 1))))
-                    for s, r in wide.items()}
-            wide_sep = rows["bottom"] - rows["top"]
-            quality = min(r.inlier_ratio for r in wide.values())
-            logger.info(
-                "[CollimationStrategy] wide-window (%dx) pair: separation %d "
-                "(%+d px from expected), min inliers %.2f",
-                factor, wide_sep, wide_sep - dist, quality,
-            )
-            if abs(wide_sep - dist) <= tol and quality >= self.min_inliers_threshold:
-                logger.info(
-                    "[CollimationStrategy] adopted wide-window (%dx) line pair", factor)
-                self._results.update(wide)
-                self._separation_ok = True
-                return
-
-        logger.error(
-            "[CollimationStrategy] separation could not be reconciled with the known "
-            "line distance - marking fit FAILED",
-        )
-        self._separation_ok = False
 
     def _process_side(self, sub_image: SubImage, side: str) -> CollimationResult:
         """Detect collimation peaks column-by-column, fit a RANSAC polynomial, and compute the distortion curve."""

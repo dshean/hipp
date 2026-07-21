@@ -16,9 +16,10 @@ from numpy.typing import NDArray
 
 def redacted_region_mask(
     band: NDArray[np.number],
-    max_dn: float = 6.0,
+    max_dn: float = 8.0,
     max_range: float = 2.0,
     min_run: int = 3,
+    dilate: int = 2,
 ) -> NDArray[np.bool_]:
     """Boolean mask of DIGITALLY REDACTED samples in a (rows, cols) search band.
 
@@ -43,7 +44,12 @@ def redacted_region_mask(
                 continue
             seg = band[r0:r1, col]
             if float(seg.max()) - float(seg.min()) <= max_range:
-                mask[r0:r1, col] = True
+                # dilate along the column: the transition pixel at a
+                # redaction boundary has an intermediate DN (not part of
+                # the uniform run), and an undilated mask leaves it as a
+                # false threshold crossing exactly at the boundary —
+                # observed on 1982 F004's top edge after the first fix.
+                mask[max(r0 - dilate, 0):min(r1 + dilate, band.shape[0]), col] = True
     return mask
 
 

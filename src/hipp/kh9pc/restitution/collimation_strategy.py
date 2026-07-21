@@ -201,22 +201,39 @@ class CollimationStrategy(RestitutionStrategy):
             x = np.linspace(col_off, col_off + window_width, self.grid_shape[0])
             cand_row = int(np.median(result.model.predict(x.reshape(-1, 1))))
             cand_sep = (self._line_row(good) - cand_row) if bad == "top" else (cand_row - self._line_row(good))
+            logger.info(
+                "[CollimationStrategy] candidate re-detect %s (anchor %s): separation %d "
+                "(%+d px from expected), inliers %.2f",
+                bad, good, cand_sep, cand_sep - dist, result.inlier_ratio,
+            )
             candidates.append((abs(cand_sep - dist), bad, result, cand_sep))
 
-        candidates.sort(key=lambda c: c[0])
-        if candidates and candidates[0][0] <= tol:
-            err, bad, result, cand_sep = candidates[0]
+        # Acceptance needs BOTH separation agreement and a healthy re-detected
+        # fit: a spurious anchor (the corrupted side) can place the re-detect
+        # window over content where RANSAC "finds" a line at almost exactly the
+        # expected distance from the WRONG anchor — separation error alone
+        # scored such a 0.21-inlier lock at +3 px on D3C1217-200742F004 while
+        # the true line (anchored on the good side, +61 px) sat in the other
+        # candidate. Inlier filtering keeps only re-detects that landed on a
+        # real continuous line.
+        ok = [c for c in candidates
+              if c[0] <= tol and c[2].inlier_ratio >= self.min_inliers_threshold]
+        ok.sort(key=lambda c: c[0])
+        if ok:
+            err, bad, result, cand_sep = ok[0]
             logger.info(
-                "[CollimationStrategy] adopted re-detected %s line: separation %d (%+d px from expected)",
-                bad, cand_sep, cand_sep - dist,
+                "[CollimationStrategy] adopted re-detected %s line: separation %d "
+                "(%+d px from expected), inliers %.2f",
+                bad, cand_sep, cand_sep - dist, result.inlier_ratio,
             )
             self._results[bad] = result
             self._separation_ok = True
         else:
             logger.error(
                 "[CollimationStrategy] separation could not be reconciled with the known "
-                "line distance - marking fit FAILED (best candidate off by %s px)",
-                f"{candidates[0][0]:.0f}" if candidates else "n/a",
+                "line distance - marking fit FAILED (candidates: %s)",
+                "; ".join(f"{c[1]}: {c[0]:.0f} px off, inliers {c[2].inlier_ratio:.2f}"
+                          for c in candidates) or "none",
             )
             self._separation_ok = False
 

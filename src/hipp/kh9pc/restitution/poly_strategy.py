@@ -134,7 +134,12 @@ class PolyStrategy(RestitutionStrategy):
         constant near-black DN, unlike noisy dark scanned film) are masked
         first and the rupture scan skips through them, so the edge cannot
         snap to a redaction boundary instead of the true film edge."""
-        redacted = redacted_region_mask(sub_image.band)
+        # mask ceiling = the rupture threshold itself: redaction fill at
+        # DN 9-19 defeated the default ceiling while still triggering
+        # ruptures (F004 QC round 2 — fit blended true edge + redaction
+        # boundary). Uniformity (range test) remains the discriminator.
+        redacted = redacted_region_mask(
+            sub_image.band, max_dn=self.background_threshold, dilate=3)
         res = []
         for i in range(sub_image.band.shape[1]):
             ruptures = detect_ruptures_skip_redacted(

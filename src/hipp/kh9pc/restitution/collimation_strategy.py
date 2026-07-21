@@ -166,9 +166,58 @@ class CollimationStrategy(RestitutionStrategy):
                 sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
                 self._results[side] = self._process_side(sub_image, side)
 
-        self._validate_separation()
+            self._validate_separation()
+            if self._separation_ok:
+                self._refit_edges_from_lines(src, col_off, window_width, window_height)
 
         return self
+
+    def _refit_edges_from_lines(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
+        """Re-run the exposure-edge detection in windows ANCHORED at the fitted
+        collimation lines, replacing the PolyStrategy edge results.
+
+        The initial PolyStrategy scan searches from the raster boundary inward,
+        so it can lock the film FRAME boundary (D3C1210 A022 top) or a
+        redaction boundary (D3C1217 F004) instead of the exposed-area edge
+        (David 2026-07-21: redo the edge finding at a limited window from the
+        collimation line; do not trust poly_edges as originally plotted). The
+        exposure edge lies OUTSIDE its line, within `window_height`; the
+        rupture scan runs from the line outward, so the FIRST rupture is the
+        edge nearest the line — the frame boundary further out never wins.
+        The refit REPLACES poly_strategy's results, so the poly_edges QC
+        figure and any downstream consumer see the line-anchored edges."""
+        top_line = self._line_row("top")
+        bot_line = self._line_row("bottom")
+        for side, window in {
+            "top": Window(col_off, max(top_line - window_height, 0),
+                          window_width, min(window_height, top_line)),
+            "bottom": Window(col_off, bot_line, window_width,
+                             min(window_height, src.height - bot_line)),
+        }.items():
+            if window.height < 2 * self.poly_strategy.stride:
+                logger.warning(
+                    "[CollimationStrategy] no room to refit the %s exposure edge "
+                    "(line at raster boundary) - keeping the initial fit", side)
+                continue
+            sub_image = SubImage(src, window, out_shape=(
+                1, max(int(window.height) // self.poly_strategy.stride, 1),
+                self.poly_strategy.grid_shape[0]))
+            try:
+                result = self.poly_strategy._process_side(sub_image, side)
+            except RuntimeError as e:
+                logger.warning(
+                    "[CollimationStrategy] %s exposure-edge refit found no "
+                    "ruptures (%s) - keeping the initial fit", side, e)
+                continue
+            x = np.linspace(col_off, col_off + window_width,
+                            self.poly_strategy.grid_shape[0])
+            old = int(np.median(self.poly_strategy._results[side].model.predict(x.reshape(-1, 1))))
+            new = int(np.median(result.model.predict(x.reshape(-1, 1))))
+            logger.info(
+                "[CollimationStrategy] %s exposure edge refit from its line: "
+                "median row %d -> %d (%+d px), inliers %.2f",
+                side, old, new, new - old, result.inlier_ratio)
+            self.poly_strategy._results[side] = result
 
     def _out_shape(self, window: Window) -> tuple[int, int, int]:
         """Decimated read shape for a search window (rows strided, columns gridded)."""

@@ -44,3 +44,34 @@ def test_rupture_scan_skips_redaction():
 
     skipped = detect_ruptures_skip_redacted(vec, 20, redacted, reverse_scan=True)
     assert skipped[0] == 4, "masked scan must find the true film edge above the redaction"
+
+
+def test_variance_edge_basic_and_redacted():
+    """_variance_edge finds the texture edge nearest the line, both
+    orientations, and is not fooled by a uniform redaction band."""
+    import numpy as np
+    from hipp.kh9pc.restitution.collimation_strategy import _variance_edge
+
+    rng = np.random.default_rng(7)
+    n = 200
+    # bottom-side strip layout: line/content at the START (rows 0..119 noisy),
+    # smooth margin beyond (rows 120.. flat ~60 DN)
+    col = np.concatenate([
+        rng.normal(120, 15, 120),           # scene content
+        np.full(80, 60.0) + rng.normal(0, 0.3, 80),  # unexposed margin
+    ])
+    red = np.zeros(n, dtype=bool)
+    r = _variance_edge(col, red, from_end=False)
+    assert r is not None and 110 <= r <= 135
+
+    # top-side strip: same column REVERSED (line at the END), edge mirrors
+    r2 = _variance_edge(col[::-1], red, from_end=True)
+    assert r2 is not None and n - 135 <= r2 <= n - 110
+
+    # a uniform redaction band INSIDE content must not fake the edge
+    col_red = col.copy()
+    col_red[40:70] = 12.0                   # uniform fill
+    red2 = np.zeros(n, dtype=bool)
+    red2[40:70] = True
+    r3 = _variance_edge(col_red, red2, from_end=False)
+    assert r3 is not None and 110 <= r3 <= 135

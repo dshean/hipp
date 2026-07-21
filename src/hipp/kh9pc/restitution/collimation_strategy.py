@@ -173,49 +173,84 @@ class CollimationStrategy(RestitutionStrategy):
         return self
 
     def _refit_edges_from_lines(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
-        """Re-run the exposure-edge detection in windows ANCHORED at the fitted
+        """Re-detect the EXPOSURE edges in windows ANCHORED at the fitted
         collimation lines, replacing the PolyStrategy edge results.
 
-        The initial PolyStrategy scan searches from the raster boundary inward,
-        so it can lock the film FRAME boundary (D3C1210 A022 top) or a
-        redaction boundary (D3C1217 F004) instead of the exposed-area edge
-        (David 2026-07-21: redo the edge finding at a limited window from the
-        collimation line; do not trust poly_edges as originally plotted). The
-        exposure edge lies OUTSIDE its line, within `window_height`; the
-        rupture scan runs from the line outward, so the FIRST rupture is the
-        edge nearest the line — the frame boundary further out never wins.
-        The refit REPLACES poly_strategy's results, so the poly_edges QC
-        figure and any downstream consumer see the line-anchored edges."""
+        The initial PolyStrategy scan is a DN-threshold rupture search from the
+        raster boundary inward — it fires only on near-black background, and
+        the film margin between the exposed area and the frame is NOT black,
+        so it locks the film FRAME boundary (D3C1210 A022) or a redaction
+        boundary (D3C1217 F004) instead of the exposed-area edge, no matter
+        how the window is placed (verified: a line-anchored threshold scan
+        reproduced the same locks +-3 px). The exposure edge is a TEXTURE
+        transition — scene content is noisy, unexposed margin is smooth (the
+        same variance principle that discriminates redaction fill from film) —
+        so the refit scans each column OUTWARD from the line and takes the
+        first SUSTAINED drop of rolling variance below a fraction of the
+        content variance. Redacted samples are spliced out first (redaction
+        fill is uniform and would fake an edge). RANSAC-fit as usual; the
+        refit REPLACES poly_strategy's results so the poly_edges QC figure and
+        downstream consumers see line-anchored exposure edges (David
+        2026-07-21: redo the edge finding at a limited window from the line;
+        do not trust poly_edges as originally plotted)."""
+        from hipp.kh9pc.redaction_mask import redacted_region_mask
+        from hipp.kh9pc.restitution.base import fit_ransac_poly
+        from hipp.kh9pc.restitution.poly_strategy import PolyResult
+
         top_line = self._line_row("top")
         bot_line = self._line_row("bottom")
+        stride = self.poly_strategy.stride
         for side, window in {
             "top": Window(col_off, max(top_line - window_height, 0),
                           window_width, min(window_height, top_line)),
             "bottom": Window(col_off, bot_line, window_width,
                              min(window_height, src.height - bot_line)),
         }.items():
-            if window.height < 2 * self.poly_strategy.stride:
+            if window.height < 12 * stride:
                 logger.warning(
                     "[CollimationStrategy] no room to refit the %s exposure edge "
                     "(line at raster boundary) - keeping the initial fit", side)
                 continue
             sub_image = SubImage(src, window, out_shape=(
-                1, max(int(window.height) // self.poly_strategy.stride, 1),
+                1, max(int(window.height) // stride, 1),
                 self.poly_strategy.grid_shape[0]))
-            try:
-                result = self.poly_strategy._process_side(sub_image, side)
-            except RuntimeError as e:
+            redacted = redacted_region_mask(
+                sub_image.band, max_dn=self.poly_strategy.background_threshold,
+                dilate=3)
+            res = []
+            for c in range(sub_image.band.shape[1]):
+                r = _variance_edge(sub_image.band[:, c], redacted[:, c],
+                                   from_end=(side == "top"))
+                if r is not None:
+                    res.append((c, r))
+            if len(res) < max(10, sub_image.band.shape[1] // 10):
                 logger.warning(
-                    "[CollimationStrategy] %s exposure-edge refit found no "
-                    "ruptures (%s) - keeping the initial fit", side, e)
+                    "[CollimationStrategy] %s exposure-edge refit: only %d/%d "
+                    "columns yielded a texture edge - keeping the initial fit",
+                    side, len(res), sub_image.band.shape[1])
                 continue
+            ruptures_local = np.array(res)
+            ruptures_global = sub_image.to_global(ruptures_local)
+            model = fit_ransac_poly(
+                ruptures_global[:, 0], ruptures_global[:, 1],
+                degree=self.poly_strategy.polynomial_degree,
+                residual_threshold=self.poly_strategy.ransac_residual_threshold,
+                max_trials=self.poly_strategy.ransac_max_trials)
             x = np.linspace(col_off, col_off + window_width,
                             self.poly_strategy.grid_shape[0])
+            y_pred = model.predict(x.reshape(-1, 1)).ravel()
+            result = PolyResult(
+                ruptures_local=ruptures_local,
+                ruptures_global=ruptures_global.astype(int),
+                distortion=np.column_stack([x, y_pred - y_pred.mean()]),
+                inlier_ratio=float(model.inlier_mask_.mean()),
+                model=model,
+                sub_image=sub_image)
             old = int(np.median(self.poly_strategy._results[side].model.predict(x.reshape(-1, 1))))
-            new = int(np.median(result.model.predict(x.reshape(-1, 1))))
+            new = int(np.median(y_pred))
             logger.info(
-                "[CollimationStrategy] %s exposure edge refit from its line: "
-                "median row %d -> %d (%+d px), inliers %.2f",
+                "[CollimationStrategy] %s exposure edge refit (texture) from its "
+                "line: median row %d -> %d (%+d px), inliers %.2f",
                 side, old, new, new - old, result.inlier_ratio)
             self.poly_strategy._results[side] = result
 
@@ -341,6 +376,57 @@ class CollimationStrategy(RestitutionStrategy):
             block_size=2**13,
             lowres_step=100,
         )
+
+
+def _variance_edge(
+    vec: NDArray[np.number],
+    redacted: NDArray[np.bool_],
+    from_end: bool,
+    win: int = 9,
+    sustain: int = 3,
+    rel_frac: float = 0.2,
+    abs_floor: float = 1.5,
+) -> int | None:
+    """Exposure-edge row of one strip column via rolling-std transition.
+
+    The column runs from the film side to the collimation-line side
+    (``from_end=True`` = line at the END of the vector, i.e. the TOP strip;
+    scan starts at the line end and moves outward). Content near the line is
+    textured; the unexposed margin beyond the exposure edge is smooth. The
+    edge is the FIRST position (scanning outward) where the rolling std stays
+    below ``max(abs_floor, rel_frac * content_std)`` for ``sustain``
+    consecutive windows; content_std is the median rolling std of the third
+    of the column nearest the line. Redacted samples (uniform fill — would
+    fake a smooth margin) are spliced out; the returned index is in ORIGINAL
+    column coordinates, or None when no sustained transition exists (edge
+    outside the window, or an all-content column).
+    """
+    keep = np.flatnonzero(~np.asarray(redacted, dtype=bool))
+    if keep.size < 4 * win:
+        return None
+    v = np.asarray(vec, dtype=float)[keep]
+    if from_end:
+        v = v[::-1]
+    # rolling std via cumulative sums (window `win`, valid positions)
+    c1 = np.cumsum(np.insert(v, 0, 0.0))
+    c2 = np.cumsum(np.insert(v * v, 0, 0.0))
+    n = len(v) - win + 1
+    mean = (c1[win:] - c1[:-win]) / win
+    var = np.maximum((c2[win:] - c2[:-win]) / win - mean * mean, 0.0)
+    std = np.sqrt(var[:n])
+    content_std = float(np.median(std[: max(n // 3, win)]))
+    thresh = max(abs_floor, rel_frac * content_std)
+    below = std < thresh
+    run = 0
+    for i in range(n):
+        run = run + 1 if below[i] else 0
+        if run == sustain:
+            j = i - sustain + 1          # first window of the sustained run
+            idx = j                      # window start = transition row
+            if from_end:
+                idx = len(v) - 1 - idx
+            return int(keep[idx])
+    return None
 
 
 def detect_collimation_peak(x: NDArray[np.number], max_peak_width: int, sigma: int = 2) -> int:

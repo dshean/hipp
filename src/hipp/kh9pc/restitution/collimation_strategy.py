@@ -93,6 +93,28 @@ class CollimationStrategy(RestitutionStrategy):
     # (D3C1217 F004: +0.28% line spacing, +0.9% detected width), so 2% separates
     # scan-scale variation from a genuinely wrong line lock.
     min_inliers_threshold: float = 0.5
+    # Exposure edge = the collimation line + a conservative fixed OUTWARD offset
+    # (David 2026-07-22: "set the edge some distance outward from the
+    # collimation line to remove the black frame; rather cut a few good pixels
+    # in some sections than let redacted or black frame into the cropped
+    # images"). The offset is the measured line->exposure-edge distance: across
+    # the correctly-refit WA fits (D3C1217 F002/F003/A003/A004/A005 top+bottom
+    # and F004 top; D3C1210 F020/F021/A022 top+bottom) the per-column edge sits
+    # 182-377 px OUTWARD of its collimation line (top ~188-210, bottom
+    # 182-377, mission-dependent). ``edge_offset_from_line`` = 180 is at/below
+    # the smallest measured value, so the DERIVED edge (line + offset) always
+    # lands at or INSIDE the true edge -> errs inward. The per-column texture
+    # refit may only REFINE the edge to a transition whose distance OUTWARD from
+    # THAT column's line falls in [edge_band_inner, edge_band_outer]: anything
+    # nearer than 90 px (line halo / secondary band) or farther than 550 px is
+    # rejected. 550 clears the largest measured edge (~380 px) with margin yet
+    # is far short of the nearest margin artifact -- the film-frame boundary
+    # (~955 px from the line) and F004's burned-in USGS logo (~1198 px from the
+    # line, the row-24170 transition that bent the old free RANSAC fit down) --
+    # so no margin artifact can ever enter the fit or bend the edge outward.
+    edge_offset_from_line: int = 180
+    edge_band_inner: int = 90
+    edge_band_outer: int = 550
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 
@@ -188,11 +210,24 @@ class CollimationStrategy(RestitutionStrategy):
         so the refit scans each column OUTWARD from the line and takes the
         first SUSTAINED drop of rolling variance below a fraction of the
         content variance. Redacted samples are spliced out first (redaction
-        fill is uniform and would fake an edge). RANSAC-fit as usual; the
-        refit REPLACES poly_strategy's results so the poly_edges QC figure and
-        downstream consumers see line-anchored exposure edges (David
-        2026-07-21: redo the edge finding at a limited window from the line;
-        do not trust poly_edges as originally plotted)."""
+        fill is uniform and would fake an edge).
+
+        The refit is ANCHORED to the line, not free: the edge is the line model
+        plus a conservative fixed outward offset, and a per-column texture
+        transition may only REFINE it when it lands in a tight band
+        [edge_band_inner, edge_band_outer] px OUTWARD of that column's line
+        (David 2026-07-22). A transition beyond the band -- F004's USGS logo
+        burned into the bottom-left margin sits ~1198 px out and, being bright
+        anti-aliased text, keeps the rolling variance HIGH past the true edge
+        so the first sustained drop lands at the logo's lower rim; at the LEFT
+        end of the span it had full leverage on the old free RANSAC fit and
+        bent the bottom edge down ~1000 px -- is REJECTED. If too few columns
+        survive the band gate (or the fit is low-inlier), the derived
+        line+offset edge stands ON ITS OWN, erring INWARD (cutting a few good
+        pixels) rather than admitting margin. The result REPLACES
+        poly_strategy's DN-threshold edge (which locks the film-FRAME boundary,
+        far outside the exposed area) so the poly_edges QC figure and
+        downstream consumers see the line-anchored exposure edge."""
         from hipp.kh9pc.redaction_mask import redacted_region_mask
         from hipp.kh9pc.restitution.base import fit_ransac_poly
         from hipp.kh9pc.restitution.poly_strategy import PolyResult
@@ -209,6 +244,11 @@ class CollimationStrategy(RestitutionStrategy):
         for side in ("top", "bottom"):
             line_rows = self._results[side].model.predict(
                 x_cols.reshape(-1, 1)).ravel()
+            # Line-anchored DERIVED edge (line + conservative offset OUTWARD): the
+            # authority when the texture refit finds too few in-band columns, and
+            # the band centre the refit refines within. It errs INWARD by
+            # construction (see the edge_offset_from_line comment).
+            derived = self._derived_edge_result(x_cols, line_rows, side, col_off, window_width)
             lmin, lmax = int(line_rows.min()), int(line_rows.max())
             if side == "top":
                 row0 = max(lmin - window_height, 0)
@@ -220,7 +260,8 @@ class CollimationStrategy(RestitutionStrategy):
             if window.height < 12 * stride:
                 logger.warning(
                     "[CollimationStrategy] no room to refit the %s exposure edge "
-                    "(line at raster boundary) - keeping the initial fit", side)
+                    "(line at raster boundary) - using the derived line+offset edge", side)
+                self.poly_strategy._results[side] = derived
                 continue
             sub_image = SubImage(src, window, out_shape=(
                 1, max(int(window.height) // stride, 1),
@@ -229,7 +270,9 @@ class CollimationStrategy(RestitutionStrategy):
                 sub_image.band, max_dn=self.poly_strategy.background_threshold,
                 dilate=3)
             nrows = sub_image.band.shape[0]
+            row_scale = float(sub_image._scale[1])   # full-res px per strided local row
             res = []
+            rejected_band = 0
             for c in range(sub_image.band.shape[1]):
                 # per-column scan start = the line's own row at this column
                 line_local = int(round(sub_image.to_local_y(line_rows[c])))
@@ -246,13 +289,27 @@ class CollimationStrategy(RestitutionStrategy):
                                        red_vec[line_local:], from_end=False)
                     if r is not None:
                         r += line_local
-                if r is not None:
-                    res.append((c, r))
+                if r is None:
+                    continue
+                # BAND GATE (David 2026-07-22): the refit may only refine within a
+                # tight band around the derived edge. Distance OUTWARD from THIS
+                # column's line, in full-res px; reject transitions nearer than
+                # edge_band_inner (line halo / secondary band) or farther than
+                # edge_band_outer (redaction / black frame / F004's ~1198 px logo
+                # rim). Rejected columns simply do not vote — a whole side that
+                # loses its edge falls back to the derived line+offset edge below.
+                dist = (line_local - r if side == "top" else r - line_local) * row_scale
+                if not (self.edge_band_inner <= dist <= self.edge_band_outer):
+                    rejected_band += 1
+                    continue
+                res.append((c, r))
             if len(res) < max(10, sub_image.band.shape[1] // 10):
                 logger.warning(
                     "[CollimationStrategy] %s exposure-edge refit: only %d/%d "
-                    "columns yielded a texture edge - keeping the initial fit",
-                    side, len(res), sub_image.band.shape[1])
+                    "columns in-band (%d rejected out-of-band) - using the "
+                    "derived line+offset edge",
+                    side, len(res), sub_image.band.shape[1], rejected_band)
+                self.poly_strategy._results[side] = derived
                 continue
             ruptures_local = np.array(res)
             ruptures_global = sub_image.to_global(ruptures_local)
@@ -271,24 +328,64 @@ class CollimationStrategy(RestitutionStrategy):
                 inlier_ratio=float(model.inlier_mask_.mean()),
                 model=model,
                 sub_image=sub_image)
-            old = int(np.median(self.poly_strategy._results[side].model.predict(x.reshape(-1, 1))))
+            derived_med = int(np.median(derived.model.predict(x.reshape(-1, 1))))
             new = int(np.median(y_pred))
-            # Quality gate (adversarial review 2026-07-21): never overwrite the
-            # poly result with a low-inlier refit — the QC figure would show a
-            # garbage edge with no visual signal.
+            # Quality gate (adversarial review 2026-07-21): never install a
+            # low-inlier refit — fall back to the derived line+offset edge, which
+            # is always a clean line-anchored curve.
             if result.inlier_ratio < self.poly_strategy.min_inliers_threshold:
                 logger.warning(
                     "[CollimationStrategy] %s exposure-edge refit REJECTED "
-                    "(inliers %.2f < %.2f) - keeping the initial fit "
-                    "(would have moved median row %d -> %d)",
+                    "(inliers %.2f < %.2f) - using the derived line+offset edge "
+                    "(refit median row would have been %d vs derived %d)",
                     side, result.inlier_ratio,
-                    self.poly_strategy.min_inliers_threshold, old, new)
+                    self.poly_strategy.min_inliers_threshold, new, derived_med)
+                self.poly_strategy._results[side] = derived
                 continue
             logger.info(
-                "[CollimationStrategy] %s exposure edge refit (texture) from its "
-                "line: median row %d -> %d (%+d px), inliers %.2f",
-                side, old, new, new - old, result.inlier_ratio)
+                "[CollimationStrategy] %s exposure edge refit (band-gated texture) "
+                "from its line: median row %d (derived %d, %+d px), inliers %.2f, "
+                "%d/%d columns in-band",
+                side, new, derived_med, new - derived_med, result.inlier_ratio,
+                len(res), sub_image.band.shape[1])
             self.poly_strategy._results[side] = result
+
+    def _derived_edge_result(
+        self,
+        x_cols: NDArray[np.floating],
+        line_rows: NDArray[np.floating],
+        side: str,
+        col_off: int,
+        window_width: int,
+    ) -> "PolyResult":
+        """Exposure-edge PolyResult DERIVED from the collimation line model plus
+        the conservative fixed offset (OUTWARD): edge(col) = line(col) -/+
+        edge_offset_from_line for top/bottom. This is the fallback when the
+        per-column texture refit has too few in-band columns (or is low-inlier);
+        it errs INWARD -- cutting a few good pixels rather than admitting margin
+        artifacts -- and reproduces the line's cross-scan slope. Synthetic
+        ruptures lie exactly on the shifted line, so it fits with inliers=1 and
+        the poly_edges QC figure shows a clean line-anchored edge."""
+        from hipp.kh9pc.restitution.base import fit_ransac_poly
+        from hipp.kh9pc.restitution.poly_strategy import PolyResult
+
+        sign = -1.0 if side == "top" else 1.0   # top edge is OUTWARD = smaller row
+        edge_rows = line_rows + sign * self.edge_offset_from_line
+        model = fit_ransac_poly(
+            x_cols, edge_rows,
+            degree=self.poly_strategy.polynomial_degree,
+            residual_threshold=self.poly_strategy.ransac_residual_threshold,
+            max_trials=self.poly_strategy.ransac_max_trials)
+        x = np.linspace(col_off, col_off + window_width, self.poly_strategy.grid_shape[0])
+        y_pred = model.predict(x.reshape(-1, 1)).ravel()
+        ruptures_global = np.column_stack([x_cols, edge_rows]).astype(int)
+        return PolyResult(
+            ruptures_local=ruptures_global.copy(),
+            ruptures_global=ruptures_global,
+            distortion=np.column_stack([x, y_pred - y_pred.mean()]),
+            inlier_ratio=1.0,
+            model=model,
+            sub_image=self._results[side].sub_image)   # reuse the line strip for QC background
 
     def _out_shape(self, window: Window) -> tuple[int, int, int]:
         """Decimated read shape for a search window (rows strided, columns gridded)."""

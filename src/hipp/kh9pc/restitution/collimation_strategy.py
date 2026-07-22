@@ -202,9 +202,10 @@ class CollimationStrategy(RestitutionStrategy):
         # scan — D3C1210; a median-anchored strip end CUT the line at half the
         # columns and the scan start missed it, David 2026-07-21) plus the
         # full outward reach. Per column, the scan starts at the line MODEL's
-        # predicted row, never at the strip boundary.
-        x_cols = np.linspace(col_off, col_off + window_width,
-                             self.poly_strategy.grid_shape[0])
+        # predicted row, never at the strip boundary. x uses PIXEL-CENTER
+        # convention matching SubImage's resampled-column binning.
+        ncols = self.poly_strategy.grid_shape[0]
+        x_cols = col_off + (np.arange(ncols) + 0.5) * window_width / ncols
         for side in ("top", "bottom"):
             line_rows = self._results[side].model.predict(
                 x_cols.reshape(-1, 1)).ravel()
@@ -272,6 +273,17 @@ class CollimationStrategy(RestitutionStrategy):
                 sub_image=sub_image)
             old = int(np.median(self.poly_strategy._results[side].model.predict(x.reshape(-1, 1))))
             new = int(np.median(y_pred))
+            # Quality gate (adversarial review 2026-07-21): never overwrite the
+            # poly result with a low-inlier refit — the QC figure would show a
+            # garbage edge with no visual signal.
+            if result.inlier_ratio < self.poly_strategy.min_inliers_threshold:
+                logger.warning(
+                    "[CollimationStrategy] %s exposure-edge refit REJECTED "
+                    "(inliers %.2f < %.2f) - keeping the initial fit "
+                    "(would have moved median row %d -> %d)",
+                    side, result.inlier_ratio,
+                    self.poly_strategy.min_inliers_threshold, old, new)
+                continue
             logger.info(
                 "[CollimationStrategy] %s exposure edge refit (texture) from its "
                 "line: median row %d -> %d (%+d px), inliers %.2f",
@@ -407,9 +419,8 @@ def _variance_edge(
     redacted: NDArray[np.bool_],
     from_end: bool,
     win: int = 9,
-    sustain: int = 3,
-    rel_frac: float = 0.2,
-    abs_floor: float = 1.5,
+    sustain: int = 8,
+    contrast_min: float = 2.0,
 ) -> int | None:
     """Exposure-edge row of one strip column via rolling-std transition.
 
@@ -417,16 +428,22 @@ def _variance_edge(
     (``from_end=True`` = line at the END of the vector, i.e. the TOP strip;
     scan starts at the line end and moves outward). Content near the line is
     textured; the unexposed margin beyond the exposure edge is smooth. The
-    edge is the FIRST position (scanning outward) where the rolling std stays
-    below ``max(abs_floor, rel_frac * content_std)`` for ``sustain``
-    consecutive windows; content_std is the median rolling std of the third
-    of the column nearest the line. Redacted samples (uniform fill — would
-    fake a smooth margin) are spliced out; the returned index is in ORIGINAL
-    column coordinates, or None when no sustained transition exists (edge
-    outside the window, or an all-content column).
+    threshold is the GEOMETRIC MEAN of the column's own two reference levels
+    — median rolling std of the line-side third (content) and of the
+    outward-end sixth (deep margin/frame) — and the column is REFUSED
+    (None) when the contrast between them is below ``contrast_min``: an
+    absolute floor misfired on smooth content (ice/ocean/cloud — the
+    strided-average read shrinks content std ~3x, so a fixed 1.5-DN floor
+    sat AT the content level and 3 chance-low windows faked an edge at the
+    line; adversarial review 2026-07-21). ``sustain`` requires ~80 full-res
+    px of continuous smoothness so transient content dips cannot fire. The
+    edge is the FIRST position (scanning outward) with a sustained
+    below-threshold run. Redacted samples (uniform fill — would fake a
+    smooth margin) are spliced out; the returned index is in ORIGINAL
+    column coordinates, or None when no edge is detectable.
     """
     keep = np.flatnonzero(~np.asarray(redacted, dtype=bool))
-    if keep.size < 4 * win:
+    if keep.size < 6 * win:
         return None
     v = np.asarray(vec, dtype=float)[keep]
     if from_end:
@@ -438,8 +455,11 @@ def _variance_edge(
     mean = (c1[win:] - c1[:-win]) / win
     var = np.maximum((c2[win:] - c2[:-win]) / win - mean * mean, 0.0)
     std = np.sqrt(var[:n])
-    content_std = float(np.median(std[: max(n // 3, win)]))
-    thresh = max(abs_floor, rel_frac * content_std)
+    content_lvl = float(np.median(std[: max(n // 3, win)]))
+    outer_lvl = float(np.median(std[-max(n // 6, win):]))
+    if content_lvl <= 0 or content_lvl < contrast_min * max(outer_lvl, 1e-6):
+        return None                      # no content/margin contrast — refuse
+    thresh = float(np.sqrt(content_lvl * max(outer_lvl, 1e-4)))
     below = std < thresh
     run = 0
     for i in range(n):

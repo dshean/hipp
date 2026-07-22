@@ -75,3 +75,28 @@ def test_variance_edge_basic_and_redacted():
     red2[40:70] = True
     r3 = _variance_edge(col_red, red2, from_end=False)
     assert r3 is not None and 110 <= r3 <= 135
+
+
+def test_variance_edge_smooth_content_regression():
+    """Adversarial-review regression (2026-07-21): smooth low-texture content
+    (ice/ocean regime) next to a bright collimation line must NOT fake an
+    edge at the line; a column with no content/margin contrast is refused."""
+    import numpy as np
+    from hipp.kh9pc.restitution.collimation_strategy import _variance_edge
+
+    rng = np.random.default_rng(11)
+    n = 200
+    # bottom-side layout: line spike at scan start, SMOOTH content to row
+    # ~160, then true margin (very smooth)
+    col = np.concatenate([
+        np.full(6, 250.0),                    # collimation line (bright)
+        rng.normal(200, 2.5, 154),            # smooth content
+        np.full(40, 60.0) + rng.normal(0, 0.3, 40),   # margin
+    ])
+    red = np.zeros(n, dtype=bool)
+    r = _variance_edge(col, red, from_end=False)
+    assert r is not None and 145 <= r <= 175, f"premature edge at {r}"
+
+    # no-contrast column (content statistically identical to margin): refuse
+    flat = rng.normal(100, 0.4, n)
+    assert _variance_edge(flat, red, from_end=False) is None

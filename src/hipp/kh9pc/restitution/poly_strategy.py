@@ -18,6 +18,7 @@ from skimage.transform import ThinPlateSplineTransform
 from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
+from hipp.kh9pc.redaction_mask import detect_ruptures_skip_redacted, redacted_region_mask
 from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, detect_content_edges, fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.vertical_detector import VerticalDetector
@@ -127,35 +128,50 @@ class PolyStrategy(RestitutionStrategy):
         return self
 
     def _process_side(self, sub_image: SubImage, side: str) -> PolyResult:
-        """Fit the CONSERVATIVE content-end edge for one side.
+        """Sample column-wise ruptures, fit a RANSAC polynomial, and compute the distortion curve.
 
-        No collimation line anchors this fallback, so each column is scanned
-        from the CONTENT (inner) side of the boundary-anchored window OUTWARD to
-        the frame (``detect_content_edges``): the edge is the last exposed-
-        content row before a sustained featureless run (near-black frame OR flat
-        grey margin), NOT the DN-threshold film-FRAME boundary out in the black
-        margin that the old rupture scan locked. The RANSAC fit is then CLAMPED
-        to the INWARD envelope (``_InwardEnvelopeModel``) so it steps inward at
-        scan-section black-frame boundaries and never crosses past a black block
-        -- the conservative rule holds even without a line (David 2026-07-22:
-        rather crop some valid pixels than include a black rectangle)."""
-        res = detect_content_edges(sub_image.band, side, black_dn=self.background_threshold)
-        if len(res) < max(10, sub_image.band.shape[1] // 10):
-            raise RuntimeError(f"No content edge detected on the {side} edge.")
+        This edge is consumed for STRIP PLACEMENT by ``CollimationStrategy`` (the
+        collimation-line search window is anchored at, and sized from, this edge:
+        the line sits ~1150 px inside the FILM-FRAME boundary this rupture scan
+        locks). It MUST stay byte-identical to keep line detection unchanged; the
+        conservative content-end/inward-envelope edge for the no-line delivery is
+        applied separately in ``_conservative_edge_model`` at transform time
+        (regression 2026-07-22: moving this scan to the content end shifted the
+        top strip ~780 px inward and collapsed line detection).
+
+        DIGITALLY REDACTED runs (redaction rectangles / hard margin fill —
+        constant near-black DN, unlike noisy dark scanned film) are masked
+        first and the rupture scan skips through them, so the edge cannot
+        snap to a redaction boundary instead of the true film edge."""
+        # mask ceiling = the rupture threshold itself: redaction fill at
+        # DN 9-19 defeated the default ceiling while still triggering
+        # ruptures (F004 QC round 2 — fit blended true edge + redaction
+        # boundary). Uniformity (range test) remains the discriminator.
+        redacted = redacted_region_mask(
+            sub_image.band, max_dn=self.background_threshold, dilate=3)
+        res = []
+        for i in range(sub_image.band.shape[1]):
+            ruptures = detect_ruptures_skip_redacted(
+                sub_image.band[:, i], self.background_threshold, redacted[:, i],
+                reverse_scan=(side == "top"))
+            if len(ruptures) > 0:
+                res.append((i, ruptures[0]))
+
+        if not res:
+            raise RuntimeError(f"No rupture detected on the {side} edge.")
 
         ruptures_local = np.array(res)
-        ruptures_global = sub_image.to_global(ruptures_local).astype(int)
+        ruptures_global = sub_image.to_global(ruptures_local)
 
-        poly = fit_ransac_poly(
+        model = fit_ransac_poly(
             ruptures_global[:, 0],
             ruptures_global[:, 1],
             degree=self.polynomial_degree,
             residual_threshold=self.ransac_residual_threshold,
             max_trials=self.ransac_max_trials,
         )
-        model = _InwardEnvelopeModel.from_inliers(poly, ruptures_global, side)
 
-        inlier_ratio = float(poly.inlier_mask_.mean())
+        inlier_ratio = float(model.inlier_mask_.mean())
 
         x_sample = np.linspace(
             sub_image.window.col_off, sub_image.window.col_off + sub_image.window.width, self.grid_shape[0]
@@ -166,12 +182,37 @@ class PolyStrategy(RestitutionStrategy):
 
         return PolyResult(
             ruptures_local=ruptures_local,
-            ruptures_global=ruptures_global,
+            ruptures_global=ruptures_global.astype(int),
             distortion=distortion,
             inlier_ratio=inlier_ratio,
             model=model,
             sub_image=sub_image,
         )
+
+    def _conservative_edge_model(self, side: str):
+        """CONSERVATIVE content-end + inward-envelope edge for the DELIVERED crop
+        of the no-collimation-line fallback (David 2026-07-22: "some images may
+        not have the collimation lines ... rather crop valid pixels than include
+        a black rectangle"). ADDITIVE and delivery-only: the strip-placement
+        edge (``_process_side``'s ``model``) is untouched. Each column of the
+        stored search band is scanned from the content (inner) side outward
+        (``detect_content_edges``): the edge is the content end, NOT the DN-
+        threshold film-frame boundary out in the black margin, and the RANSAC fit
+        is clamped to the inward envelope so it steps inward at scan-section
+        black steps and never crops in a black block. Falls back to the round-1
+        model when too few columns yield a content edge."""
+        result = self._results[side]
+        band = result.sub_image.band
+        edges = detect_content_edges(band, side, black_dn=self.background_threshold)
+        if len(edges) < max(10, band.shape[1] // 10):
+            return result.model
+        ruptures_global = result.sub_image.to_global(np.array(edges)).astype(int)
+        poly = fit_ransac_poly(
+            ruptures_global[:, 0], ruptures_global[:, 1],
+            degree=self.polynomial_degree,
+            residual_threshold=self.ransac_residual_threshold,
+            max_trials=self.ransac_max_trials)
+        return _InwardEnvelopeModel.from_inliers(poly, ruptures_global, side)
 
     def _compute_transformation(self) -> Transformation:
         """Build a TPS Transformation that maps the fitted curved edges to horizontal target lines."""
@@ -181,8 +222,10 @@ class PolyStrategy(RestitutionStrategy):
 
         x = np.linspace(left, right, self.grid_shape[0])
 
-        y_top_src = self.top_.model.predict(x.reshape(-1, 1))
-        y_bot_src = self.bottom_.model.predict(x.reshape(-1, 1))
+        # DELIVERED crop uses the conservative content-end + inward envelope, NOT
+        # the strip-placement frame-boundary edge (David 2026-07-22).
+        y_top_src = self._conservative_edge_model("top").predict(x.reshape(-1, 1))
+        y_bot_src = self._conservative_edge_model("bottom").predict(x.reshape(-1, 1))
 
         top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
         detected_height = bot - top

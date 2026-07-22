@@ -19,7 +19,16 @@ from rasterio.windows import Window
 from hipp.image import SubImage
 from hipp.kh9pc.restitution.base import detect_content_edges
 from hipp.kh9pc.restitution.flat_strategy import FlatStrategy
-from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
+from hipp.kh9pc.restitution.poly_strategy import PolyResult, PolyStrategy
+
+
+def _delivered_model(sub: SubImage, side: str):
+    """The DELIVERY-time conservative edge model for the no-line PolyStrategy
+    fallback (``_conservative_edge_model``), driven only by the search band."""
+    ps = PolyStrategy()
+    z = np.zeros((1, 2), dtype=int)
+    ps._results = {side: PolyResult(z, z, np.zeros((1, 2)), 1.0, None, sub)}
+    return ps._conservative_edge_model(side)
 
 HW, W = 2000, 1200          # a boundary-anchored search window (no collimation line)
 
@@ -55,13 +64,13 @@ def test_poly_bottom_fallback_steps_inward(tmp_path: Path) -> None:
     _bottom_window(src, black_left, black_right)
     with rasterio.open(src) as ds:
         sub = SubImage(ds, Window(0, 0, W, HW), out_shape=(1, HW // 10, 100))
-        res = PolyStrategy()._process_side(sub, "bottom")
+        model = _delivered_model(sub, "bottom")   # DELIVERY edge (not strip placement)
     cols = np.linspace(0, W, 200)
-    edge = res.model.predict(cols.reshape(-1, 1)).ravel()
+    edge = model.predict(cols.reshape(-1, 1)).ravel()
     right, left = edge[cols >= W // 2], edge[cols < W // 2]
     assert right.max() <= black_right + 3, f"right edge admitted black: {right.max()}"
     assert left.max() <= black_left + 3, f"left edge admitted black: {left.max()}"
-    poly = res.model._poly.predict(cols.reshape(-1, 1)).ravel()
+    poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
     assert poly[cols >= W // 2].max() > black_right + 10, "control: unclamped poly would admit black"
 
 
@@ -73,13 +82,13 @@ def test_poly_top_fallback_steps_inward(tmp_path: Path) -> None:
     _top_window(src, content_left, content_right)
     with rasterio.open(src) as ds:
         sub = SubImage(ds, Window(0, 0, W, HW), out_shape=(1, HW // 10, 100))
-        res = PolyStrategy()._process_side(sub, "top")
+        model = _delivered_model(sub, "top")
     cols = np.linspace(0, W, 200)
-    edge = res.model.predict(cols.reshape(-1, 1)).ravel()
+    edge = model.predict(cols.reshape(-1, 1)).ravel()
     right = edge[cols >= W // 2]
     # top crop keeps rows >= edge; to exclude frame the right edge must be >= its content start
     assert right.min() >= content_right - 3, f"top edge admitted frame above content: {right.min()}"
-    poly = res.model._poly.predict(cols.reshape(-1, 1)).ravel()
+    poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
     assert poly[cols >= W // 2].min() < content_right - 10, "control: unclamped poly would admit frame"
 
 

@@ -22,13 +22,13 @@ from hipp.kh9pc.restitution.flat_strategy import FlatStrategy
 from hipp.kh9pc.restitution.poly_strategy import PolyResult, PolyStrategy
 
 
-def _delivered_model(sub: SubImage, side: str):
-    """The DELIVERY-time conservative edge model for the no-line PolyStrategy
-    fallback (``_conservative_edge_model``), driven only by the search band."""
+def _delivered_models(sub: SubImage, side: str):
+    """``(smooth_model, crop_model)`` from the no-line PolyStrategy delivery path
+    (``_content_edge_model``): smooth geometry + conservative crop bound."""
     ps = PolyStrategy()
     z = np.zeros((1, 2), dtype=int)
     ps._results = {side: PolyResult(z, z, np.zeros((1, 2)), 1.0, None, sub)}
-    return ps._conservative_edge_model(side)
+    return ps._content_edge_model(side)
 
 HW, W = 2000, 1200          # a boundary-anchored search window (no collimation line)
 
@@ -56,39 +56,40 @@ def _top_window(path: Path, content_left: int, content_right: int) -> None:
         d.write(img, 1)
 
 
-def test_poly_bottom_fallback_steps_inward(tmp_path: Path) -> None:
-    """No-line PolyStrategy bottom edge: the shallow section's black is never
-    crossed, though a single smooth polynomial would."""
+def test_poly_bottom_fallback_geometry_smooth_crop_conservative(tmp_path: Path) -> None:
+    """No-line PolyStrategy bottom (David r3): geometry model smooth through the
+    section step; the separate crop bound never admits the shallow black."""
     black_left, black_right = 1400, 1300               # right section's frame is shallower
     src = tmp_path / "b.tif"
     _bottom_window(src, black_left, black_right)
     with rasterio.open(src) as ds:
         sub = SubImage(ds, Window(0, 0, W, HW), out_shape=(1, HW // 10, 100))
-        model = _delivered_model(sub, "bottom")   # DELIVERY edge (not strip placement)
+        geom_model, crop_model = _delivered_models(sub, "bottom")
     cols = np.linspace(0, W, 200)
-    edge = model.predict(cols.reshape(-1, 1)).ravel()
-    right, left = edge[cols >= W // 2], edge[cols < W // 2]
-    assert right.max() <= black_right + 3, f"right edge admitted black: {right.max()}"
-    assert left.max() <= black_left + 3, f"left edge admitted black: {left.max()}"
-    poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
-    assert poly[cols >= W // 2].max() > black_right + 10, "control: unclamped poly would admit black"
+    geom = geom_model.predict(cols.reshape(-1, 1)).ravel()
+    crop = crop_model.predict(cols.reshape(-1, 1)).ravel()
+    assert np.abs(np.diff(geom, 2)).max() < 5, "geometry model stepped -> shear"
+    assert geom[cols >= W // 2].max() > black_right + 5, "smooth model averages across the step"
+    assert crop[cols >= W // 2].max() <= black_right + 3, f"crop admitted black: {crop[cols >= W // 2].max()}"
+    assert crop[cols < W // 2].max() <= black_left + 3, f"left crop admitted black: {crop[cols < W // 2].max()}"
 
 
 def test_poly_top_fallback_steps_inward(tmp_path: Path) -> None:
-    """No-line PolyStrategy top edge (mirrored): the delivered edge never sits
-    above (outside) a section's content start, so no frame is admitted."""
+    """No-line PolyStrategy top edge (mirrored): the conservative CROP bound never
+    sits above (outside) a section's content start, so no frame is admitted."""
     content_left, content_right = 600, 700             # right section's content starts deeper
     src = tmp_path / "t.tif"
     _top_window(src, content_left, content_right)
     with rasterio.open(src) as ds:
         sub = SubImage(ds, Window(0, 0, W, HW), out_shape=(1, HW // 10, 100))
-        model = _delivered_model(sub, "top")
+        geom_model, crop_model = _delivered_models(sub, "top")
     cols = np.linspace(0, W, 200)
-    edge = model.predict(cols.reshape(-1, 1)).ravel()
+    assert np.abs(np.diff(geom_model.predict(cols.reshape(-1, 1)).ravel(), 2)).max() < 5, "top geometry stepped"
+    edge = crop_model.predict(cols.reshape(-1, 1)).ravel()
     right = edge[cols >= W // 2]
     # top crop keeps rows >= edge; to exclude frame the right edge must be >= its content start
-    assert right.min() >= content_right - 3, f"top edge admitted frame above content: {right.min()}"
-    poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
+    assert right.min() >= content_right - 3, f"top crop admitted frame above content: {right.min()}"
+    poly = crop_model._poly.predict(cols.reshape(-1, 1)).ravel()
     assert poly[cols >= W // 2].min() < content_right - 10, "control: unclamped poly would admit frame"
 
 

@@ -236,26 +236,27 @@ def _write_stepped_raster(path: Path, black_left: int, black_right: int) -> None
         dst.write(img, 1)
 
 
-def test_stepped_sections_edge_stays_inward(tmp_path: Path) -> None:
-    """Two sections whose black frame starts at different rows: the delivered
-    bottom edge must step INWARD and never cross below (outward of) the shallower
-    section's black start, even though a single smooth polynomial through both
-    would (David 2026-07-22)."""
+def test_stepped_sections_geometry_smooth_crop_conservative(tmp_path: Path) -> None:
+    """Two sections whose black frame starts at different rows (David 2026-07-22
+    round 3): the GEOMETRY model must stay SMOOTH through the step (a step in the
+    edge is shear in the warp), while the separate CONSERVATIVE crop line steps
+    inward and never crosses below the shallower section's black start."""
     black_left, black_right = 2300, 2150          # right section's black is shallower
     src_path = tmp_path / "stepped.tif"
     _write_stepped_raster(src_path, black_left, black_right)
     with rasterio.open(src_path) as src:
         strat = _strategy_with_lines(src)
         strat._refit_edges_from_lines(src, 0, W, 1700)
-        model = strat.poly_strategy._results["bottom"].model
-        cols = np.linspace(0, W, 200)
-        edge = model.predict(cols.reshape(-1, 1)).ravel()
-        right = edge[cols >= W // 2]
-        left = edge[cols < W // 2]
-        # the shallow (right) section must never admit black
-        assert right.max() <= black_right + 3, f"right edge crossed into black: {right.max()}"
-        # the deep (left) section is allowed out to its own (deeper) black
-        assert left.max() <= black_left + 3, f"left edge crossed into black: {left.max()}"
-        # and the envelope actually stepped inward vs the unclamped polynomial
-        poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
-        assert poly[cols >= W // 2].max() > black_right + 10, "control: unclamped poly would admit black"
+        res = strat.poly_strategy._results["bottom"]
+    cols = np.linspace(0, W, 200)
+    geom = res.model.predict(cols.reshape(-1, 1)).ravel()          # feeds the warp
+    crop = res.crop_model.predict(cols.reshape(-1, 1)).ravel()     # valid-pixel bound
+    # GEOMETRY smooth: a degree-2 poly has a tiny second difference everywhere
+    # (no step -> no local vertical-scale discontinuity -> no shear).
+    assert np.abs(np.diff(geom, 2)).max() < 5, "geometry model stepped -> would shear the warp"
+    # the smooth geometry DOES average across the step (that is why a crop/mask,
+    # not the geometry, must enforce conservatism)
+    assert geom[cols >= W // 2].max() > black_right + 5, "smooth model should cross the shallow step"
+    # the CONSERVATIVE crop excludes the shallow section's black in every column
+    assert crop[cols >= W // 2].max() <= black_right + 3, f"crop admitted black: {crop[cols >= W // 2].max()}"
+    assert crop[cols < W // 2].max() <= black_left + 3, f"left crop admitted black: {crop[cols < W // 2].max()}"

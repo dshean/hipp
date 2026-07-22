@@ -128,7 +128,12 @@ def plot_flat_edges(detector: FlatStrategy, margin_fraction: float = 0.03) -> Fi
 
 
 def plot_poly_edges(detector: PolyStrategy) -> Figure:
-    """Subimage thumbnails with RANSAC inliers/outliers and polynomial model for top and bottom edges."""
+    """Subimage thumbnails with RANSAC inliers/outliers, the SMOOTH edge model
+    (blue, the geometry that feeds the warp) and, when present, the conservative
+    inward-envelope CROP line (dashed orange, the valid-pixel boundary). The two
+    are drawn separately so geometry (must be smooth -- a step is shear) and
+    conservatism (steps inward to exclude black frame) can be reviewed apart
+    (David 2026-07-22 round 3)."""
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
 
     for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
@@ -143,9 +148,14 @@ def plot_poly_edges(detector: PolyStrategy) -> Figure:
         ax.scatter(pts[~inlier_mask, 0], pts[~inlier_mask, 1], s=12, c="red", label="outliers")
         ax.scatter(pts[inlier_mask, 0], pts[inlier_mask, 1], s=12, c="green", label="inliers")
 
-        x_global = result.ruptures_global[:, 0].astype(float)
-        y_global_pred = result.model.predict(x_global.reshape(-1, 1))
-        ax.plot(x_global, y_global_pred.ravel(), color="blue", linewidth=1, label="model")
+        order = np.argsort(result.ruptures_global[:, 0].astype(float))
+        x_global = result.ruptures_global[order, 0].astype(float)
+        ax.plot(x_global, result.model.predict(x_global.reshape(-1, 1)).ravel(),
+                color="blue", linewidth=1, label="model (geometry)")
+        crop_model = getattr(result, "crop_model", None)
+        if crop_model is not None:
+            ax.plot(x_global, np.asarray(crop_model.predict(x_global.reshape(-1, 1))).ravel(),
+                    color="darkorange", linewidth=1.2, linestyle="--", label="crop (conservative)")
 
         ax.set_title(f"{side} edge")
         ax.set_xlabel("column (full-res px)")

@@ -40,9 +40,16 @@ class PolyResult:
     inlier_ratio:
         Fraction of rupture points classified as inliers by RANSAC.
     model:
-        Fitted ``RANSACRegressor`` wrapping the polynomial pipeline.
+        Fitted ``RANSACRegressor`` wrapping the polynomial pipeline. This is the
+        SMOOTH edge that may feed a geometric warp -- it must never step.
     sub_image:
         Downsampled strip from which ruptures were extracted (kept for QC).
+    crop_model:
+        Optional conservative INWARD-envelope model (``_InwardEnvelopeModel``)
+        for the valid-pixel CROP/mask only -- it steps inward at scan-section
+        black-frame boundaries so no black frame enters the crop, and is NEVER
+        used for geometry (David 2026-07-22 round 3). ``None`` when there is no
+        separate conservative crop (e.g. the strip-placement edge).
     """
 
     ruptures_local: NDArray[np.integer]
@@ -51,6 +58,7 @@ class PolyResult:
     inlier_ratio: float
     model: RANSACRegressor
     sub_image: SubImage
+    crop_model: object | None = None
 
 
 @dataclass
@@ -189,30 +197,30 @@ class PolyStrategy(RestitutionStrategy):
             sub_image=sub_image,
         )
 
-    def _conservative_edge_model(self, side: str):
-        """CONSERVATIVE content-end + inward-envelope edge for the DELIVERED crop
-        of the no-collimation-line fallback (David 2026-07-22: "some images may
-        not have the collimation lines ... rather crop valid pixels than include
-        a black rectangle"). ADDITIVE and delivery-only: the strip-placement
-        edge (``_process_side``'s ``model``) is untouched. Each column of the
-        stored search band is scanned from the content (inner) side outward
-        (``detect_content_edges``): the edge is the content end, NOT the DN-
-        threshold film-frame boundary out in the black margin, and the RANSAC fit
-        is clamped to the inward envelope so it steps inward at scan-section
-        black steps and never crops in a black block. Falls back to the round-1
-        model when too few columns yield a content edge."""
+    def _content_edge_model(self, side: str) -> tuple[object, object | None]:
+        """``(smooth_model, crop_model)`` for the DELIVERED no-collimation-line
+        output (David r1-3). The SMOOTH poly2 fit to the content-end inliers is
+        the ONLY edge that feeds the warp -- geometry must not step (a step in
+        the edge is a step in local vertical scale = shear). The INWARD-ENVELOPE
+        ``crop_model`` bounds the conservative valid-pixel rectangle and never
+        feeds geometry. Each column of the stored search band is scanned from the
+        content (inner) side outward (``detect_content_edges``): the edge is the
+        content end, NOT the DN-threshold film-frame boundary out in the black
+        margin. Returns ``(round-1 strip-placement model, None)`` when too few
+        columns yield a content edge."""
         result = self._results[side]
         band = result.sub_image.band
         edges = detect_content_edges(band, side, black_dn=self.background_threshold)
         if len(edges) < max(10, band.shape[1] // 10):
-            return result.model
+            return result.model, None
         ruptures_global = result.sub_image.to_global(np.array(edges)).astype(int)
-        poly = fit_ransac_poly(
+        smooth = fit_ransac_poly(
             ruptures_global[:, 0], ruptures_global[:, 1],
             degree=self.polynomial_degree,
             residual_threshold=self.ransac_residual_threshold,
             max_trials=self.ransac_max_trials)
-        return _InwardEnvelopeModel.from_inliers(poly, ruptures_global, side)
+        crop = _InwardEnvelopeModel.from_inliers(smooth, ruptures_global, side)
+        return smooth, crop
 
     def _compute_transformation(self) -> Transformation:
         """Build a TPS Transformation that maps the fitted curved edges to horizontal target lines."""
@@ -222,14 +230,15 @@ class PolyStrategy(RestitutionStrategy):
 
         x = np.linspace(left, right, self.grid_shape[0])
 
-        # DELIVERED crop uses the conservative content-end + inward envelope, NOT
-        # the strip-placement frame-boundary edge (David 2026-07-22).
-        y_top_src = self._conservative_edge_model("top").predict(x.reshape(-1, 1))
-        y_bot_src = self._conservative_edge_model("bottom").predict(x.reshape(-1, 1))
+        # GEOMETRY: the SMOOTH content-edge poly2 -- never the stepped inward
+        # envelope -- so the warp introduces no shear at scan-section steps
+        # (David 2026-07-22 round 3).
+        top_model, top_crop = self._content_edge_model("top")
+        bot_model, bot_crop = self._content_edge_model("bottom")
+        y_top_src = top_model.predict(x.reshape(-1, 1)).ravel()
+        y_bot_src = bot_model.predict(x.reshape(-1, 1)).ravel()
 
         top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
-        detected_height = bot - top
-        output_height = self.output_height or detected_height
 
         y_top_dst = np.full_like(x, top)
         y_bot_dst = np.full_like(x, bot)
@@ -240,11 +249,26 @@ class PolyStrategy(RestitutionStrategy):
         # inverse source destination (important)
         deformation = tps_from_estimate(dst, src)
 
-        # ---- CENTERING TO OUTPUT ----
+        # ---- CONSERVATIVE CROP RECTANGLE (David r3) ----
+        # The output is a plain rectangle (remap_tif_blockwise has no per-pixel
+        # mask), so the valid region is the CLOSEST conservative rectangle: inset
+        # from the smooth edge to the innermost content edge (``crop_model``) so
+        # no scan-section black block enters. In the warped frame the smooth edge
+        # sits at ``top``/``bot``; per-section content deviates by the envelope,
+        # so shrink the crop by that residual. Pixel cost = the section-step
+        # amplitude (a few tens of px). Output height follows the conservative
+        # detected height, not the outward-padded standard, so the pad cannot
+        # re-admit frame.
+        top_inset = int(max(0.0, float(np.max(top_crop.predict(x.reshape(-1, 1)).ravel() - y_top_src)))) if top_crop else 0
+        bot_inset = int(max(0.0, float(np.max(y_bot_src - bot_crop.predict(x.reshape(-1, 1)).ravel())))) if bot_crop else 0
+        crop_top, crop_bot = top + top_inset, bot - bot_inset
+        detected_height = crop_bot - crop_top
+        output_height = min(self.output_height, detected_height) if self.output_height else detected_height
+
         pad_x = (output_width - detected_width) / 2
         pad_y = (output_height - detected_height) / 2
 
-        crop_offset = (int(left - pad_x), int(top - pad_y))
+        crop_offset = (int(left - pad_x), int(crop_top - pad_y))
 
         return Transformation(
             self.raster_filepath_,

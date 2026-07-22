@@ -350,32 +350,33 @@ class CollimationStrategy(RestitutionStrategy):
                     side, inlier_ratio, self.poly_strategy.min_inliers_threshold)
                 self.poly_strategy._results[side] = derived
                 continue
-            # INWARD ENVELOPE (David 2026-07-22): the merged frames are mosaics
-            # of scan sections whose black frame starts at DIFFERENT rows, so a
-            # single smooth curve can pass outside a shallower section's black
-            # start and admit a sliver of frame. Clamp the polynomial per column
-            # to the innermost detected transition (rolling min/max of the RANSAC
-            # inliers, so isolated noisy columns -- already RANSAC outliers -- do
-            # not) so the delivered edge steps INWARD at section boundaries and
-            # never crosses past a black block. Prefer cutting a few good pixels.
-            env_model = _InwardEnvelopeModel.from_inliers(
+            # GEOMETRY vs CROP separation (David 2026-07-22 round 3): the edge
+            # MODEL is the clean SMOOTH poly2 fit to the accepted inliers -- the
+            # only thing that may ever feed a geometric warp, so it must NOT
+            # step (a step in the edge = a step in local vertical scale = shear).
+            # The conservative INWARD ENVELOPE (which steps inward at scan-section
+            # black-frame boundaries so no black frame enters the crop) is a
+            # SEPARATE ``crop_model`` product, used for the valid-pixel crop/mask
+            # and drawn distinctly in QC -- never for the geometry.
+            crop_model = _InwardEnvelopeModel.from_inliers(
                 model, ruptures_global, side)
             x = np.linspace(col_off, col_off + window_width,
                             self.poly_strategy.grid_shape[0])
-            y_pred = env_model.predict(x.reshape(-1, 1)).ravel()
+            y_pred = model.predict(x.reshape(-1, 1)).ravel()
             result = PolyResult(
                 ruptures_local=ruptures_local,
                 ruptures_global=ruptures_global.astype(int),
                 distortion=np.column_stack([x, y_pred - y_pred.mean()]),
                 inlier_ratio=inlier_ratio,
-                model=env_model,
-                sub_image=sub_image)
+                model=model,
+                sub_image=sub_image,
+                crop_model=crop_model)
             derived_med = int(np.median(derived.model.predict(x.reshape(-1, 1))))
             new = int(np.median(y_pred))
             logger.info(
-                "[CollimationStrategy] %s exposure edge refit (DN featureless + "
-                "inward envelope) from its line: median row %d (derived %d, %+d "
-                "px), inliers %.2f, %d/%d columns in-band",
+                "[CollimationStrategy] %s exposure edge refit (smooth poly2 model "
+                "+ inward-envelope crop) from its line: median row %d (derived "
+                "%d, %+d px), inliers %.2f, %d/%d columns in-band",
                 side, new, derived_med, new - derived_med, inlier_ratio,
                 len(res), sub_image.band.shape[1])
             self.poly_strategy._results[side] = result

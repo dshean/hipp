@@ -64,11 +64,14 @@ def plot_vertical_edges(
             out_shape = (1, out_height, int(window.width * scale))
             sub_image = SubImage(src, window=window, out_shape=out_shape)
 
-            ax.imshow(sub_image.band, cmap="gray", aspect="auto")
+            w = sub_image.window
+            extent = [w.col_off, w.col_off + w.width, w.row_off + w.height, w.row_off]
+            ax.imshow(sub_image.band, cmap="gray", aspect="auto", extent=extent)
 
-            ax.axvline(x=sub_image.to_local_x(edge_col), color="red")
+            ax.axvline(x=edge_col, color="red")
             ax.set_title(f"{side} edge (col={edge_col})")
-            ax.axis("off")
+            ax.set_xlabel("column (full-res px)")
+            ax.set_ylabel("row (full-res px)")
 
     fig.suptitle(detector.raster_filepath_.stem, fontsize=12, fontweight="bold")
     return fig
@@ -111,11 +114,12 @@ def plot_flat_edges(detector: FlatStrategy, margin_fraction: float = 0.03) -> Fi
                 out_shape=(512, 512),
                 resampling=Resampling.average,
             )
-            line_row = (result.position - row_off) / win_h * 512
-            ax.imshow(thumb, cmap="gray", aspect="auto")
-            ax.axhline(line_row, color="yellow", linewidth=1.5)
+            extent = [left, left + roi_w, row_end, row_off]
+            ax.imshow(thumb, cmap="gray", aspect="auto", extent=extent)
+            ax.axhline(result.position, color="yellow", linewidth=1.5)
             ax.set_title(f"{side} edge — position={result.position} px")
-            ax.axis("off")
+            ax.set_xlabel("column (full-res px)")
+            ax.set_ylabel("row (full-res px)")
 
     return fig
 
@@ -128,22 +132,25 @@ def plot_poly_edges(detector: PolyStrategy) -> Figure:
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
 
     for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
-        ax.imshow(result.sub_image.band, cmap="gray", aspect="auto")
+        # GLOBAL full-res raster coordinates on both axes (diagnostic default:
+        # window placement/size must be readable at a glance, David 2026-07-21)
+        w = result.sub_image.window
+        extent = [w.col_off, w.col_off + w.width, w.row_off + w.height, w.row_off]
+        ax.imshow(result.sub_image.band, cmap="gray", aspect="auto", extent=extent)
 
         inlier_mask = result.model.inlier_mask_
-        pts = result.ruptures_local
+        pts = result.ruptures_global
         ax.scatter(pts[~inlier_mask, 0], pts[~inlier_mask, 1], s=12, c="red", label="outliers")
         ax.scatter(pts[inlier_mask, 0], pts[inlier_mask, 1], s=12, c="green", label="inliers")
 
         x_global = result.ruptures_global[:, 0].astype(float)
         y_global_pred = result.model.predict(x_global.reshape(-1, 1))
-        global_pred = np.column_stack([x_global, y_global_pred.ravel()])
-        local_pred = result.sub_image.to_local(global_pred)
-        ax.plot(local_pred[:, 0], local_pred[:, 1], color="blue", linewidth=1, label="model")
+        ax.plot(x_global, y_global_pred.ravel(), color="blue", linewidth=1, label="model")
 
         ax.set_title(f"{side} edge")
+        ax.set_xlabel("column (full-res px)")
+        ax.set_ylabel("row (full-res px)")
         ax.legend(loc="best", fontsize=8)
-        ax.axis("off")
 
     return fig
 
@@ -172,21 +179,23 @@ def plot_collimation_edges(detector: CollimationStrategy) -> Figure:
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
 
     for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
-        ax.imshow(result.sub_image.band, cmap="gray", aspect="auto")
+        w = result.sub_image.window
+        extent = [w.col_off, w.col_off + w.width, w.row_off + w.height, w.row_off]
+        ax.imshow(result.sub_image.band, cmap="gray", aspect="auto", extent=extent)
 
         inliers = result.model.inlier_mask_
-        peaks = result.peaks_local
+        peaks = result.peaks_global
         ax.scatter(peaks[~inliers, 0], peaks[~inliers, 1], s=12, c="red", label="outliers")
         ax.scatter(peaks[inliers, 0], peaks[inliers, 1], s=12, c="green", label="inliers")
 
         y_global_pred = result.model.predict(result.peaks_global[:, 0].reshape(-1, 1))
-        global_pred = np.column_stack([result.peaks_global[:, 0], y_global_pred])
-        local_pred = result.sub_image.to_local(global_pred)
-        ax.plot(local_pred[:, 0], local_pred[:, 1], color="blue", linewidth=1, label="model")
+        ax.plot(result.peaks_global[:, 0], np.asarray(y_global_pred).ravel(),
+                color="blue", linewidth=1, label="model")
 
         ax.set_title(f"{side} collimation line")
+        ax.set_xlabel("column (full-res px)")
+        ax.set_ylabel("row (full-res px)")
         ax.legend(loc="best", fontsize=8)
-        ax.axis("off")
 
     return fig
 

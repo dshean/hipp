@@ -197,15 +197,25 @@ class CollimationStrategy(RestitutionStrategy):
         from hipp.kh9pc.restitution.base import fit_ransac_poly
         from hipp.kh9pc.restitution.poly_strategy import PolyResult
 
-        top_line = self._line_row("top")
-        bot_line = self._line_row("bottom")
         stride = self.poly_strategy.stride
-        for side, window in {
-            "top": Window(col_off, max(top_line - window_height, 0),
-                          window_width, min(window_height, top_line)),
-            "bottom": Window(col_off, bot_line, window_width,
-                             min(window_height, src.height - bot_line)),
-        }.items():
+        # Windows must contain the WHOLE line (it can slope ~450 px across the
+        # scan — D3C1210; a median-anchored strip end CUT the line at half the
+        # columns and the scan start missed it, David 2026-07-21) plus the
+        # full outward reach. Per column, the scan starts at the line MODEL's
+        # predicted row, never at the strip boundary.
+        x_cols = np.linspace(col_off, col_off + window_width,
+                             self.poly_strategy.grid_shape[0])
+        for side in ("top", "bottom"):
+            line_rows = self._results[side].model.predict(
+                x_cols.reshape(-1, 1)).ravel()
+            lmin, lmax = int(line_rows.min()), int(line_rows.max())
+            if side == "top":
+                row0 = max(lmin - window_height, 0)
+                row1 = min(lmax + 5 * stride, src.height)   # small pad past the line
+            else:
+                row0 = max(lmin - 5 * stride, 0)
+                row1 = min(lmax + window_height, src.height)
+            window = Window(col_off, row0, window_width, row1 - row0)
             if window.height < 12 * stride:
                 logger.warning(
                     "[CollimationStrategy] no room to refit the %s exposure edge "
@@ -217,10 +227,24 @@ class CollimationStrategy(RestitutionStrategy):
             redacted = redacted_region_mask(
                 sub_image.band, max_dn=self.poly_strategy.background_threshold,
                 dilate=3)
+            nrows = sub_image.band.shape[0]
             res = []
             for c in range(sub_image.band.shape[1]):
-                r = _variance_edge(sub_image.band[:, c], redacted[:, c],
-                                   from_end=(side == "top"))
+                # per-column scan start = the line's own row at this column
+                line_local = int(round(sub_image.to_local_y(line_rows[c])))
+                line_local = min(max(line_local, 0), nrows - 1)
+                col_vec = sub_image.band[:, c]
+                red_vec = redacted[:, c]
+                if side == "top":
+                    # rows [0 .. line_local]: line at the END, scan upward
+                    r = _variance_edge(col_vec[: line_local + 1],
+                                       red_vec[: line_local + 1], from_end=True)
+                else:
+                    # rows [line_local ..]: line at the START, scan downward
+                    r = _variance_edge(col_vec[line_local:],
+                                       red_vec[line_local:], from_end=False)
+                    if r is not None:
+                        r += line_local
                 if r is not None:
                     res.append((c, r))
             if len(res) < max(10, sub_image.band.shape[1] // 10):

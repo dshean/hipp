@@ -22,7 +22,7 @@ from skimage.transform import ThinPlateSplineTransform
 from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
-from hipp.kh9pc.restitution.base import fit_ransac_poly, tps_from_estimate
+from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, _featureless_edge, fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
 
@@ -115,6 +115,21 @@ class CollimationStrategy(RestitutionStrategy):
     edge_offset_from_line: int = 180
     edge_band_inner: int = 90
     edge_band_outer: int = 550
+    # Round 2 (David 2026-07-22): the PRIMARY per-column edge test is simple and
+    # DN-based -- walking OUTWARD from the line, the edge is the last real-content
+    # row before a SUSTAINED FEATURELESS run: near-black (DN <= edge_black_dn;
+    # the merged section-mosaic black frame is essentially 0, measured ~9) OR a
+    # flat run (rolling std <= a small absolute value; the unexposed grey film
+    # margin above the top edge is featureless at DN ~40, not black). This
+    # accepts nearly every content column (F004: ~96-98/100 in-band vs 30-66/100
+    # for the round-1 variance gate, which REFUSED obviously-decidable columns).
+    # ``_variance_edge`` is kept only as a SECONDARY inner tiebreak. Because the
+    # merged frames are mosaics of scan sections whose black frame starts at
+    # DIFFERENT rows, the delivered edge is the INWARD ENVELOPE: the RANSAC
+    # polynomial CLAMPED per column to the innermost detected transition
+    # (``_InwardEnvelopeModel``), so it steps inward at section boundaries and
+    # never crosses outward past a black block.
+    edge_black_dn: int = 15
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 
@@ -277,32 +292,38 @@ class CollimationStrategy(RestitutionStrategy):
                 # per-column scan start = the line's own row at this column
                 line_local = int(round(sub_image.to_local_y(line_rows[c])))
                 line_local = min(max(line_local, 0), nrows - 1)
-                col_vec = sub_image.band[:, c]
-                red_vec = redacted[:, c]
+                # OUTWARD-ordered column vector (index 0 = line side) so the
+                # detectors always "walk outward from the collimation line".
                 if side == "top":
-                    # rows [0 .. line_local]: line at the END, scan upward
-                    r = _variance_edge(col_vec[: line_local + 1],
-                                       red_vec[: line_local + 1], from_end=True)
+                    step = -1
+                    out_vec = sub_image.band[: line_local + 1, c][::-1]
+                    out_red = redacted[: line_local + 1, c][::-1]
                 else:
-                    # rows [line_local ..]: line at the START, scan downward
-                    r = _variance_edge(col_vec[line_local:],
-                                       red_vec[line_local:], from_end=False)
-                    if r is not None:
-                        r += line_local
-                if r is None:
+                    step = 1
+                    out_vec = sub_image.band[line_local:, c]
+                    out_red = redacted[line_local:, c]
+                # PRIMARY: last content row before a sustained featureless run
+                # (near-black or flat). SECONDARY tiebreak: the round-1 variance
+                # edge. Take the INNERMOST (most conservative) of the two — never
+                # let the variance refusal reject a column the DN test decides.
+                prim = _featureless_edge(out_vec, black_dn=self.edge_black_dn)
+                sec = _variance_edge(out_vec, out_red, from_end=False)
+                cands = [r for r in (prim, sec) if r is not None]
+                if not cands:
                     continue
-                # BAND GATE (David 2026-07-22): the refit may only refine within a
-                # tight band around the derived edge. Distance OUTWARD from THIS
-                # column's line, in full-res px; reject transitions nearer than
-                # edge_band_inner (line halo / secondary band) or farther than
-                # edge_band_outer (redaction / black frame / F004's ~1198 px logo
-                # rim). Rejected columns simply do not vote — a whole side that
-                # loses its edge falls back to the derived line+offset edge below.
-                dist = (line_local - r if side == "top" else r - line_local) * row_scale
+                r_out = min(cands)                       # innermost outward index
+                local_row = line_local + step * r_out
+                # BAND GATE (round 1, David 2026-07-22): keep only transitions a
+                # plausible line->edge distance OUTWARD of THIS column's line, in
+                # full-res px. Nearer than edge_band_inner = line halo / smooth
+                # near-line content (premature flat trigger); farther than
+                # edge_band_outer = redaction / black frame / F004's ~1198 px
+                # logo rim. Out-of-band columns do not vote.
+                dist = abs(local_row - line_local) * row_scale
                 if not (self.edge_band_inner <= dist <= self.edge_band_outer):
                     rejected_band += 1
                     continue
-                res.append((c, r))
+                res.append((c, local_row))
             if len(res) < max(10, sub_image.band.shape[1] // 10):
                 logger.warning(
                     "[CollimationStrategy] %s exposure-edge refit: only %d/%d "
@@ -318,35 +339,44 @@ class CollimationStrategy(RestitutionStrategy):
                 degree=self.poly_strategy.polynomial_degree,
                 residual_threshold=self.poly_strategy.ransac_residual_threshold,
                 max_trials=self.poly_strategy.ransac_max_trials)
+            inlier_ratio = float(model.inlier_mask_.mean())
+            # Quality gate (adversarial review 2026-07-21): never install a
+            # low-inlier refit — fall back to the derived line+offset edge, which
+            # is always a clean line-anchored curve.
+            if inlier_ratio < self.poly_strategy.min_inliers_threshold:
+                logger.warning(
+                    "[CollimationStrategy] %s exposure-edge refit REJECTED "
+                    "(inliers %.2f < %.2f) - using the derived line+offset edge",
+                    side, inlier_ratio, self.poly_strategy.min_inliers_threshold)
+                self.poly_strategy._results[side] = derived
+                continue
+            # INWARD ENVELOPE (David 2026-07-22): the merged frames are mosaics
+            # of scan sections whose black frame starts at DIFFERENT rows, so a
+            # single smooth curve can pass outside a shallower section's black
+            # start and admit a sliver of frame. Clamp the polynomial per column
+            # to the innermost detected transition (rolling min/max of the RANSAC
+            # inliers, so isolated noisy columns -- already RANSAC outliers -- do
+            # not) so the delivered edge steps INWARD at section boundaries and
+            # never crosses past a black block. Prefer cutting a few good pixels.
+            env_model = _InwardEnvelopeModel.from_inliers(
+                model, ruptures_global, side)
             x = np.linspace(col_off, col_off + window_width,
                             self.poly_strategy.grid_shape[0])
-            y_pred = model.predict(x.reshape(-1, 1)).ravel()
+            y_pred = env_model.predict(x.reshape(-1, 1)).ravel()
             result = PolyResult(
                 ruptures_local=ruptures_local,
                 ruptures_global=ruptures_global.astype(int),
                 distortion=np.column_stack([x, y_pred - y_pred.mean()]),
-                inlier_ratio=float(model.inlier_mask_.mean()),
-                model=model,
+                inlier_ratio=inlier_ratio,
+                model=env_model,
                 sub_image=sub_image)
             derived_med = int(np.median(derived.model.predict(x.reshape(-1, 1))))
             new = int(np.median(y_pred))
-            # Quality gate (adversarial review 2026-07-21): never install a
-            # low-inlier refit — fall back to the derived line+offset edge, which
-            # is always a clean line-anchored curve.
-            if result.inlier_ratio < self.poly_strategy.min_inliers_threshold:
-                logger.warning(
-                    "[CollimationStrategy] %s exposure-edge refit REJECTED "
-                    "(inliers %.2f < %.2f) - using the derived line+offset edge "
-                    "(refit median row would have been %d vs derived %d)",
-                    side, result.inlier_ratio,
-                    self.poly_strategy.min_inliers_threshold, new, derived_med)
-                self.poly_strategy._results[side] = derived
-                continue
             logger.info(
-                "[CollimationStrategy] %s exposure edge refit (band-gated texture) "
-                "from its line: median row %d (derived %d, %+d px), inliers %.2f, "
-                "%d/%d columns in-band",
-                side, new, derived_med, new - derived_med, result.inlier_ratio,
+                "[CollimationStrategy] %s exposure edge refit (DN featureless + "
+                "inward envelope) from its line: median row %d (derived %d, %+d "
+                "px), inliers %.2f, %d/%d columns in-band",
+                side, new, derived_med, new - derived_med, inlier_ratio,
                 len(res), sub_image.band.shape[1])
             self.poly_strategy._results[side] = result
 

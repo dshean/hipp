@@ -13,6 +13,14 @@ conservative fixed OUTWARD offset and let the texture refit only REFINE within a
 tight band [edge_band_inner, edge_band_outer]; reject anything farther out, and
 if too few columns survive, the derived line+offset edge stands on its own
 (erring inward). These tests assert the block can never enter the fit.
+
+Round 2 (David 2026-07-22): the primary per-column detector is simple and
+DN-based (``_featureless_edge`` -- last content row before a sustained near-black
+or flat run), which accepts nearly every content column instead of refusing the
+low-contrast-but-obvious ones the round-1 variance gate rejected; and the
+delivered edge is the INWARD ENVELOPE (``_InwardEnvelopeModel``) so it steps
+inward at scan-section black-frame boundaries and never crosses past a black
+block.
 """
 
 from pathlib import Path
@@ -27,6 +35,7 @@ from hipp.kh9pc.restitution.base import fit_ransac_poly
 from hipp.kh9pc.restitution.collimation_strategy import (
     CollimationResult,
     CollimationStrategy,
+    _featureless_edge,
     _variance_edge,
 )
 
@@ -167,3 +176,86 @@ def test_starved_refit_falls_back_to_derived_edge(tmp_path: Path) -> None:
             assert np.allclose(d, strat.edge_offset_from_line, atol=2), (
                 f"{side} did not fall back to line+offset: {d.min()}..{d.max()}"
             )
+
+
+# ---- round 2: DN featureless detector + inward section envelope ----
+
+def _write_black_margin_raster(path: Path) -> None:
+    """Bottom edge = textured content ending in a near-black frame (DN 5), the
+    merged-scan case David points at. No logo; a plain content->black transition
+    the DN detector must accept in essentially every column."""
+    rng = np.random.default_rng(3)
+    img = np.full((H, W), 5, np.uint8)                         # near-black frame
+    img[EDGE_TOP:EDGE_BOT] = rng.integers(30, 240, size=(EDGE_BOT - EDGE_TOP, W)).astype(np.uint8)
+    img[LINE_TOP - 4 : LINE_TOP + 4] = 250
+    img[LINE_BOT - 4 : LINE_BOT + 4] = 250
+    with rasterio.open(path, "w", driver="GTiff", width=W, height=H, count=1, dtype="uint8") as dst:
+        dst.write(img, 1)
+
+
+def test_featureless_detector_accepts_nearly_all_content_columns(tmp_path: Path) -> None:
+    """The DN featureless detector must ACCEPT nearly every content column (the
+    round-1 variance gate refused the obviously-decidable ones). On a plain
+    content->black bottom edge it accepts ~all columns at the true offset, far
+    more than the variance detector."""
+    src_path = tmp_path / "blackmargin.tif"
+    _write_black_margin_raster(src_path)
+    with rasterio.open(src_path) as src:
+        row0, row1 = LINE_BOT - 5 * STRIDE, min(LINE_BOT + 1700, H)
+        sub = SubImage(src, Window(0, row0, W, row1 - row0), out_shape=(1, (row1 - row0) // STRIDE, 100))
+        ll = int(round(sub.to_local_y(LINE_BOT)))
+        red = redacted_region_mask(sub.band, max_dn=20, dilate=3)
+        n = sub.band.shape[1]
+        feat_ok = var_ok = 0
+        for c in range(n):
+            out = sub.band[ll:, c]
+            rf = _featureless_edge(out)
+            if rf is not None and 90 <= (sub.to_global_y(rf + ll) - LINE_BOT) <= 550:
+                feat_ok += 1
+            rv = _variance_edge(out, red[ll:, c], from_end=False)
+            if rv is not None and 90 <= (sub.to_global_y(rv + ll) - LINE_BOT) <= 550:
+                var_ok += 1
+        frac = feat_ok / n
+        assert frac >= 0.90, f"featureless detector accepted only {feat_ok}/{n} in-band"
+        assert feat_ok > var_ok, f"featureless ({feat_ok}) must beat variance ({var_ok})"
+
+
+def _write_stepped_raster(path: Path, black_left: int, black_right: int) -> None:
+    """Two scan sections (left / right halves) whose near-black frame starts at
+    DIFFERENT bottom rows -- the section-mosaicking step. Content is textured
+    down to each section's black start."""
+    rng = np.random.default_rng(5)
+    img = np.full((H, W), 5, np.uint8)
+    img[EDGE_TOP : LINE_BOT + 700] = rng.integers(30, 240, size=(LINE_BOT + 700 - EDGE_TOP, W)).astype(np.uint8)
+    img[black_left:, : W // 2] = 5
+    img[black_right:, W // 2 :] = 5
+    img[:EDGE_TOP] = 5
+    img[LINE_TOP - 4 : LINE_TOP + 4] = 250
+    img[LINE_BOT - 4 : LINE_BOT + 4] = 250
+    with rasterio.open(path, "w", driver="GTiff", width=W, height=H, count=1, dtype="uint8") as dst:
+        dst.write(img, 1)
+
+
+def test_stepped_sections_edge_stays_inward(tmp_path: Path) -> None:
+    """Two sections whose black frame starts at different rows: the delivered
+    bottom edge must step INWARD and never cross below (outward of) the shallower
+    section's black start, even though a single smooth polynomial through both
+    would (David 2026-07-22)."""
+    black_left, black_right = 2300, 2150          # right section's black is shallower
+    src_path = tmp_path / "stepped.tif"
+    _write_stepped_raster(src_path, black_left, black_right)
+    with rasterio.open(src_path) as src:
+        strat = _strategy_with_lines(src)
+        strat._refit_edges_from_lines(src, 0, W, 1700)
+        model = strat.poly_strategy._results["bottom"].model
+        cols = np.linspace(0, W, 200)
+        edge = model.predict(cols.reshape(-1, 1)).ravel()
+        right = edge[cols >= W // 2]
+        left = edge[cols < W // 2]
+        # the shallow (right) section must never admit black
+        assert right.max() <= black_right + 3, f"right edge crossed into black: {right.max()}"
+        # the deep (left) section is allowed out to its own (deeper) black
+        assert left.max() <= black_left + 3, f"left edge crossed into black: {left.max()}"
+        # and the envelope actually stepped inward vs the unclamped polynomial
+        poly = model._poly.predict(cols.reshape(-1, 1)).ravel()
+        assert poly[cols >= W // 2].max() > black_right + 10, "control: unclamped poly would admit black"

@@ -10,11 +10,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
 
+import numpy as np
 import rasterio
 from rasterio.windows import Window
 
 from hipp.image import SubImage, remap_tif_blockwise
-from hipp.kh9pc.restitution.base import detect_ruptures
+from hipp.kh9pc.restitution.base import detect_content_edges, detect_ruptures
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.vertical_detector import VerticalDetector
 
@@ -55,6 +56,7 @@ class FlatStrategy(RestitutionStrategy):
     background_threshold: int = 20
     height_fraction: float = 0.15
     stride: int = 10
+    grid_width: int = 50  # columns sampled for the per-column content-end scan (was column-collapsed)
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 
@@ -99,7 +101,7 @@ class FlatStrategy(RestitutionStrategy):
 
         with rasterio.open(raster_filepath) as src:
             window_height = int(src.height * self.height_fraction)
-            out_shape = (1, window_height // self.stride, 1)
+            out_shape = (1, window_height // self.stride, self.grid_width)
 
             for side, window in {
                 "top": Window(col_off, 0, window_width, window_height),
@@ -111,11 +113,31 @@ class FlatStrategy(RestitutionStrategy):
         return self
 
     def _process_side(self, sub_image: SubImage, side: str) -> FlatResult:
-        """Find the first intensity rupture in the collapsed horizontal profile for one edge."""
-        ruptures = detect_ruptures(sub_image.band.flatten(), self.background_threshold, reverse_scan=(side == "top"))
-        if len(ruptures) == 0:
-            raise RuntimeError(f"No rupture detected on the {side} edge.")
-        rupture_local = int(ruptures[0])
+        """CONSERVATIVE single-row edge position for one side.
+
+        A flat crop delivers ONE horizontal row per edge, so with scan-section
+        black-frame steps the only way to never admit frame is to place the row
+        at the INNERMOST content edge across columns (David 2026-07-22: rather
+        crop valid pixels than include a black rectangle). Each column is scanned
+        from the content (inner) side outward (``detect_content_edges``, the same
+        content-end test the line strategies use); outliers -- e.g. a single
+        column whose smooth content triggered early -- are rejected robustly by
+        MAD, then the innermost surviving row wins (max row for the top, min for
+        the bottom). Falls back to the column-collapsed rupture only if no
+        content edge is found at all."""
+        edges = detect_content_edges(sub_image.band, side, black_dn=self.background_threshold)
+        if edges:
+            rows = np.array([r for _, r in edges], dtype=float)
+            med = np.median(rows)
+            mad = np.median(np.abs(rows - med))
+            keep = rows[np.abs(rows - med) <= max(4.0 * mad, 3.0)]  # drop premature-trigger outliers
+            rupture_local = int(keep.max() if side == "top" else keep.min())
+        else:
+            ruptures = detect_ruptures(
+                sub_image.band.mean(axis=1), self.background_threshold, reverse_scan=(side == "top"))
+            if len(ruptures) == 0:
+                raise RuntimeError(f"No edge detected on the {side} edge.")
+            rupture_local = int(ruptures[0])
         position = int(sub_image.to_global_y(rupture_local))
         return FlatResult(position=position, rupture_local=rupture_local, sub_image=sub_image)
 

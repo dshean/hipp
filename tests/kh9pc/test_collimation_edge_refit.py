@@ -279,3 +279,43 @@ def test_stepped_sections_geometry_smooth_crop_conservative(tmp_path: Path) -> N
     # at/above the shallow content edge, never down in the black.
     src_row = float(tf.deformation(np.array([[3 * W // 4, crop_bot]], dtype=np.float32))[0, 1])
     assert src_row <= black_right + 8, f"delivered crop bottom maps into black: {src_row}"
+
+
+def test_delivered_crop_is_fixed_line_offset(tmp_path: Path, caplog) -> None:
+    """David 2026-07-22 (~23:20) ruling: the DELIVERED crop is the collimation
+    line shifted a fixed conservative distance OUTWARD -- parallel to the line
+    by construction -- with no per-column edge/envelope model in the crop path.
+    Output height is therefore uniform across frames. When a section's content
+    ends INSIDE the fixed rectangle (offset too generous for this frame), the
+    non-fatal black-leak sentinel must warn."""
+    import logging
+    from types import SimpleNamespace
+
+    def _transform_for(path: Path, black_left: int, black_right: int, offset: int | None = None):
+        _write_stepped_raster(path, black_left, black_right)
+        with rasterio.open(path) as src:
+            strat = _strategy_with_lines(src)
+            if offset is not None:
+                strat.crop_offset_from_line = offset
+            strat.collimation_line_dist = LINE_BOT - LINE_TOP   # warp scale ~1
+            strat._refit_edges_from_lines(src, 0, W, 1700)
+            strat.poly_strategy.vertical_detector = SimpleNamespace(edges_=(0, W), detected_width_=W)
+            strat._FittingClass__raster_filepath_ = path
+            return strat, strat.transformation_
+
+    strat, tf = _transform_for(tmp_path / "a.tif", 2300, 2150)
+    # crop bounds = line -/+ fixed offset (top line sits at its median row in
+    # the warped frame); height = line separation + 2*offset, by construction
+    assert abs(tf.crop_offset[1] - (LINE_TOP - strat.crop_offset_from_line)) <= 1
+    assert tf.output_size[1] == strat.collimation_line_dist + 2 * strat.crop_offset_from_line
+
+    # uniform height: different section black-step geometry, same rectangle
+    _, tf2 = _transform_for(tmp_path / "b.tif", 2500, 2400)
+    assert tf2.output_size[1] == tf.output_size[1]
+    assert tf2.crop_offset[1] == tf.crop_offset[1]
+
+    # sentinel: an offset beyond the shallowest line->black distance (250 px
+    # here on the right section) must log the black-leak warning
+    with caplog.at_level(logging.WARNING):
+        _transform_for(tmp_path / "c.tif", 2300, 2150, offset=400)
+    assert any("black may survive" in r.message for r in caplog.records)

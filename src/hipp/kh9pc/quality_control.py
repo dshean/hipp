@@ -127,13 +127,16 @@ def plot_flat_edges(detector: FlatStrategy, margin_fraction: float = 0.03) -> Fi
 # --- Poly ---
 
 
-def plot_poly_edges(detector: PolyStrategy) -> Figure:
+def plot_poly_edges(detector: PolyStrategy, crop_is_delivered: bool = True) -> Figure:
     """Subimage thumbnails with RANSAC inliers/outliers, the SMOOTH edge model
     (blue, the geometry that feeds the warp) and, when present, the conservative
-    inward-envelope CROP line (dashed orange, the valid-pixel boundary). The two
-    are drawn separately so geometry (must be smooth -- a step is shear) and
-    conservatism (steps inward to exclude black frame) can be reviewed apart
-    (David 2026-07-22 round 3)."""
+    inward-envelope line (dashed orange). The two are drawn separately so
+    geometry (must be smooth -- a step is shear) and conservatism (steps inward
+    to exclude black frame) can be reviewed apart (David 2026-07-22 round 3).
+    ``crop_is_delivered``: True when the envelope actually cuts the product
+    (pure Poly/Mixed fallback); False under CollimationStrategy, where the
+    delivered crop is the fixed line-offset (2026-07-22 ruling) and the
+    envelope is QC/sentinel only."""
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
 
     for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
@@ -156,13 +159,16 @@ def plot_poly_edges(detector: PolyStrategy) -> Figure:
         if crop_model is not None:
             cm = np.asarray(crop_model.predict(x_global.reshape(-1, 1))).ravel()
             ax.plot(x_global, cm, color="darkorange", linewidth=1.2, linestyle="--",
-                    label="crop (conservative)")
-            # the DELIVERED rectangle bound is the innermost row of the envelope
-            # (deepest for the top edge, shallowest for the bottom) -- the actual
-            # row the product is cut at (David 2026-07-22 round 4).
+                    label="content envelope (conservative)")
+            # innermost row of the envelope (deepest for the top edge,
+            # shallowest for the bottom). Under the pure Poly/Mixed fallback
+            # this is the actual row the product is cut at; under
+            # CollimationStrategy the delivered crop is the fixed line-offset
+            # (David 2026-07-22) and this row is QC/sentinel only.
             crop_row = float(cm.max()) if side == "top" else float(cm.min())
-            ax.axhline(crop_row, color="red", linewidth=1.0, linestyle=":",
-                       label=f"delivered crop = row {int(crop_row)}")
+            lbl = (f"delivered crop = row {int(crop_row)}" if crop_is_delivered
+                   else f"innermost content row {int(crop_row)} (QC)")
+            ax.axhline(crop_row, color="red", linewidth=1.0, linestyle=":", label=lbl)
 
         ax.set_title(f"{side} edge")
         ax.set_xlabel("column (full-res px)")
@@ -208,6 +214,16 @@ def plot_collimation_edges(detector: CollimationStrategy) -> Figure:
         y_global_pred = result.model.predict(result.peaks_global[:, 0].reshape(-1, 1))
         ax.plot(result.peaks_global[:, 0], np.asarray(y_global_pred).ravel(),
                 color="blue", linewidth=1, label="model")
+
+        # Delivered crop = the line shifted a fixed distance OUTWARD, parallel
+        # by construction (David 2026-07-22 fixed-offset crop ruling).
+        off = getattr(detector, "crop_offset_from_line", None)
+        if off is not None:
+            sign = -1.0 if side == "top" else 1.0
+            ax.plot(result.peaks_global[:, 0],
+                    np.asarray(y_global_pred).ravel() + sign * off,
+                    color="red", linewidth=1.0, linestyle=":",
+                    label=f"delivered crop = line {'-' if side == 'top' else '+'} {off} px")
 
         ax.set_title(f"{side} collimation line")
         ax.set_xlabel("column (full-res px)")
@@ -612,8 +628,17 @@ def save_figures(fitting_class: FittingClass, output_dir: str | Path) -> None:
             logger.warning("Skipping QC figure: %s", e)
 
 
-def get_figures(fitting_class: FittingClass, plot_transformation: bool = True) -> Iterator[tuple[str, Figure]]:
-    """Yield (name, figure) pairs for all QC plots of a fitted FittingClass instance."""
+def get_figures(
+    fitting_class: FittingClass,
+    plot_transformation: bool = True,
+    poly_crop_is_delivered: bool = True,
+) -> Iterator[tuple[str, Figure]]:
+    """Yield (name, figure) pairs for all QC plots of a fitted FittingClass instance.
+
+    ``poly_crop_is_delivered`` is threaded to ``plot_poly_edges`` so the red
+    crop row is labeled honestly: it is the delivered cut only for the pure
+    Poly/Mixed fallback, not under CollimationStrategy (fixed line-offset crop,
+    David 2026-07-22)."""
     if isinstance(fitting_class, VerticalDetector):
         yield "vertical_edges", plot_vertical_edges(fitting_class)
         yield "vertical_ruptures", plot_vertical_ruptures(fitting_class)
@@ -627,14 +652,15 @@ def get_figures(fitting_class: FittingClass, plot_transformation: bool = True) -
         return
     if isinstance(fitting_class, PolyStrategy):
         yield from get_figures(fitting_class.vertical_detector, plot_transformation=False)
-        yield "poly_edges", plot_poly_edges(fitting_class)
+        yield "poly_edges", plot_poly_edges(fitting_class, crop_is_delivered=poly_crop_is_delivered)
         yield "poly_distortions", plot_poly_distortions(fitting_class)
         if plot_transformation:
             yield "deformation_grid", plot_deformation_grid(fitting_class.transformation_)
             yield "crop_area", plot_crop_area(fitting_class.transformation_)
         return
     if isinstance(fitting_class, CollimationStrategy):
-        yield from get_figures(fitting_class.poly_strategy, plot_transformation=False)
+        yield from get_figures(fitting_class.poly_strategy, plot_transformation=False,
+                               poly_crop_is_delivered=False)
         yield "collimation_edges", plot_collimation_edges(fitting_class)
         yield "collimation_distortions", plot_collimation_distortions(fitting_class)
         if plot_transformation:

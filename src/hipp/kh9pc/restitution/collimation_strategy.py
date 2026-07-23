@@ -130,6 +130,20 @@ class CollimationStrategy(RestitutionStrategy):
     # (``_InwardEnvelopeModel``), so it steps inward at section boundaries and
     # never crosses outward past a black block.
     edge_black_dn: int = 15
+    # ---- DELIVERED CROP (David 2026-07-22 ~23:20 ruling) ----
+    # "The collimation lines are the only true geometric markers ... rather
+    # than trying to find an edge with a model, use a fixed offset from the
+    # collimation line that cuts off all of the black rectangles; the model
+    # line should be PARALLEL to the collimation line." The delivered
+    # rectangle is cut at line -/+ this offset (OUTWARD, both edges) in the
+    # warped frame -- no per-column edge/envelope model feeds the crop (those
+    # remain as QC and a black-leak sentinel). Measured line->content-end
+    # distances across both WA missions: 182-377 px outward (smallest 182).
+    # 170 sits 12 px inside the smallest measured content end: every measured
+    # section's black block is excluded at a cost of <=~12 px of valid film
+    # on the tightest frame ("rather crop some valid pixels than include
+    # black rectangle in the output").
+    crop_offset_from_line: int = 170
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 
@@ -491,10 +505,11 @@ class CollimationStrategy(RestitutionStrategy):
         )
 
     def _crop_bound_model(self, side: str) -> object:
-        """Conservative content-edge crop bound for one edge: the exposure-edge
+        """Conservative content-edge model for one edge: the exposure-edge
         refit's inward-envelope ``crop_model`` when present, else its (already
-        conservative) derived line+offset ``model``. Trims the DELIVERED
-        rectangle only -- never the geometry."""
+        conservative) derived line+offset ``model``. Since the fixed-offset
+        crop ruling (David 2026-07-22) this feeds ONLY the black-leak sentinel
+        and QC figures -- never the delivered crop, never the geometry."""
         r = self.poly_strategy._results[side]
         return r.crop_model if getattr(r, "crop_model", None) is not None else r.model
 
@@ -523,36 +538,47 @@ class CollimationStrategy(RestitutionStrategy):
         # the smooth collimation line models -> no shear (David 2026-07-22 r3).
         deformation = tps_from_estimate(dst, src)
 
-        # ---- CONSERVATIVE VERTICAL CROP (David 2026-07-22 round 4) ----
-        # Trim the delivered rectangle to the INNERMOST content envelope on BOTH
-        # edges so no black frame / scan-section black block enters the product
-        # ("rather cut a few good pixels than let black frame into the cropped
-        # images"). The geometry above is untouched. crop_model is in SOURCE rows;
-        # map it into the warped frame through the same vertical scale the TPS
-        # applies (collimation_line_dist / detected line separation, ~1), measured
-        # per column relative to that column's collimation line. Take the deepest
-        # top edge and the shallowest bottom edge so EVERY section's black is
-        # excluded. Output height therefore varies per frame (kh9_01 center-crops
-        # downstream anyway).
-        sep = max(float(np.median(y_bot_src) - np.median(y_top_src)), 1.0)
-        scale = self.collimation_line_dist / sep
-        top_edge = top + scale * (
-            self._crop_bound_model("top").predict(x.reshape(-1, 1)).ravel() - y_top_src.ravel())
-        bot_edge = bot + scale * (
-            self._crop_bound_model("bottom").predict(x.reshape(-1, 1)).ravel() - y_bot_src.ravel())
-        crop_top = int(np.ceil(float(np.max(top_edge))))    # deepest top edge -> excludes every top black block
-        crop_bot = int(np.floor(float(np.min(bot_edge))))   # shallowest bottom edge -> excludes every bottom block
+        # ---- FIXED-OFFSET DELIVERED CROP (David 2026-07-22 ~23:20) ----
+        # The crop bounds are the straightened collimation lines shifted a
+        # fixed conservative distance OUTWARD -- parallel to the lines by
+        # construction ("the collimation lines are the only true geometric
+        # markers"). In the warped frame the lines sit exactly at ``top`` and
+        # ``bot``, so the crop is a fixed rectangle and the output height is
+        # identical for every frame: collimation_line_dist +
+        # 2*crop_offset_from_line. The geometry/warp above is untouched.
+        crop_top = int(top - self.crop_offset_from_line)
+        crop_bot = int(bot + self.crop_offset_from_line)
         output_height = max(crop_bot - crop_top, 1)
 
-        # per-frame pixel cost vs the OLD fixed line-anchored window
-        old_h = self.output_height or detected_height
-        old_top = top - (old_h - detected_height) / 2.0
+        # Black-leak sentinel (non-fatal): the per-column content envelope no
+        # longer drives the crop, but wherever it detects content ending
+        # INSIDE the fixed rectangle, that section's black block would
+        # survive -- warn with the worst intrusion so an out-of-family frame
+        # (offset calibrated on measured WA frames) is caught in QC.
+        sep = max(float(np.median(y_bot_src) - np.median(y_top_src)), 1.0)
+        scale = self.collimation_line_dist / sep
+        for side, line_src, line_dst, bound in (
+                ("top", y_top_src, top, crop_top),
+                ("bottom", y_bot_src, bot, crop_bot)):
+            try:
+                env = line_dst + scale * (
+                    self._crop_bound_model(side).predict(x.reshape(-1, 1)).ravel()
+                    - np.asarray(line_src).ravel())
+            except Exception:
+                continue
+            intr = (env - bound) if side == "top" else (bound - env)
+            worst = float(np.max(intr))
+            if worst > 0:
+                logger.warning(
+                    "[CollimationStrategy] %s content envelope ends INSIDE the "
+                    "fixed-offset crop by up to %d px on %d/%d sampled columns "
+                    "-- black may survive; review poly_edges QC",
+                    side, int(np.ceil(worst)), int((intr > 0).sum()), intr.size)
+
         logger.info(
-            "[CollimationStrategy] conservative crop to content envelope: top %d "
-            "(%+d px vs fixed window), bottom %d (%+d px), height %d (fixed %d, "
-            "%+d px)", crop_top, int(round(crop_top - old_top)),
-            crop_bot, int(round(crop_bot - (old_top + old_h))),
-            output_height, int(old_h), int(output_height - old_h))
+            "[CollimationStrategy] fixed-offset delivered crop: line -/+ %d px "
+            "-> rows [%d, %d], height %d (uniform by construction)",
+            self.crop_offset_from_line, crop_top, crop_bot, output_height)
 
         pad_x = (output_width - detected_width) / 2
         crop_offset = (int(left - pad_x), crop_top)

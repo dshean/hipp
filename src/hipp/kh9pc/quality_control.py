@@ -154,8 +154,15 @@ def plot_poly_edges(detector: PolyStrategy) -> Figure:
                 color="blue", linewidth=1, label="model (geometry)")
         crop_model = getattr(result, "crop_model", None)
         if crop_model is not None:
-            ax.plot(x_global, np.asarray(crop_model.predict(x_global.reshape(-1, 1))).ravel(),
-                    color="darkorange", linewidth=1.2, linestyle="--", label="crop (conservative)")
+            cm = np.asarray(crop_model.predict(x_global.reshape(-1, 1))).ravel()
+            ax.plot(x_global, cm, color="darkorange", linewidth=1.2, linestyle="--",
+                    label="crop (conservative)")
+            # the DELIVERED rectangle bound is the innermost row of the envelope
+            # (deepest for the top edge, shallowest for the bottom) -- the actual
+            # row the product is cut at (David 2026-07-22 round 4).
+            crop_row = float(cm.max()) if side == "top" else float(cm.min())
+            ax.axhline(crop_row, color="red", linewidth=1.0, linestyle=":",
+                       label=f"delivered crop = row {int(crop_row)}")
 
         ax.set_title(f"{side} edge")
         ax.set_xlabel("column (full-res px)")

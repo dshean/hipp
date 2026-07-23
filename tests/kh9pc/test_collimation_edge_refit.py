@@ -241,13 +241,20 @@ def test_stepped_sections_geometry_smooth_crop_conservative(tmp_path: Path) -> N
     round 3): the GEOMETRY model must stay SMOOTH through the step (a step in the
     edge is shear in the warp), while the separate CONSERVATIVE crop line steps
     inward and never crosses below the shallower section's black start."""
+    from types import SimpleNamespace
+
     black_left, black_right = 2300, 2150          # right section's black is shallower
     src_path = tmp_path / "stepped.tif"
     _write_stepped_raster(src_path, black_left, black_right)
     with rasterio.open(src_path) as src:
         strat = _strategy_with_lines(src)
+        strat.collimation_line_dist = LINE_BOT - LINE_TOP   # synthetic line spacing -> warp scale ~1
         strat._refit_edges_from_lines(src, 0, W, 1700)
         res = strat.poly_strategy._results["bottom"]
+        # the delivered crop needs the vertical detector's content-column span
+        strat.poly_strategy.vertical_detector = SimpleNamespace(edges_=(0, W), detected_width_=W)
+        strat._FittingClass__raster_filepath_ = src_path   # normally set by fit()
+        tf = strat.transformation_
     cols = np.linspace(0, W, 200)
     geom = res.model.predict(cols.reshape(-1, 1)).ravel()          # feeds the warp
     crop = res.crop_model.predict(cols.reshape(-1, 1)).ravel()     # valid-pixel bound
@@ -257,6 +264,18 @@ def test_stepped_sections_geometry_smooth_crop_conservative(tmp_path: Path) -> N
     # the smooth geometry DOES average across the step (that is why a crop/mask,
     # not the geometry, must enforce conservatism)
     assert geom[cols >= W // 2].max() > black_right + 5, "smooth model should cross the shallow step"
-    # the CONSERVATIVE crop excludes the shallow section's black in every column
+    # the CONSERVATIVE crop line excludes the shallow section's black in every column
     assert crop[cols >= W // 2].max() <= black_right + 3, f"crop admitted black: {crop[cols >= W // 2].max()}"
     assert crop[cols < W // 2].max() <= black_left + 3, f"left crop admitted black: {crop[cols < W // 2].max()}"
+
+    # DELIVERED collimation crop (round 4): the output rectangle's bottom bound is
+    # trimmed to the SHALLOWEST content edge, so the shallow section's black is
+    # excluded from the product -- and it is the innermost (shallow) edge, not the
+    # deep one (which would admit the shallow section's black).
+    crop_bot = tf.crop_offset[1] + tf.output_size[1]              # warped bottom row of the product
+    assert crop_bot <= black_right + 5, f"delivered crop admits shallow black: {crop_bot} > {black_right}"
+    assert crop_bot < black_left - 30, f"delivered crop did not take the innermost bottom edge: {crop_bot}"
+    # map that bottom row back to source at a right-section column: it must land
+    # at/above the shallow content edge, never down in the black.
+    src_row = float(tf.deformation(np.array([[3 * W // 4, crop_bot]], dtype=np.float32))[0, 1])
+    assert src_row <= black_right + 8, f"delivered crop bottom maps into black: {src_row}"

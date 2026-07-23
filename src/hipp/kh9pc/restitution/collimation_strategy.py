@@ -490,6 +490,14 @@ class CollimationStrategy(RestitutionStrategy):
             sub_image=sub_image,
         )
 
+    def _crop_bound_model(self, side: str) -> object:
+        """Conservative content-edge crop bound for one edge: the exposure-edge
+        refit's inward-envelope ``crop_model`` when present, else its (already
+        conservative) derived line+offset ``model``. Trims the DELIVERED
+        rectangle only -- never the geometry."""
+        r = self.poly_strategy._results[side]
+        return r.crop_model if getattr(r, "crop_model", None) is not None else r.model
+
     def _compute_transformation(self) -> Transformation:
         """Build a TPS Transformation using the fixed physical collimation line separation."""
         left, right = self.poly_strategy.vertical_detector.edges_
@@ -504,7 +512,6 @@ class CollimationStrategy(RestitutionStrategy):
         top = int(np.median(y_top_src))
         bot = top + self.collimation_line_dist
         detected_height = bot - top
-        output_height = self.output_height or detected_height
 
         y_top_dst = np.full_like(x, top)
         y_bot_dst = np.full_like(x, bot)
@@ -512,14 +519,43 @@ class CollimationStrategy(RestitutionStrategy):
         src = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_src, y_bot_src))))
         dst = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_dst, y_bot_dst))))
 
-        # inverse source destination (important)
+        # inverse source destination (important). GEOMETRY: the warp uses ONLY
+        # the smooth collimation line models -> no shear (David 2026-07-22 r3).
         deformation = tps_from_estimate(dst, src)
 
-        # ---- CENTERING TO OUTPUT ----
-        pad_x = (output_width - detected_width) / 2
-        pad_y = (output_height - detected_height) / 2
+        # ---- CONSERVATIVE VERTICAL CROP (David 2026-07-22 round 4) ----
+        # Trim the delivered rectangle to the INNERMOST content envelope on BOTH
+        # edges so no black frame / scan-section black block enters the product
+        # ("rather cut a few good pixels than let black frame into the cropped
+        # images"). The geometry above is untouched. crop_model is in SOURCE rows;
+        # map it into the warped frame through the same vertical scale the TPS
+        # applies (collimation_line_dist / detected line separation, ~1), measured
+        # per column relative to that column's collimation line. Take the deepest
+        # top edge and the shallowest bottom edge so EVERY section's black is
+        # excluded. Output height therefore varies per frame (kh9_01 center-crops
+        # downstream anyway).
+        sep = max(float(np.median(y_bot_src) - np.median(y_top_src)), 1.0)
+        scale = self.collimation_line_dist / sep
+        top_edge = top + scale * (
+            self._crop_bound_model("top").predict(x.reshape(-1, 1)).ravel() - y_top_src.ravel())
+        bot_edge = bot + scale * (
+            self._crop_bound_model("bottom").predict(x.reshape(-1, 1)).ravel() - y_bot_src.ravel())
+        crop_top = int(np.ceil(float(np.max(top_edge))))    # deepest top edge -> excludes every top black block
+        crop_bot = int(np.floor(float(np.min(bot_edge))))   # shallowest bottom edge -> excludes every bottom block
+        output_height = max(crop_bot - crop_top, 1)
 
-        crop_offset = (int(left - pad_x), int(top - pad_y))
+        # per-frame pixel cost vs the OLD fixed line-anchored window
+        old_h = self.output_height or detected_height
+        old_top = top - (old_h - detected_height) / 2.0
+        logger.info(
+            "[CollimationStrategy] conservative crop to content envelope: top %d "
+            "(%+d px vs fixed window), bottom %d (%+d px), height %d (fixed %d, "
+            "%+d px)", crop_top, int(round(crop_top - old_top)),
+            crop_bot, int(round(crop_bot - (old_top + old_h))),
+            output_height, int(old_h), int(output_height - old_h))
+
+        pad_x = (output_width - detected_width) / 2
+        crop_offset = (int(left - pad_x), crop_top)
 
         return Transformation(
             self.raster_filepath_,

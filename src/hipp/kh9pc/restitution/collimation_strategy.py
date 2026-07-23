@@ -148,6 +148,13 @@ class CollimationStrategy(RestitutionStrategy):
     # ("rather crop some valid pixels than include black rectangle in the
     # output" — the no-black constraint is categorical, area is secondary).
     crop_offset_from_line: int = 75
+    # Per-side overrides (2026-07-23 v4 calibration: offsets are per date AND
+    # per side — the exposed band beyond the line is asymmetric). None ->
+    # fall back to the symmetric crop_offset_from_line. Set by the pipeline
+    # driver from <date_dir>/crop_offset_v4.json (content-envelope p75 capped
+    # by black p1 - margin). Crop policy under iteration with Luc + Amaury.
+    crop_offset_from_line_top: int | None = None
+    crop_offset_from_line_bottom: int | None = None
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 
@@ -550,8 +557,14 @@ class CollimationStrategy(RestitutionStrategy):
         # ``bot``, so the crop is a fixed rectangle and the output height is
         # identical for every frame: collimation_line_dist +
         # 2*crop_offset_from_line. The geometry/warp above is untouched.
-        crop_top = int(top - self.crop_offset_from_line)
-        crop_bot = int(bot + self.crop_offset_from_line)
+        off_top = (self.crop_offset_from_line_top
+                   if self.crop_offset_from_line_top is not None
+                   else self.crop_offset_from_line)
+        off_bot = (self.crop_offset_from_line_bottom
+                   if self.crop_offset_from_line_bottom is not None
+                   else self.crop_offset_from_line)
+        crop_top = int(top - off_top)
+        crop_bot = int(bot + off_bot)
         output_height = max(crop_bot - crop_top, 1)
 
         # Black-leak sentinel (non-fatal): the per-column content envelope no
@@ -580,9 +593,9 @@ class CollimationStrategy(RestitutionStrategy):
                     side, int(np.ceil(worst)), int((intr > 0).sum()), intr.size)
 
         logger.info(
-            "[CollimationStrategy] fixed-offset delivered crop: line -/+ %d px "
+            "[CollimationStrategy] fixed-offset delivered crop: line -%d/+%d px "
             "-> rows [%d, %d], height %d (uniform by construction)",
-            self.crop_offset_from_line, crop_top, crop_bot, output_height)
+            off_top, off_bot, crop_top, crop_bot, output_height)
 
         pad_x = (output_width - detected_width) / 2
         crop_offset = (int(left - pad_x), crop_top)

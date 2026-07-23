@@ -137,13 +137,17 @@ class CollimationStrategy(RestitutionStrategy):
     # line should be PARALLEL to the collimation line." The delivered
     # rectangle is cut at line -/+ this offset (OUTWARD, both edges) in the
     # warped frame -- no per-column edge/envelope model feeds the crop (those
-    # remain as QC and a black-leak sentinel). Measured line->content-end
-    # distances across both WA missions: 182-377 px outward (smallest 182).
-    # 170 sits 12 px inside the smallest measured content end: every measured
-    # section's black block is excluded at a cost of <=~12 px of valid film
-    # on the tightest frame ("rather crop some valid pixels than include
-    # black rectangle in the output").
-    crop_offset_from_line: int = 170
+    # remain as QC and a black-leak sentinel). Calibration (detqc 24883964,
+    # ALL 10 frames of both WA missions): the per-column line->content-end
+    # distance dips to ~87 px at section-mosaic steps (the round-1 "182-377
+    # px" range was refit MEDIANS, not per-column minima — a 170 px offset
+    # tripped the sentinel on every frame, worst 83 px intrusion on 99/100
+    # columns of A021 top). 75 sits 12 px inside the smallest measured
+    # content end: no measured section's black block survives, at a cost of
+    # up to ~300 px of valid film on columns where content extends farthest
+    # ("rather crop some valid pixels than include black rectangle in the
+    # output" — the no-black constraint is categorical, area is secondary).
+    crop_offset_from_line: int = 75
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
 

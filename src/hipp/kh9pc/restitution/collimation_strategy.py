@@ -93,6 +93,17 @@ class CollimationStrategy(RestitutionStrategy):
     # (D3C1217 F004: +0.28% line spacing, +0.9% detected width), so 2% separates
     # scan-scale variation from a genuinely wrong line lock.
     min_inliers_threshold: float = 0.5
+    # Per-side INWARD shift of the detection strip start (px, default 0 = strip
+    # anchored at the poly edge as before). Escape hatch for frames where a
+    # bright OUTER secondary band inside the strip out-competes the true
+    # collimation line in the per-column peak search and the separation
+    # validator fails on an outer-band lock (first case: D3C1210-200323F013,
+    # 2026-07-24 — BOTH sides locked outer bands, separation 24143 vs 21770
+    # (+11%)). Set per frame by the driver (like crop_offset_from_line_*);
+    # the separation validator still gates the result, so a wrong inset can
+    # only produce a loud FAIL, never a silent wrong lock.
+    search_inset_top: int = 0
+    search_inset_bottom: int = 0
     # Exposure edge = the collimation line + a conservative fixed OUTWARD offset
     # (David 2026-07-22: "set the edge some distance outward from the
     # collimation line to remove the black frame; rather cut a few good pixels
@@ -222,8 +233,11 @@ class CollimationStrategy(RestitutionStrategy):
             # Both collimation lines lie inside the effective image content, not outside it.
             # top window starts at top_edge and extends downward; bottom window ends at bot_edge and extends upward.
             for side, window in {
-                "top": Window(col_off, top_edge, window_width, window_height),
-                "bottom": Window(col_off, bot_edge - window_height, window_width, window_height),
+                "top": Window(col_off, top_edge + self.search_inset_top,
+                              window_width, window_height),
+                "bottom": Window(col_off,
+                                 bot_edge - window_height - self.search_inset_bottom,
+                                 window_width, window_height),
             }.items():
                 sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
                 self._results[side] = self._process_side(sub_image, side)

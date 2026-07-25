@@ -67,6 +67,13 @@ class CollimationStrategy(RestitutionStrategy):
     polynomial, and the fixed physical distance between lines (``collimation_line_dist``)
     sets the output height precisely rather than relying on the detected edge positions.
     Fails if the inlier ratio on either side falls below ``min_inliers_threshold``.
+
+    .. warning:: Configure via CONSTRUCTOR KWARGS, never by assigning class
+       attributes: annotated dataclass fields freeze their ``__init__``
+       defaults at class creation, so ``CollimationStrategy.attr = x``
+       silently never reaches new instances (found 2026-07-25 — the per-side
+       crop offsets set that way by every production driver were inert and
+       all fits ran the symmetric ``crop_offset_from_line`` default).
     """
 
     poly_strategy: PolyStrategy = field(default_factory=PolyStrategy)

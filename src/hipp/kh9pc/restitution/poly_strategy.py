@@ -81,7 +81,8 @@ class PolyStrategy(RestitutionStrategy):
     grid_shape: tuple[int, int] = (100, 50)
     min_inliers_threshold: float = 0.5
     output_width: int | None = None
-    output_height: int | None = DEFAULT_OUTPUT_HEIGHT
+    # None -> canonical KH9ImageSpec height (ed2c30e port); set only to override
+    output_height: int | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -226,7 +227,13 @@ class PolyStrategy(RestitutionStrategy):
         """Build a TPS Transformation that maps the fitted curved edges to horizontal target lines."""
         left, right = self.vertical_detector.edges_
         detected_width = self.vertical_detector.detected_width_
-        output_width = self.output_width or detected_width
+        # Canonical output size ALWAYS (targeted port of origin/main
+        # ed2c30e): the detected-size fallback produced non-canonical
+        # rasters (17.4-18k heights on 2026-vintage casa frames, job
+        # 25016563) that break every downstream fixed-dims assumption.
+        from hipp.kh9pc.kh9_image_spec import KH9ImageSpec
+        _spec_w, _spec_h = KH9ImageSpec.from_raster_filepath(self.raster_filepath_).expected_size
+        output_width = self.output_width or _spec_w
 
         x = np.linspace(left, right, self.grid_shape[0])
 
@@ -263,7 +270,11 @@ class PolyStrategy(RestitutionStrategy):
         bot_inset = int(max(0.0, float(np.max(y_bot_src - bot_crop.predict(x.reshape(-1, 1)).ravel())))) if bot_crop else 0
         crop_top, crop_bot = top + top_inset, bot - bot_inset
         detected_height = crop_bot - crop_top
-        output_height = min(self.output_height, detected_height) if self.output_height else detected_height
+        # canonical spec height unless the caller explicitly overrides
+        # (second half of the ed2c30e port; the old min(default, detected)
+        # collapsed to the detected height whenever the film sat tilted or
+        # short in the scan)
+        output_height = self.output_height or _spec_h
 
         pad_x = (output_width - detected_width) / 2
         pad_y = (output_height - detected_height) / 2

@@ -243,13 +243,24 @@ class FiducialStrategy(RestitutionStrategy):
             w_width = w_end - w_start
             w_center = w_start + w_width // 2
 
-            # strip above the top edge: rows 0 → predicted top row
+            # strip above the top edge: rows 0 → predicted top row.
+            # Clamp BEFORE constructing the Window: rasterio validates at
+            # init, so a negative predicted row raises ValueError there and
+            # the height<=0 guard below never runs (2026-08-21: the fitted
+            # top-edge poly dips below 0 on several 2026-vintage casa
+            # scans — jobs 25016147 frames A011/A016/F011/F017).
             if side == "top":
                 top_row = int(self.poly_strategy.top_.model.predict(np.array([[w_center]])).flat[0])
+                top_row = max(0, min(top_row, src.height))
+                if top_row == 0 or w_width <= 0:
+                    continue
                 window = Window(w_start, 0, w_width, top_row)
             # strip below the bottom edge: predicted bottom row → end of raster
             else:
                 bot_row = int(self.poly_strategy.bottom_.model.predict(np.array([[w_center]])).flat[0])
+                bot_row = max(0, min(bot_row, src.height))
+                if src.height - bot_row <= 0 or w_width <= 0:
+                    continue
                 window = Window(w_start, bot_row, w_width, src.height - bot_row)
 
             if window.height <= 0 or window.width <= 0:

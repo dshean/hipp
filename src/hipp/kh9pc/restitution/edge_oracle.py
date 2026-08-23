@@ -95,12 +95,14 @@ def _strip_detect(rows, med, spr):
                 while j < nn and seq[j] > spike_lo:
                     j += 1
                 if (j - i) * ROW_STEP <= 300:
-                    kk, dark = j, 0
+                    # CONSECUTIVE dark run (2026-08-23, fix-sibling of the
+                    # harness 09:4x change)
+                    kk, dark, best = j, 0, 0
                     while kk < nn and (kk - j) * ROW_STEP < 800:
-                        if seq[kk] < dark_thr:
-                            dark += 1
+                        dark = dark + 1 if seq[kk] < dark_thr else 0
+                        best = max(best, dark)
                         kk += 1
-                    if dark * ROW_STEP >= 100:
+                    if best * ROW_STEP >= 100:
                         pk = i + int(np.argmax(seq[i:j]))
                         e = j
                         while e < nn and seq[e] >= dark_thr:
@@ -108,12 +110,12 @@ def _strip_detect(rows, med, spr):
                         return pk, min(e, nn - 1)
                 i = j
             elif seq[i] < dark_thr:
-                kk, dark = i, 0
+                kk, dark, best = i, 0, 0
                 while kk < nn and (kk - i) * ROW_STEP < 800:
-                    if seq[kk] < dark_thr:
-                        dark += 1
+                    dark = dark + 1 if seq[kk] < dark_thr else 0
+                    best = max(best, dark)
                     kk += 1
-                if dark * ROW_STEP >= 300:
+                if best * ROW_STEP >= 300:
                     return None, i
                 i += 1                       # audit M-4: never skip spikes
             else:

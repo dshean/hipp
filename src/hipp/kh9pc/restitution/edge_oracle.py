@@ -85,7 +85,7 @@ def _strip_detect(rows, med, spr):
     m_c = float(np.median(med[c0:c1]))
     s_c = max(3.0, 1.4826 * float(np.median(np.abs(med[c0:c1] - m_c))))
 
-    def scan_outward(seq):
+    def scan_outward(seq, tex):
         spike_hi, spike_lo = m_c + 3 * s_c, m_c + 1.5 * s_c
         dark_thr = m_c - 2.5 * s_c
         i, nn = 0, len(seq)
@@ -102,7 +102,11 @@ def _strip_detect(rows, med, spr):
                         dark = dark + 1 if seq[kk] < dark_thr else 0
                         best = max(best, dark)
                         kk += 1
-                    if best * ROW_STEP >= 100:
+                    beyond_ok = True
+                    bey = tex[min(nn, kk):min(nn, kk + int(4000 / ROW_STEP))]
+                    if bey.size and bey.mean() > 0.25:
+                        beyond_ok = False
+                    if best * ROW_STEP >= 100 and beyond_ok:
                         pk = i + int(np.argmax(seq[i:j]))
                         e = j
                         while e < nn and seq[e] >= dark_thr:
@@ -116,6 +120,12 @@ def _strip_detect(rows, med, spr):
                     best = max(best, dark)
                     kk += 1
                 if best * ROW_STEP >= 300:
+                    # TERMINAL check: content resuming beyond the run means
+                    # it was shadow/water, not the border (fix-sibling)
+                    beyond = tex[min(nn, kk):min(nn, kk + int(4000 / ROW_STEP))]
+                    if beyond.size and beyond.mean() > 0.25:
+                        i = kk
+                        continue
                     return None, i
                 i += 1                       # audit M-4: never skip spikes
             else:
@@ -125,7 +135,8 @@ def _strip_detect(rows, med, spr):
     out = {}
     for side, start in (("top", c0), ("bottom", c1)):
         seq = med[start::-1] if side == "top" else med[start:]
-        hit = scan_outward(seq)
+        tex = textured[start::-1] if side == "top" else textured[start:]
+        hit = scan_outward(seq, tex)
         if hit is None:
             out[side] = (None, None, False)
             continue

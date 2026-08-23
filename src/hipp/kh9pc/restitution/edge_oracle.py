@@ -138,14 +138,15 @@ def _strip_detect(rows, med, spr):
         vin = (textured[anchor:min(n, anchor + int(1200 / ROW_STEP))].mean()
                if side == "top" else
                textured[max(0, anchor - int(1200 / ROW_STEP)):anchor].mean())
-        # audit M-5: outward side must be margin-class, not more content
-        # (a bright glint + shadow inside content must not pass)
-        vout = (textured[max(0, e_i - int(1500 / ROW_STEP)):max(0, e_i - 1)].mean()
-                if side == "top" else
-                textured[min(n, e_i + 1):min(n, e_i + int(1500 / ROW_STEP))].mean())
+        # Audit finding M-5 (outward-must-be-untextured) was REVERTED
+        # 2026-08-23 02:2x: on real post-C5 mosaics the outward side of the
+        # frame edge legitimately carries marks/titling that read as
+        # textured, and the check rejected ~40% of GOOD strips (oracle gate
+        # F007/A011, support 88-97% with valid ~50-67%). Inward-textured
+        # validation is the review-accepted v4.2 behavior.
         out[side] = (int(rows[e_i]),
                      None if l_i is None else int(rows[l_i]),
-                     bool(vin > 0.7 and vout < 0.35))
+                     bool(vin > 0.7))
     return out
 
 

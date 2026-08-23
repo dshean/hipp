@@ -52,9 +52,12 @@ class EdgeFit:
 
     @property
     def passed(self) -> bool:
-        # thresholds MATCH the review-accepted harness PASS verdict
-        # (audit H-3): WARN-grade fits must not silently feed the warp
-        return self.valid_frac >= 0.8 and self.support_frac >= 0.7
+        # Calibrated 2026-08-23 against dshean's full-block visual review of
+        # all 48 casa_block sides (min approved valid=53%, support=80%): the
+        # line-anchored detector demotes inside-line picks, so valid_frac
+        # runs lower by design while support_frac carries fit quality.
+        # WARN-grade fits must not silently feed the warp (audit H-3).
+        return self.valid_frac >= 0.5 and self.support_frac >= 0.8
 
 
 def _strip_profiles(src):

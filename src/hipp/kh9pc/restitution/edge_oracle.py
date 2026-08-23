@@ -184,6 +184,7 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
     picks = {"top": [], "bottom": []}
     valid = {"top": [], "bottom": []}
     lines = {"top": 0, "bottom": 0}
+    lines_y = {"top": [], "bottom": []}
     for i in range(len(xc)):
         det = _strip_detect(rows, med[i], spr[i])
         # SNR-adaptive 3-strip retry (audit H-4: review-accepted harness
@@ -200,6 +201,7 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
         for side, (e, l, v) in det.items():
             picks[side].append(np.nan if e is None else e)
             valid[side].append(v)
+            lines_y[side].append(np.nan if l is None else l)
             if l is not None:
                 lines[side] += 1
     out = {}
@@ -210,10 +212,33 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
         c, keep = _robust_poly(np.asarray(xc, float), yv)
         if c is None:
             continue
+        # LINE-ANCHORED EDGE (David 2026-08-23, fix-sibling of the harness
+        # change): where the line fit is solid, edge curve = line fit +
+        # robust median per-strip offset; outlier edge picks cannot bend it
+        yl = np.array(lines_y[side], float)
+        cl, _ = _robust_poly(np.asarray(xc, float), np.where(v, yl, np.nan))
+        if cl is not None:
+            # inside-the-line edge picks are anatomically impossible ->
+            # suspect: excluded and their strips demoted (fix-sibling)
+            yl_fit = np.polyval(cl, np.asarray(xc, float))
+            tol = 40.0
+            inside = (y > yl_fit + tol) if side == "top" else (y < yl_fit - tol)
+            v = v & ~(np.isfinite(y) & inside)
+            both = v & np.isfinite(yl) & np.isfinite(y)
+            if both.sum() >= 6:
+                xb = np.asarray(xc, float)[both]
+                offs = y[both] - np.polyval(cl, xb)
+                d = float(np.median(offs))
+                mad = float(np.median(np.abs(offs - d)))
+                ce = cl.copy()
+                ce[-1] += d
+                resid = y - np.polyval(ce, np.asarray(xc, float))
+                c = ce
+                keep = np.isfinite(y) & (np.abs(resid) < max(4 * mad, 60))
         out[side] = EdgeFit(
             coeffs=c,
             valid_frac=float(v.mean()) if v.size else 0.0,
-            support_frac=float(keep.sum() / max(1, v.sum())),
+            support_frac=float((keep & v).sum() / max(1, v.sum())),
             n_strips=len(xc),
             line_frac=lines[side] / max(1, len(xc)),
         )

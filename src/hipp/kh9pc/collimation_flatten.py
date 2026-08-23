@@ -17,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 import rasterio
-from numpy.typing import NDArray
+from numpy.typing import DTypeLike, NDArray
 from rasterio.windows import Window
 
 logger = logging.getLogger(__name__)
@@ -59,7 +59,7 @@ class EdgeFlattenStats:
 
 
 def _flatten_band(
-    band: NDArray[np.floating],
+    band: NDArray[np.number],
     saturation_dn: float | None,
     nodata: float,
     dtype_max: float,
@@ -67,7 +67,8 @@ def _flatten_band(
     taper_px: int = DEFAULT_TAPER_PX,
     match_spread: bool = False,
     gain_cap: float = DEFAULT_GAIN_CAP,
-) -> tuple[NDArray[np.floating], EdgeFlattenStats]:
+    out_dtype: DTypeLike | None = None,
+) -> tuple[NDArray[np.number], EdgeFlattenStats]:
     """Flatten one edge band (rows ordered outer edge first, regardless of side).
 
     1. per-row median DN over valid (non-nodata) pixels -> brightness curve;
@@ -84,6 +85,14 @@ def _flatten_band(
     6. results are clipped to [nodata + 1, dtype_max] so no valid pixel becomes
        nodata or wraps; only if ``saturation_dn`` is given do INPUT pixels
        at/above it (clipped highlights) become ``nodata``.
+
+    ``band`` may be any numeric dtype: the per-row statistics and the
+    correction expression promote row-sized temporaries to float64 only,
+    never the whole strip. With ``out_dtype`` set (integer), the returned
+    array is that dtype and corrected rows are ``np.rint``-ed on assignment —
+    bit-identical to the former promote-whole-strip-to-float64 path with a
+    single trailing rint/cast, at ~1/8 the memory. ``out_dtype=None``
+    preserves the legacy contract (out dtype = band dtype, no rounding).
     """
     n_rows = band.shape[0]
     valid = band != nodata
@@ -111,12 +120,13 @@ def _flatten_band(
     shift_t = shift * taper
     gain_t = 1.0 + (gain - 1.0) * taper
 
-    out = band.copy()
+    out = band.copy() if out_dtype is None else band.astype(out_dtype)
     for r in np.flatnonzero((shift_t != 0) | (gain_t != 1.0)):
         row = out[r]
         row_valid = valid[r]
-        corrected = (row[row_valid] - curve[r]) * gain_t[r] + curve[r] + shift_t[r]
-        row[row_valid] = np.clip(corrected, nodata + 1, dtype_max)
+        corrected = (band[r][row_valid] - curve[r]) * gain_t[r] + curve[r] + shift_t[r]
+        clipped = np.clip(corrected, nodata + 1, dtype_max)
+        row[row_valid] = clipped if out_dtype is None else np.rint(clipped)
 
     n_saturated = 0
     if saturation_dn is not None:
@@ -204,7 +214,7 @@ def flatten_collimation_band(
 
 
 def _flatten_band_windowed(
-    band: NDArray[np.floating],
+    band: NDArray[np.number],
     nodata: float,
     dtype_max: float,
     side: str,
@@ -213,7 +223,8 @@ def _flatten_band_windowed(
     gain_cap: float = DEFAULT_GAIN_CAP,
     window_px: int = 8000,
     min_valid: int = 200,
-) -> tuple[NDArray[np.floating], EdgeFlattenStats]:
+    out_dtype: DTypeLike | None = None,
+) -> tuple[NDArray[np.number], EdgeFlattenStats]:
     """Moving-window flavor of :func:`_flatten_band` (David 2026-07-19).
 
     The full-row-median model assumes edge rows are radiometrically
@@ -257,7 +268,7 @@ def _flatten_band_windowed(
         ramp = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, taper_px)))
         taper[n_rows - taper_px:] = ramp
     xs = np.arange(n_cols, dtype=np.float64)
-    out = band.copy()
+    out = band.copy() if out_dtype is None else band.astype(out_dtype)
     pivot_row = np.empty(n_cols)
     for r in range(n_rows):
         sh = shift[r] * taper[r]
@@ -270,7 +281,8 @@ def _flatten_band_windowed(
         rowv = valid[r]
         corrected = ((band[r][rowv] - pivot_row[rowv]) * gn_x[rowv]
                      + pivot_row[rowv] + sh_x[rowv])
-        out[r][rowv] = np.clip(corrected, nodata + 1, dtype_max)
+        clipped = np.clip(corrected, nodata + 1, dtype_max)
+        out[r][rowv] = clipped if out_dtype is None else np.rint(clipped)
     stats = EdgeFlattenStats(
         side=side,
         reference_dn=float(np.nanmedian(ref)),
@@ -285,8 +297,8 @@ def _flatten_band_windowed(
 
 
 def _mask_dark_margin(
-    band: NDArray[np.floating],
-    raw: NDArray[np.floating],
+    band: NDArray[np.number],
+    raw: NDArray[np.number],
     dark_thresh: float = 20.0,
     min_run: int = 25,
 ) -> int:
@@ -297,19 +309,30 @@ def _mask_dark_margin(
     sustained ``min_run``-row run of raw >= ``dark_thresh`` begins; every
     pixel edge-side of it is set 0. Columns with no such run (margin deeper
     than the band, or all-dark) are zeroed entirely. Returns px zeroed.
+
+    Columns are independent, so the run-length scan proceeds in column
+    chunks — the cumsum/runsum temporaries over a full 342k-wide strip
+    were multi-GB, and per-chunk they stay <0.5 GB.
     """
     ok = raw >= dark_thresh
     n_rows, n_cols = ok.shape
     if min_run > n_rows:
         min_run = n_rows
-    csum = np.cumsum(ok, axis=0)
-    runsum = csum[min_run - 1:] - np.vstack(
-        [np.zeros((1, n_cols), dtype=csum.dtype), csum[:-min_run]])
-    full = runsum >= min_run          # row i => rows [i, i+min_run) all ok
-    start = np.where(full.any(axis=0), full.argmax(axis=0), n_rows)
-    mask = np.arange(n_rows)[:, None] < start[None, :]
-    band[mask] = 0.0
-    return int(mask.sum())
+    chunk = 65536
+    row_idx = np.arange(n_rows)[:, None]
+    total = 0
+    for x0 in range(0, n_cols, chunk):
+        sl = slice(x0, min(x0 + chunk, n_cols))
+        csum = np.cumsum(ok[:, sl], axis=0, dtype=np.int32)
+        nc = csum.shape[1]
+        runsum = csum[min_run - 1:] - np.vstack(
+            [np.zeros((1, nc), dtype=csum.dtype), csum[:-min_run]])
+        full = runsum >= min_run      # row i => rows [i, i+min_run) all ok
+        start = np.where(full.any(axis=0), full.argmax(axis=0), n_rows)
+        mask = row_idx < start[None, :]
+        band[:, sl][mask] = 0.0
+        total += int(mask.sum())
+    return total
 
 
 def flatten_collimation_band_vrt(
@@ -382,31 +405,43 @@ def flatten_collimation_band_vrt(
         if 2 * band_px >= height:
             raise ValueError(f"image height {height} too small for band_px {band_px}")
 
-        top_raw = src.read(1, window=Window(0, 0, width, band_px)).astype(np.float64)
-        bot_raw = src.read(1, window=Window(0, height - band_px, width, band_px)).astype(np.float64)
+        band_profile = {
+            "driver": "GTiff", "width": width, "height": band_px, "count": 1,
+            "dtype": "uint16", "compress": "lzw", "tiled": True,
+            "blockxsize": 256, "blockysize": 256, "BIGTIFF": "IF_SAFER",
+        }
+
+        # One side at a time, strips kept in the source's native dtype and the
+        # corrected band built directly as UInt16 (out_dtype): only row-sized
+        # float64 temporaries exist, ~3 GB peak/process vs ~28 GB for the former
+        # whole-strip float64 promotion (342k x 1500 strips, 2026-08-22).
         # out_max = UInt16 ceiling: the [nodata+1, out_max] clip in _flatten_band
         # becomes a no-op for 8-bit sources (max corrected ~255*gain_cap+shift
         # << 65535) — i.e. NO saturation is introduced.
-        if window_px is not None:
-            top, top_stats = _flatten_band_windowed(
-                top_raw, nodata, out_max, "top", taper_px, match_spread,
-                gain_cap, window_px)
-            bot_flip, bot_stats = _flatten_band_windowed(
-                bot_raw[::-1], nodata, out_max, "bottom", taper_px,
-                match_spread, gain_cap, window_px)
-        else:
-            top, top_stats = _flatten_band(
-                top_raw, None, nodata, out_max, "top", taper_px, match_spread, gain_cap
-            )
-            bot_flip, bot_stats = _flatten_band(
-                bot_raw[::-1], None, nodata, out_max, "bottom", taper_px, match_spread, gain_cap
-            )
-        if mask_dark_margin:
-            n_top = _mask_dark_margin(top, top_raw, dark_thresh, dark_min_run)
-            n_bot = _mask_dark_margin(bot_flip, bot_raw[::-1], dark_thresh, dark_min_run)
-            logger.info("%s: dark-margin mask zeroed %d px (top) / %d px (bottom)",
-                        input_path.name, n_top, n_bot)
-        bot = bot_flip[::-1]
+        def _one_side(side: str, window: Window, flip: bool, path: Path) -> EdgeFlattenStats:
+            raw = src.read(1, window=window)
+            work = raw[::-1] if flip else raw
+            if window_px is not None:
+                out, stats = _flatten_band_windowed(
+                    work, nodata, out_max, side, taper_px, match_spread,
+                    gain_cap, window_px, out_dtype=out_dtype)
+            else:
+                out, stats = _flatten_band(
+                    work, None, nodata, out_max, side, taper_px, match_spread,
+                    gain_cap, out_dtype=out_dtype)
+            if mask_dark_margin:
+                n = _mask_dark_margin(out, work, dark_thresh, dark_min_run)
+                logger.info("%s: dark-margin mask zeroed %d px (%s)",
+                            input_path.name, n, side)
+            if flip:
+                out = out[::-1]
+            with rasterio.open(path, "w", **band_profile) as dst:
+                dst.write(np.ascontiguousarray(out), 1)
+            return stats
+
+        top_stats = _one_side("top", Window(0, 0, width, band_px), False, top_path)
+        bot_stats = _one_side(
+            "bottom", Window(0, height - band_px, width, band_px), True, bot_path)
         for s in (top_stats, bot_stats):
             logger.info(
                 "%s: %s edge ref=%.0f DN, removed up to %.0f DN over %d rows, added up to %.0f DN "
@@ -414,16 +449,6 @@ def flatten_collimation_band_vrt(
                 input_path.name, s.side, s.reference_dn, s.max_excess_dn,
                 s.rows_darkened, s.max_deficit_dn, s.rows_brightened, s.max_gain,
             )
-
-        band_profile = {
-            "driver": "GTiff", "width": width, "height": band_px, "count": 1,
-            "dtype": "uint16", "compress": "lzw", "tiled": True,
-            "blockxsize": 256, "blockysize": 256, "BIGTIFF": "IF_SAFER",
-        }
-        with rasterio.open(top_path, "w", **band_profile) as dst:
-            dst.write(np.rint(top).astype(out_dtype), 1)
-        with rasterio.open(bot_path, "w", **band_profile) as dst:
-            dst.write(np.rint(bot).astype(out_dtype), 1)
 
     # ---- composite VRT: top band | interior passthrough | bottom band ----
     import os

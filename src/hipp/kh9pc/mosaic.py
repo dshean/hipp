@@ -192,8 +192,9 @@ def write_mosaic(
     """Warp and merge all aligned images into a single output GeoTIFF.
 
     Images are warped into the output pixel space using WarpedVRT and merged
-    block-by-block. Valid pixels from later images do not overwrite valid pixels
-    already written from earlier images.
+    block-by-block. NONZERO pixels from LATER images OVERWRITE earlier ones
+    (audit M-9: the code has always been later-nonzero-wins; the previous
+    docstring claimed the opposite).
 
     If any image extends above or to the left of the first image (negative coordinates
     after transformation), an offset is automatically applied to all transforms so that
@@ -234,6 +235,20 @@ def write_mosaic(
             pbar = LogProgressBar(f"mosaicing {alignment.image_path.name}", n_blocks, logger)
 
             adjusted_transform = T_offset @ alignment.absolute_transform
+            # C5 (2026-08-23): the merge mask `warped != 0` implicitly
+            # assumes a DARK scan background. 2026-vintage rescans have a
+            # PINNED-BRIGHT background (DN~251) around the film in every
+            # scan part, which `!= 0` pastes as valid content -- the white
+            # staircase along the merged-mosaic edges. Restrict each part
+            # to its detected film-content bbox (mapped through the part's
+            # transform) so scan background never enters the mosaic.
+            bbox = _part_content_bbox(alignment.image_path)
+            if bbox is None:
+                logger.info("%s: dark scan background (self-masking) or no "
+                            "bright surround -- legacy full-part paste",
+                            alignment.image_path.name)
+            else:
+                inv_t = np.linalg.inv(adjusted_transform)
 
             with rasterio.open(alignment.image_path) as src:
                 with WarpedVRT(
@@ -251,6 +266,15 @@ def write_mosaic(
                         warped = vrt.read(1, window=window)
                         # no nodata metadata is set: valid pixels can legitimately be 0 (dark areas)
                         mask = warped != 0
+                        if bbox is not None and mask.any():
+                            # map this block's dst pixels back to part pixel
+                            # coords; keep only pixels inside the content bbox
+                            yy, xx = np.mgrid[window.row_off:window.row_off + window.height,
+                                              window.col_off:window.col_off + window.width]
+                            sx = inv_t[0, 0] * xx + inv_t[0, 1] * yy + inv_t[0, 2]
+                            sy = inv_t[1, 0] * xx + inv_t[1, 1] * yy + inv_t[1, 2]
+                            x0, y0, x1, y1 = bbox
+                            mask &= (sx >= x0) & (sx < x1) & (sy >= y0) & (sy < y1)
                         if not mask.any():
                             continue
                         existing = dst.read(1, window=window)
@@ -308,6 +332,40 @@ def image_mosaic_asp(
 ####################################################################################################################################
 #                                                   PRIVATE FUNCTIONS
 ####################################################################################################################################
+
+
+def _part_content_bbox(image_path, dark_dn: float = 8.0,
+                       bright_dn: float = 249.0, min_frac: float = 0.15,
+                       margin_px: int = 32):
+    """Film-content bbox of one scan part, in part pixel coords.
+
+    The scan background is uniform and pinned (bright ~DN 251 on
+    2026-vintage rescans, dark ~0 on 2018-vintage); film content is
+    strictly interior DN. Decimated occupancy scan -> (x0, y0, x1, y1)
+    shrunk by ``margin_px`` so residual background at the boundary stays
+    outside. Returns None when no plausible content region is found
+    (caller falls back to legacy full-part paste, loudly).
+    """
+    with rasterio.open(image_path) as s:
+        oh = min(1024, s.height)
+        ow = min(1024, s.width)
+        a = s.read(1, out_shape=(oh, ow))
+        fy, fx = s.height / a.shape[0], s.width / a.shape[1]
+    # audit H-2: act ONLY on bright-background scans (2026 vintage). A dark
+    # background already self-masks via the != 0 merge rule, and on dark
+    # parts the interior test can crop the rails (timing marks, titling)
+    # out of the mosaic. Border median decides.
+    border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]]).astype(float)
+    if np.median(border) < bright_dn:
+        return None
+    margin_px = max(margin_px, int(2 * max(fx, fy)))
+    interior = (a > dark_dn) & (a < bright_dn)
+    rows = np.flatnonzero(interior.mean(axis=1) > min_frac)
+    cols = np.flatnonzero(interior.mean(axis=0) > min_frac)
+    if rows.size < 4 or cols.size < 4:
+        return None
+    return (cols[0] * fx + margin_px, rows[0] * fy + margin_px,
+            (cols[-1] + 1) * fx - margin_px, (rows[-1] + 1) * fy - margin_px)
 
 
 def _compute_canvas(alignments: list[ImageAlignment]) -> tuple[int, int, float, float]:

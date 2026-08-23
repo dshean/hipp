@@ -226,6 +226,10 @@ class CollimationStrategy(RestitutionStrategy):
         """
         if not self.poly_strategy.is_fitted or raster_filepath != self.poly_strategy.raster_filepath_:
             self.poly_strategy.fit(raster_filepath)
+            if self.poly_strategy.is_failed:
+                raise DetectionError(
+                    f"poly edge model failed on {raster_filepath.name} — cannot "
+                    "anchor collimation strip placement (review C2/M-1, 2026-08-23)")
 
         col_off, col_end = self.poly_strategy.vertical_detector.edges_
         window_width = self.poly_strategy.vertical_detector.detected_width_

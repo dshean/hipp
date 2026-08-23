@@ -6,6 +6,8 @@ Description: PolyStrategy — polynomial edge fitting for KH-9 PC restitution. S
     the curved edges.
 """
 
+import logging
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
@@ -22,6 +24,8 @@ from hipp.kh9pc.redaction_mask import detect_ruptures_skip_redacted, redacted_re
 from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, detect_content_edges, fit_ransac_poly, tps_from_estimate
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.vertical_detector import VerticalDetector
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -209,6 +213,27 @@ class PolyStrategy(RestitutionStrategy):
         content end, NOT the DN-threshold film-frame boundary out in the black
         margin. Returns ``(round-1 strip-placement model, None)`` when too few
         columns yield a content edge."""
+        # Edge-oracle primary (dshean 2026-08-23, review-accepted on
+        # casa_block): clean-slate per-strip middle-out detector replaces
+        # the DN-threshold content walk that locked onto outer margin
+        # structure on 2026-vintage scans (restitution review C1). The
+        # legacy path below remains the fallback when the oracle's own
+        # verdict does not pass.
+        if getattr(self, "_edge_oracle_path_", None) != self.raster_filepath_:
+            try:
+                from .edge_oracle import fit_format_edges
+                self._edge_oracle_ = fit_format_edges(self.raster_filepath_)
+            except Exception as _exc:   # audit H-5: NEVER a silent fallback
+                logger.warning(
+                    "edge oracle failed on %s: %r — falling back to legacy "
+                    "DN-threshold content edges (review C1 risk)",
+                    self.raster_filepath_, _exc)
+                self._edge_oracle_ = {}
+            self._edge_oracle_path_ = self.raster_filepath_
+        _ef = self._edge_oracle_.get(side)
+        if _ef is not None and _ef.passed:
+            return _ef, None
+
         result = self._results[side]
         band = result.sub_image.band
         edges = detect_content_edges(band, side, black_dn=self.background_threshold)

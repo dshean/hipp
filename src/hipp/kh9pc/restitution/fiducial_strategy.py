@@ -185,6 +185,20 @@ class FiducialStrategy(RestitutionStrategy):
         if not self.poly_strategy.is_fitted or raster_filepath != self.poly_strategy.raster_filepath_:
             self.poly_strategy.fit(raster_filepath)
 
+        # C2/H1 fail-loud (2026-08-23): the rail-scan windows are placed
+        # from the poly edge models; a degraded/failed poly fit silently
+        # slid every window off the (tilted) rail and produced zero or
+        # gappy detections that looked like film problems. Never consume a
+        # failed edge model for window placement. NOTE (audit M-2): this
+        # catches only the LOW-INLIER failure class; a consensus fit on
+        # the WRONG boundary passes is_failed — the oracle cross-check
+        # (compare against edge_oracle fits) is the fuller gate, deferred.
+        if self.poly_strategy.is_failed:
+            raise DetectionError(
+                f"poly edge model failed on {raster_filepath.name} — cannot "
+                "place fiducial rail-scan windows (see restitution review "
+                "C2/H1, 2026-08-23)")
+
         _, col_end = self.poly_strategy.vertical_detector.edges_
 
         with rasterio.open(raster_filepath) as src:

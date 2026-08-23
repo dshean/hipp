@@ -387,12 +387,33 @@ def plot_fiducial_detected_profiles(detector: FiducialStrategy, window_height_fr
     inset_slots = [[fig.add_subplot(gs[row, col + 1]) for col in range(n_insets)] for row in range(2)]
 
     with rasterio.open(detector.raster_filepath_) as src:
-        window_height = int(src.height * window_height_fraction)
-        windows = [
-            Window(0, 0, src.width, window_height),
-            Window(0, src.height - window_height, src.width, window_height),
-        ]
         edge_models = [detector.poly_strategy.top_.model, detector.poly_strategy.bottom_.model]
+        # Display windows ANCHORED on the content-edge model so the rail,
+        # the fiducial marks, the collimation line, and the start of image
+        # content are all visible for every column despite frame tilt
+        # (David 2026-08-22/23: fixed-fraction windows cut all of these
+        # off). Rail side gets the larger pad; falls back to the legacy
+        # fixed fraction if a model is unusable.
+        PAD_RAIL, PAD_CONTENT = 4500, 2500
+        windows = []
+        x_probe = np.linspace(0, src.width, 200).reshape(-1, 1)
+        for side_i, model in enumerate(edge_models):
+            try:
+                yy = model.predict(x_probe).ravel()
+                lo, hi = float(np.min(yy)), float(np.max(yy))
+                if side_i == 0:      # top: rail/marks above the edge
+                    y0, y1 = lo - PAD_RAIL, hi + PAD_CONTENT
+                else:                # bottom: rail/marks below the edge
+                    y0, y1 = lo - PAD_CONTENT, hi + PAD_RAIL
+            except Exception:
+                wh = int(src.height * window_height_fraction)
+                y0, y1 = (0, wh) if side_i == 0 else (src.height - wh, src.height)
+            y0 = max(0, int(y0))
+            y1 = min(src.height, int(y1))
+            if y1 - y0 < 100:        # degenerate model -> legacy window
+                wh = int(src.height * window_height_fraction)
+                y0, y1 = (0, wh) if side_i == 0 else (src.height - wh, src.height)
+            windows.append(Window(0, y0, src.width, y1 - y0))
 
         def _spacing_info(cx: np.ndarray) -> str:
             if len(cx) >= 2:
@@ -403,7 +424,7 @@ def plot_fiducial_detected_profiles(detector: FiducialStrategy, window_height_fr
         for row, (ax, side, window, result, edge_model) in enumerate(
             zip(main_axes, ["top", "bottom"], windows, sides_results, edge_models)
         ):
-            sub_img = SubImage(src, window, (1, 512, 4096))
+            sub_img = SubImage(src, window, (1, 1024, 4096))
             ax.imshow(sub_img.band, cmap="gray", aspect="auto")
 
             ax_handles: list[Line2D] = []
@@ -436,7 +457,11 @@ def plot_fiducial_detected_profiles(detector: FiducialStrategy, window_height_fr
 
             x_edge = np.linspace(0, src.width, 500)
             edge_local = sub_img.to_local(np.column_stack([x_edge, edge_model.predict(x_edge.reshape(-1, 1)).ravel()]))
-            ax.plot(edge_local[:, 0], edge_local[:, 1], color="steelblue", linewidth=1.0, linestyle="--")
+            (edge_line,) = ax.plot(
+                edge_local[:, 0], edge_local[:, 1], color="steelblue",
+                linewidth=1.0, linestyle="--",
+                label="poly strip-placement edge model (rail-window anchor)")
+            ax_handles.append(edge_line)
 
             ax.legend(handles=ax_handles, loc="lower center", bbox_to_anchor=(0.5, 1.0), fontsize=15, frameon=True)
             ax.axis("off")

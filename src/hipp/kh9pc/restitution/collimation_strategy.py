@@ -23,10 +23,24 @@ from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
 from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, _featureless_edge, fit_ransac_poly, tps_from_estimate
-from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
+from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, DetectionError, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
 
 logger = logging.getLogger(__name__)
+
+
+class _ParallelLineModel:
+    """Line model from the joint PARALLEL-PAIR refit: one shared poly2
+    shape + a per-side offset (dshean 2026-08-24). Module-level so fitted
+    strategies stay joblib-picklable. predict() is sklearn-compatible."""
+
+    def __init__(self, a2, a1, x0, offset, inlier_mask):
+        self.a2, self.a1, self.x0, self.offset = float(a2), float(a1), float(x0), float(offset)
+        self.inlier_mask_ = inlier_mask
+
+    def predict(self, X):
+        x = np.asarray(X, dtype=float).ravel() - self.x0
+        return self.a2 * x ** 2 + self.a1 * x + self.offset
 
 
 @dataclass
@@ -299,9 +313,77 @@ class CollimationStrategy(RestitutionStrategy):
                         bad, "bottom" if bad == "top" else "top",
                         self._results[bad].inlier_ratio)
             if self._separation_ok:
+                self._joint_parallel_refit()
                 self._refit_edges_from_lines(src, col_off, window_width, window_height)
 
         return self
+
+    def _joint_parallel_refit(self) -> None:
+        """Refit BOTH collimation lines as a PARALLEL PAIR: one shared
+        poly2 shape + a per-side offset (dshean 2026-08-24). The lines
+        are printed parallel, so the clean side outvotes residual
+        contamination (USGS logo, margin bands) that drags one side's
+        fit near the strip ends -- the divergence dshean flagged in the
+        distortion QC, which propagates into the warp and hurts ba1 at
+        the strip edges. Solved by iterative least squares on the union
+        of both sides' RANSAC-inlier peaks with tight MAD rejection;
+        degrades to the per-side fits on any degeneracy."""
+        import dataclasses
+        pts = {}
+        for side in ("top", "bottom"):
+            r = self._results[side]
+            m = np.asarray(r.model.inlier_mask_, bool)
+            pk = r.peaks_global[m].astype(float)
+            if pk.shape[0] < 8:
+                logger.warning("[CollimationStrategy] joint refit skipped: "
+                               "%s side has only %d inliers", side, pk.shape[0])
+                return
+            pts[side] = pk
+        xt, yt = pts["top"][:, 0], pts["top"][:, 1]
+        xb, yb = pts["bottom"][:, 0], pts["bottom"][:, 1]
+        x0 = float(np.concatenate([xt, xb]).mean())
+
+        def _design(x, is_top):
+            xc = x - x0
+            one = np.ones_like(xc)
+            zero = np.zeros_like(xc)
+            return np.column_stack([xc ** 2, xc,
+                                    one if is_top else zero,
+                                    zero if is_top else one])
+
+        A = np.vstack([_design(xt, True), _design(xb, False)])
+        y = np.concatenate([yt, yb])
+        keep = np.ones(y.size, bool)
+        sol = None
+        for _ in range(3):
+            sol, *_ = np.linalg.lstsq(A[keep], y[keep], rcond=None)
+            resid = y - A @ sol
+            med = float(np.median(resid[keep]))
+            mad = 1.4826 * float(np.median(np.abs(resid[keep] - med)))
+            keep = np.abs(resid - med) < max(4 * mad, 6.0)
+            if keep.sum() < 8:
+                logger.warning("[CollimationStrategy] joint refit degenerate "
+                               "-- keeping per-side fits")
+                return
+        a2, a1, o_t, o_b = (float(v) for v in sol)
+        nt = yt.size
+        for side, off, sl in (("top", o_t, slice(0, nt)),
+                              ("bottom", o_b, slice(nt, None))):
+            r = self._results[side]
+            full_mask = np.zeros(r.peaks_global.shape[0], dtype=bool)
+            idx = np.flatnonzero(np.asarray(r.model.inlier_mask_, bool))
+            full_mask[idx[keep[sl]]] = True
+            model = _ParallelLineModel(a2, a1, x0, off, full_mask)
+            xg = r.peaks_global[:, 0].astype(float)
+            yp = model.predict(xg)
+            self._results[side] = dataclasses.replace(
+                r, model=model,
+                distortion=np.column_stack([xg, yp - yp.mean()]),
+                inlier_ratio=float(full_mask.mean()))
+        logger.info(
+            "[CollimationStrategy] joint parallel refit: shared shape, "
+            "offsets %.1f/%.1f (sep %.1f), kept %d/%d line points",
+            o_t, o_b, o_b - o_t, int(keep.sum()), keep.size)
 
     def _refit_edges_from_lines(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
         """Re-detect the EXPOSURE edges in windows ANCHORED at the fitted
@@ -552,9 +634,26 @@ class CollimationStrategy(RestitutionStrategy):
         """Detect collimation peaks column-by-column, fit a RANSAC polynomial, and compute the distortion curve."""
         _, w = sub_image.band.shape
 
+        # dshean 2026-08-24: burned-in white furniture (USGS logo, margin
+        # bands) is PINNED bright (measured >=249, p99 255 on F001) while
+        # the collimation line never pins (max 247 there) -- and even a
+        # locally saturating line is THIN, so masking only pinned runs
+        # TALLER than the line (vertical morphological opening) removes
+        # the furniture before peak detection ever sees it, at zero risk
+        # to the line.
+        band = sub_image.band
+        pin = band >= 249
+        if pin.any():
+            from scipy.ndimage import binary_opening
+            maxrun = max(3, self.max_width_peak // max(1, self.stride))
+            furniture = binary_opening(pin, structure=np.ones((maxrun, 1), bool))
+            if furniture.any():
+                band = band.copy()
+                band[furniture] = 0
+
         peaks_local = np.zeros((w, 2), dtype=int)
         for col in range(w):
-            vec = sub_image.band[:, col]
+            vec = band[:, col]
             idx = detect_collimation_peak(vec, max_peak_width=self.max_width_peak // self.stride)
             peaks_local[col, 0] = col
             peaks_local[col, 1] = idx

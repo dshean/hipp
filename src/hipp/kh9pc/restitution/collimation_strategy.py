@@ -574,23 +574,23 @@ class CollimationStrategy(RestitutionStrategy):
         # the smooth collimation line models -> no shear (David 2026-07-22 r3).
         deformation = tps_from_estimate(dst, src)
 
-        # ---- FIXED-OFFSET DELIVERED CROP (David 2026-07-22 ~23:20) ----
-        # The crop bounds are the straightened collimation lines shifted a
-        # fixed conservative distance OUTWARD -- parallel to the lines by
-        # construction ("the collimation lines are the only true geometric
-        # markers"). In the warped frame the lines sit exactly at ``top`` and
-        # ``bot``, so the crop is a fixed rectangle and the output height is
-        # identical for every frame: collimation_line_dist +
-        # 2*crop_offset_from_line. The geometry/warp above is untouched.
-        off_top = (self.crop_offset_from_line_top
-                   if self.crop_offset_from_line_top is not None
-                   else self.crop_offset_from_line)
-        off_bot = (self.crop_offset_from_line_bottom
-                   if self.crop_offset_from_line_bottom is not None
-                   else self.crop_offset_from_line)
-        crop_top = int(top - off_top)
-        crop_bot = int(bot + off_bot)
-        output_height = max(crop_bot - crop_top, 1)
+        # ---- SPEC-SNAPPED DELIVERED CROP (dshean 2026-08-23: "fine to
+        # snap collimation crop to match the others") ----
+        # Output canvas = KH9ImageSpec.expected_size, CENTERED on the
+        # straightened line pair (y) and the detected content span (x) --
+        # the FiducialStrategy convention -- so every frame in a block is
+        # one geometry class (the 2026-07-22 fixed-offset +-75 px crop
+        # delivered 21920 rows vs the spec 21771 and per-frame widths;
+        # all six casa Collimation frames failed the per-frame spec gate,
+        # rebuild24 25024328). crop_offset_from_line* now feed only the
+        # QC overlay. Geometry/warp above is untouched.
+        from hipp.kh9pc.kh9_image_spec import KH9ImageSpec
+        ew, eh = KH9ImageSpec.from_raster_filepath(self.raster_filepath_).expected_size
+        y_center = (top + bot) / 2.0
+        crop_top = int(y_center - eh / 2)
+        crop_bot = crop_top + eh
+        output_height = eh
+        output_width = self.output_width or ew
 
         # Black-leak sentinel (non-fatal): the per-column content envelope no
         # longer drives the crop, but wherever it detects content ending
@@ -618,12 +618,12 @@ class CollimationStrategy(RestitutionStrategy):
                     side, int(np.ceil(worst)), int((intr > 0).sum()), intr.size)
 
         logger.info(
-            "[CollimationStrategy] fixed-offset delivered crop: line -%d/+%d px "
-            "-> rows [%d, %d], height %d (uniform by construction)",
-            off_top, off_bot, crop_top, crop_bot, output_height)
+            "[CollimationStrategy] spec-snapped delivered crop: canvas %dx%d "
+            "centered on lines (line rows %d/%d -> crop rows [%d, %d])",
+            output_width, output_height, top, bot, crop_top, crop_bot)
 
-        pad_x = (output_width - detected_width) / 2
-        crop_offset = (int(left - pad_x), crop_top)
+        x_center = (left + right) / 2.0
+        crop_offset = (int(x_center - output_width / 2), crop_top)
 
         return Transformation(
             self.raster_filepath_,

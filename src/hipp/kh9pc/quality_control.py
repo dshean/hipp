@@ -178,20 +178,45 @@ def plot_poly_edges(detector: PolyStrategy, crop_is_delivered: bool = True) -> F
     return fig
 
 
-def plot_poly_distortions(detector: PolyStrategy) -> Figure:
-    """Residual distortion curves (deviation from mean) for top and bottom polynomial fits."""
-    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
+# Fixed axes so distortion figures compare ACROSS frames (dshean
+# 2026-08-23); measured over the casa_block: curves span +-600 px
+# frame-to-frame, top-bottom difference stays within ~105 px.
+_DISTORTION_YLIM_PX = 700.0
+_DISTORTION_DIFF_YLIM_PX = 150.0
 
-    ax.plot(detector.top_.distortion[:, 0], detector.top_.distortion[:, 1], label="top")
-    ax.plot(detector.bottom_.distortion[:, 0], detector.bottom_.distortion[:, 1], label="bottom")
+
+def _plot_distortion_pair(top_res, bottom_res) -> Figure:
+    """Two panels (dshean 2026-08-23 spec): top & bottom distortion curves
+    on a FIXED y axis, and their difference (top - bottom, the differential
+    signal camera geometry cannot absorb) on its own fixed y axis."""
+    fig, (ax, axd) = plt.subplots(2, 1, figsize=(6, 7), sharex=True, constrained_layout=True)
+
+    tx, ty = top_res.distortion[:, 0], top_res.distortion[:, 1]
+    bx, by = bottom_res.distortion[:, 0], bottom_res.distortion[:, 1]
+    ax.plot(tx, ty, label=f"top (peak {np.nanmax(np.abs(ty)):.0f} px)")
+    ax.plot(bx, by, label=f"bottom (peak {np.nanmax(np.abs(by)):.0f} px)")
     ax.axhline(0, color="gray", linewidth=0.8, linestyle="--")
-    ax.invert_yaxis()
-    ax.legend()
+    ax.set_ylim(_DISTORTION_YLIM_PX, -_DISTORTION_YLIM_PX)  # inverted, fixed
+    ax.legend(fontsize=8)
     ax.set_title("global distortion (top & bottom)")
-    ax.set_xlabel("column (px)")
     ax.set_ylabel("distortion (px)")
 
+    diff = ty - np.interp(tx, bx, by)  # bottom resampled onto top columns
+    axd.plot(tx, diff, color="purple",
+             label=f"top - bottom (peak {np.nanmax(np.abs(diff)):.0f} px)")
+    axd.axhline(0, color="gray", linewidth=0.8, linestyle="--")
+    axd.set_ylim(_DISTORTION_DIFF_YLIM_PX, -_DISTORTION_DIFF_YLIM_PX)
+    axd.legend(fontsize=8)
+    axd.set_title("differential distortion (top - bottom)")
+    axd.set_xlabel("column (px)")
+    axd.set_ylabel("difference (px)")
+
     return fig
+
+
+def plot_poly_distortions(detector: PolyStrategy) -> Figure:
+    """Residual distortion curves (deviation from mean) for top and bottom polynomial fits."""
+    return _plot_distortion_pair(detector.top_, detector.bottom_)
 
 
 # --- Collimation ---
@@ -234,19 +259,10 @@ def plot_collimation_edges(detector: CollimationStrategy) -> Figure:
 
 
 def plot_collimation_distortions(detector: CollimationStrategy) -> Figure:
-    """Residual distortion curves for top and bottom collimation line fits."""
-    fig, ax = plt.subplots(figsize=(6, 4), constrained_layout=True)
-
-    for side, result in zip(["top", "bottom"], [detector.top_, detector.bottom_]):
-        ax.plot(result.distortion[:, 0], result.distortion[:, 1], label=side)
-
-    ax.invert_yaxis()
-    ax.legend()
-    ax.set_title("global distortion (top & bottom)")
-    ax.set_xlabel("column (px)")
-    ax.set_ylabel("distortion (px)")
-
-    return fig
+    """Residual distortion curves for top and bottom collimation line fits
+    (same fixed-axis + difference-panel layout as the poly figure -- the
+    figure-feedback-propagates rule)."""
+    return _plot_distortion_pair(detector.top_, detector.bottom_)
 
 
 # --- Fiducial ---

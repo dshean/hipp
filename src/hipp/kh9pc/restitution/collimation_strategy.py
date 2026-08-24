@@ -254,6 +254,50 @@ class CollimationStrategy(RestitutionStrategy):
                 self._results[side] = self._process_side(sub_image, side)
 
             self._validate_separation()
+            if not self._separation_ok:
+                # PAIR RESCUE (dshean 2026-08-23, ops196 F003: the top
+                # search locked a white furniture band at the mosaic top;
+                # the USGS logo can do the same to the bottom). The lines
+                # are a manufactured PAIR 21770 px apart, so re-anchor
+                # each side's window from the OTHER side's fitted line +
+                # the physical separation and keep the reconciliation
+                # that restores the constant. A furniture band has no
+                # partner at the right distance; the true line does.
+                cands = {}
+                # the partner line lies within +-tol of the anchor BY
+                # PHYSICS, so the rescue window is exactly that tall --
+                # a confuser >tol away (F003's furniture band, +1755 px)
+                # cannot be inside it. A rescue fit must also clear the
+                # inlier floor: a garbage window yields sparse peaks that
+                # can land inside the separation tolerance by chance
+                # (observed 0.17 inliers on the first F003 test).
+                tol_px = int(self.separation_tolerance * self.collimation_line_dist)
+                rescue_h = 2 * tol_px + 60
+                for bad, good, sign in (("top", "bottom", -1), ("bottom", "top", 1)):
+                    anchor = self._line_row(good) + sign * self.collimation_line_dist
+                    row0 = int(anchor - rescue_h // 2)
+                    row0 = max(0, min(row0, src.height - rescue_h))
+                    win = Window(col_off, row0, window_width, rescue_h)
+                    sub = SubImage(src, win, resampling=Resampling.average,
+                                   out_shape=self._out_shape(win))
+                    prev = self._results[bad]
+                    self._results[bad] = self._process_side(sub, bad)
+                    self._validate_separation()
+                    if (self._separation_ok
+                            and self._results[bad].inlier_ratio
+                            >= self.poly_strategy.min_inliers_threshold):
+                        cands[bad] = (self._results[bad],
+                                      self._results[bad].inlier_ratio)
+                    self._results[bad] = prev
+                if cands:
+                    bad = max(cands, key=lambda k: cands[k][1])
+                    self._results[bad] = cands[bad][0]
+                    self._validate_separation()
+                    logger.warning(
+                        "[CollimationStrategy] pair rescue: %s line re-anchored "
+                        "from the %s line + physical separation (inliers %.2f)",
+                        bad, "bottom" if bad == "top" else "top",
+                        self._results[bad].inlier_ratio)
             if self._separation_ok:
                 self._refit_edges_from_lines(src, col_off, window_width, window_height)
 

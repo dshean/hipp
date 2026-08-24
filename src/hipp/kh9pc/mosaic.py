@@ -354,14 +354,27 @@ def _part_content_bbox(image_path, dark_dn: float = 8.0,
     # audit H-2: act ONLY on bright-background scans (2026 vintage). A dark
     # background already self-masks via the != 0 merge rule, and on dark
     # parts the interior test can crop the rails (timing marks, titling)
-    # out of the mosaic. Border median decides.
+    # out of the mosaic. C5b (dshean 2026-08-23, ops196 F003): the border
+    # MEDIAN misclassifies bright-background parts whose film reaches the
+    # border (3 of F003's 4 parts pasted whole, white band included) --
+    # the vintage test is the PINNED-BRIGHT FRACTION: dark-vintage scans
+    # have essentially none, bright-vintage backgrounds plenty.
     border = np.concatenate([a[0], a[-1], a[:, 0], a[:, -1]]).astype(float)
-    if np.median(border) < bright_dn:
+    if (border >= bright_dn).mean() < 0.05:
         return None
     margin_px = max(margin_px, int(2 * max(fx, fy)))
     interior = (a > dark_dn) & (a < bright_dn)
-    rows = np.flatnonzero(interior.mean(axis=1) > min_frac)
-    cols = np.flatnonzero(interior.mean(axis=0) > min_frac)
+    # C5b (dshean 2026-08-23, ops196 F003): a pinned-bright background
+    # band's noisy edge pixels can exceed min_frac occupancy and drag
+    # whole background rows into the bbox (measured: band rows median
+    # DN 251 with 34-42% of pixels non-pinned). A content row/col must
+    # also have an interior MEDIAN -- film rows measure median ~30-80.
+    row_med = np.median(a, axis=1)
+    col_med = np.median(a, axis=0)
+    rows = np.flatnonzero((interior.mean(axis=1) > min_frac)
+                          & (row_med > dark_dn) & (row_med < bright_dn))
+    cols = np.flatnonzero((interior.mean(axis=0) > min_frac)
+                          & (col_med > dark_dn) & (col_med < bright_dn))
     if rows.size < 4 or cols.size < 4:
         return None
     return (cols[0] * fx + margin_px, rows[0] * fy + margin_px,

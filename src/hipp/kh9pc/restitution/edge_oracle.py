@@ -30,7 +30,9 @@ import rasterio
 from rasterio.enums import Resampling
 
 STRIP_BINS = 32          # decimated x-bins per strip
-X_BINS = 2048            # decimated x-bins for the full pass
+STRIP_PX = 2048          # FIXED physical strip width (dshean 2026-08-23:
+                         # fixed strip COUNTS scaled with scan sector --
+                         # 1.8k px strips on 30-deg vs 5.3k on 90-deg)
 ROW_STEP = 8             # y decimation of the profile pass
 TEXTURE_MIN = 6.0        # robust cross-column spread threshold
 
@@ -64,11 +66,12 @@ class EdgeFit:
 def _strip_profiles(src):
     W, H = src.width, src.height
     n_rows = max(1, H // ROW_STEP)
-    band = src.read(1, out_shape=(n_rows, X_BINS),
+    n_strips = max(8, W // STRIP_PX)
+    x_bins = n_strips * STRIP_BINS
+    band = src.read(1, out_shape=(n_rows, x_bins),
                     resampling=Resampling.average).astype(np.float32)
     rows = (np.arange(band.shape[0]) * (H / band.shape[0])).astype(int)
-    n_strips = X_BINS // STRIP_BINS
-    xc = ((np.arange(n_strips) + 0.5) * STRIP_BINS / X_BINS * W).astype(int)
+    xc = ((np.arange(n_strips) + 0.5) * STRIP_BINS / x_bins * W).astype(int)
     med = np.empty((n_strips, band.shape[0]), np.float32)
     spr = np.empty_like(med)
     for i in range(n_strips):

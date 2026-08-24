@@ -40,10 +40,11 @@ class EdgeFit:
     """Per-side oracle result in GLOBAL mosaic pixel coordinates."""
 
     coeffs: np.ndarray       # np.polyval poly2 coefficients, edge row vs col
-    valid_frac: float        # strips passing anatomy validation
+    valid_frac: float        # strips passing anatomy validation, of CONTENT strips
     support_frac: float      # fit inliers among valid strips
     n_strips: int
-    line_frac: float         # strips where the optional edge line was seen
+    line_frac: float         # content strips where the optional edge line was seen
+    content_frac: float = 1.0  # strips inside the contiguous content span
 
     def predict(self, x):
         """sklearn-model-compatible: accepts (N,1) or (N,) column coords."""
@@ -166,6 +167,43 @@ def _strip_detect(rows, med, spr):
     return out
 
 
+def _content_span(content, max_gap=2):
+    """Longest contiguous run of content strips, bridging gaps <= max_gap.
+
+    dshean 2026-08-23 ruling (ops196 narrow-sector): strips outside this
+    span are empty canvas fill -- or a slice of the NEXT frame if the
+    scan was cut badly -- and must neither dilute valid_frac's
+    denominator nor feed the fits. Contiguity is what excludes a foreign
+    frame slice: it sits beyond a black gap, outside the longest run.
+    """
+    idx = np.flatnonzero(content)
+    if idx.size == 0:
+        return np.ones_like(content, bool)   # degrade to no exclusion
+    runs, s, p = [], idx[0], idx[0]
+    for i in idx[1:]:
+        if i - p <= max_gap + 1:
+            p = i
+        else:
+            runs.append((s, p))
+            s = p = i
+    runs.append((s, p))
+    s, p = max(runs, key=lambda r: r[1] - r[0])
+    m = np.zeros_like(content, bool)
+    m[s:p + 1] = True
+    return m
+
+
+def _coverage_deg(x, y, extent_px):
+    """Fit degree earned by x-coverage (dshean 2026-08-23, ops196 A001:
+    picks clustered in 15% of the frame let a poly2 extrapolate wildly).
+    >=50% of the content extent -> 2; >=25% -> 1; else 0 (constant)."""
+    xf = np.asarray(x, float)[np.isfinite(np.asarray(y, float))]
+    if xf.size < 2 or extent_px <= 0:
+        return 0
+    cov = (xf.max() - xf.min()) / float(extent_px)
+    return 2 if cov >= 0.5 else (1 if cov >= 0.25 else 0)
+
+
 def _robust_poly(x, y, deg=2, iters=3):
     x, y = np.asarray(x, float), np.asarray(y, float)
     keep = np.isfinite(y)
@@ -184,9 +222,14 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
     """Oracle entry point: per-side EdgeFit in global mosaic coords."""
     with rasterio.open(raster_filepath) as src:
         W, H, rows, xc, med, spr = _strip_profiles(src)
+    # content span (dshean 2026-08-23): textured central band marks real
+    # film content; film grain clears TEXTURE_MIN, digital canvas fill is
+    # uniform. Strips outside the longest contiguous run are excluded.
+    n_band = med.shape[1]
+    cb0, cb1 = int(0.30 * n_band), int(0.70 * n_band)
+    span = _content_span((spr[:, cb0:cb1] > TEXTURE_MIN).mean(axis=1) > 0.2)
     picks = {"top": [], "bottom": []}
     valid = {"top": [], "bottom": []}
-    lines = {"top": 0, "bottom": 0}
     lines_y = {"top": [], "bottom": []}
     for i in range(len(xc)):
         det = _strip_detect(rows, med[i], spr[i])
@@ -205,21 +248,27 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
             picks[side].append(np.nan if e is None else e)
             valid[side].append(v)
             lines_y[side].append(np.nan if l is None else l)
-            if l is not None:
-                lines[side] += 1
     out = {}
+    n_span = max(1, int(span.sum()))
     for side in ("top", "bottom"):
         y = np.array(picks[side], float)
-        v = np.array(valid[side], bool)
+        # span exclusion BEFORE fitting: an out-of-span strip (canvas
+        # fill or a foreign frame slice) must not bend the fit either
+        v = np.array(valid[side], bool) & span
         yv = np.where(v, y, np.nan)
-        c, keep = _robust_poly(np.asarray(xc, float), yv)
+        xs = np.asarray(xc, float)[span]
+        extent_px = float(xs.max() - xs.min()) if xs.size >= 2 else 0.0
+        c, keep = _robust_poly(np.asarray(xc, float), yv,
+                               deg=_coverage_deg(xc, yv, extent_px))
         if c is None:
             continue
         # LINE-ANCHORED EDGE (David 2026-08-23, fix-sibling of the harness
         # change): where the line fit is solid, edge curve = line fit +
         # robust median per-strip offset; outlier edge picks cannot bend it
         yl = np.array(lines_y[side], float)
-        cl, _ = _robust_poly(np.asarray(xc, float), np.where(v, yl, np.nan))
+        ylv = np.where(v, yl, np.nan)
+        cl, _ = _robust_poly(np.asarray(xc, float), ylv,
+                             deg=_coverage_deg(xc, ylv, extent_px))
         if cl is not None:
             # inside-the-line edge picks are anatomically impossible ->
             # suspect: excluded and their strips demoted (fix-sibling)
@@ -238,11 +287,13 @@ def fit_format_edges(raster_filepath: str | Path) -> dict[str, EdgeFit]:
                 resid = y - np.polyval(ce, np.asarray(xc, float))
                 c = ce
                 keep = np.isfinite(y) & (np.abs(resid) < max(4 * mad, 60))
+        yl_arr = np.array(lines_y[side], float)
         out[side] = EdgeFit(
             coeffs=c,
-            valid_frac=float(v.mean()) if v.size else 0.0,
+            valid_frac=float(v.sum() / n_span),
             support_frac=float((keep & v).sum() / max(1, v.sum())),
             n_strips=len(xc),
-            line_frac=lines[side] / max(1, len(xc)),
+            line_frac=float((np.isfinite(yl_arr) & span).sum() / n_span),
+            content_frac=float(span.sum() / max(1, len(xc))),
         )
     return out

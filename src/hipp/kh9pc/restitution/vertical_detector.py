@@ -98,6 +98,10 @@ class VerticalDetector(FittingClass):
     width_sigma: float = 0.002        #   30-deg +-1 %: ops327 A004 +0.67 %, ops196 A004 +0.95 %), so absolute px
     width_sigma_px: int = 700         # Gaussian width prior for ranking pairs: max(fraction, px)
     short_pair_tol: float = 0.08      # v10.3 (2026-08-27): accept a pair down to this fraction SHORT of the sweep when no
+    short_pair_min_sep_px: int = 128  # v10.3c: finer candidate window for the short-pair pass (the exposure onset 460 px
+    film_gap_px: int = 2500           #   beside a z=228 scanner step was suppressed at 512). v10.3d: an OUTER candidate
+                                      #   with an inner eligible one within film_gap_px and a FLAT strip between them (film
+                                      #   base, per-column texture < exposed_tex_min) is the film/scanner boundary -- skip it
                                       #   full-width pair exists (first frames: ops196 A001 -3 %, F001 -4 %); ranked by the weaker edge
     edge_margin_px: int = 64          # 2026-08-26 (dshean: A002/F002 exposures start at 200-600 px): only the very edge is excluded; the width prior handles the black-margin|film step
     boundary_suspect_px: int = 600    # single-edge fallback: a step this close to the raster edge is suspect (scan cut through film)
@@ -257,6 +261,8 @@ class VerticalDetector(FittingClass):
         self.multiframe_ = False
         self.short_scan_ = False
         self.true_edges_ = None
+        self.candidates_ = []
+        self.expected_width_ = None
         self._tex_retry_ = False
         image_spec = KH9ImageSpec.from_raster_filepath(raster_filepath)
         expected = float(image_spec.expected_size[0])
@@ -296,6 +302,9 @@ class VerticalDetector(FittingClass):
                 # pairs (left, right) whose separation matches the sweep; score = |z_l| + |z_r|
                 # (+ 25 % when the signs are the natural dark->exposed->dark pattern)
                 val = self._validate_candidates(peaks, z, f)
+                self.expected_width_ = float(expected)
+                self.candidates_ = [dict(x=v["x"], z=v["z"], single_left=v["single_left"], single_right=v["single_right"],
+                                         trunc_left=v["trunc_left"], trunc_right=v["trunc_right"], pool="coarse") for v in val]
                 if os.environ.get("KH9_EDGE_DEBUG"):
                     for v in sorted(val, key=lambda v: -abs(v["z"]))[:24]:
                         logger.info("[VerticalDetector] cand x=%7d z=%+7.1f | L tex %5.1f dn %5.1f nod %.2f t90b %5.1f | R tex %5.1f dn %5.1f nod %.2f t90b %5.1f | pairL=%d pairR=%d singleL=%d singleR=%d truncL=%d truncR=%d",
@@ -339,22 +348,69 @@ class VerticalDetector(FittingClass):
                     # toward the nominal width picks the spurious step further out (ops196 F001: base-
                     # strip step at 2176, z 7, beat the exposure start at 2992, z 17). Full-width pairs,
                     # when they exist, are never affected.
-                    for i, pi in enumerate(peaks):
-                        if not ok_left[i]:
+                    # v10.3c/d/e: a FINER candidate pool for this pass only (short_pair_min_sep_px): the true
+                    # exposure onset 460 px beside a z=228 scanner step (ops395 A001) never became a
+                    # candidate at the 512 px window. Exclusions: a truncation (>= 50 % nodata on the
+                    # outside), and the OUTER of two nearby eligible candidates when the strip between
+                    # them is flat film base (v10.3d; a flank-band DN test -- v10.3c -- fired on the true
+                    # edge whenever the base strip was narrower than the 2048 px band).
+                    win_f = max(2, int(self.short_pair_min_sep_px / f))
+                    peaks_f = np.flatnonzero((az >= self.z_min) & (az == maximum_filter1d(az, size=2 * win_f + 1)))
+                    peaks_f = peaks_f[(peaks_f + 1 >= m) & (peaks_f + 1 <= az.size - m)]
+                    val_f = self._validate_candidates(peaks_f, z, f)
+                    x_f = (peaks_f + 1.0) * f
+                    _seen = {c["x"] for c in self.candidates_}
+                    self.candidates_ += [dict(x=v["x"], z=v["z"], single_left=v["single_left"], single_right=v["single_right"],
+                                              trunc_left=v["trunc_left"], trunc_right=v["trunc_right"], pool="fine")
+                                         for v in val_f if v["x"] not in _seen]
+                    ctex = np.asarray(self._coltex_, dtype=np.float64)
+                    def _flat_between(xa, xb):
+                        a_, b_ = int(min(xa, xb) / f), int(max(xa, xb) / f)
+                        seg = ctex[max(0, a_):min(ctex.size, b_)]
+                        return seg.size > 0 and float(np.median(seg)) < self.exposed_tex_min
+                    def _outer(i, side):
+                        # an eligible inner candidate within film_gap_px with flat film base between
+                        for j in range(len(peaks_f)):
+                            if j == i: continue
+                            if side == "left" and val_f[j]["as_left"] and x_f[i] < x_f[j] <= x_f[i] + self.film_gap_px and _flat_between(x_f[i], x_f[j]):
+                                return True
+                            if side == "right" and val_f[j]["as_right"] and x_f[i] - self.film_gap_px <= x_f[j] < x_f[i] and _flat_between(x_f[j], x_f[i]):
+                                return True
+                        return False
+                    best_f = None
+                    _dbg = bool(os.environ.get("KH9_EDGE_DEBUG"))
+                    if _dbg:
+                        for i, vi in enumerate(val_f):
+                            logger.info("[VerticalDetector] short-pair pool x=%7d z=%+7.1f asL=%d asR=%d sL=%d sR=%d nodL=%.2f nodR=%.2f outerL=%d outerR=%d",
+                                        int(x_f[i]), vi["z"], vi["as_left"], vi["as_right"], vi["single_left"], vi["single_right"],
+                                        vi["L"]["nodata"], vi["R"]["nodata"], _outer(i, "left"), _outer(i, "right"))
+                    for i, pi in enumerate(peaks_f):
+                        vi = val_f[i]
+                        if not vi["as_left"] or vi["L"]["nodata"] >= self.nodata_frac or _outer(i, "left"):   # v10.3e: the detector's own truncation threshold (0.9), not 0.5 -- ops395 A001's true right edge has 75 % black in its 2048 px flank because the film ends 690 px beyond it
                             continue
-                        for k, pk in enumerate(peaks):
-                            if not ok_right[k]:
+                        for k, pk in enumerate(peaks_f):
+                            vk = val_f[k]
+                            if not vk["as_right"] or vk["R"]["nodata"] >= self.nodata_frac or _outer(k, "right"):
                                 continue
-                            sep = x_peak[k] - x_peak[i]
+                            sep = x_f[k] - x_f[i]
                             if sep <= 0 or sep >= expected - tol or sep < expected * (1.0 - self.short_pair_tol):
+                                if _dbg and 0 < sep < expected: logger.info("[VerticalDetector] short-pair reject width: %d..%d sep %.0f (%.1f %% of %.0f)", int(x_f[i]), int(x_f[k]), sep, 100 * sep / expected, expected)
                                 continue
-                            if not (val[i]["single_left"] or val[k]["single_right"]):
+                            if not (vi["single_left"] or vk["single_right"]):
+                                if _dbg: logger.info("[VerticalDetector] short-pair reject no-strict-single: %d..%d", int(x_f[i]), int(x_f[k]))
                                 continue
-                            if x_peak[i] <= self.boundary_suspect_px or (W - x_peak[k]) <= self.boundary_suspect_px:
+                            if x_f[i] <= self.boundary_suspect_px or (W - x_f[k]) <= self.boundary_suspect_px:
+                                if _dbg: logger.info("[VerticalDetector] short-pair reject boundary: %d..%d", int(x_f[i]), int(x_f[k]))
                                 continue
                             sc = float(min(az[pi], az[pk]))
-                            if best is None or sc > best[0]:
-                                best = (sc, i, k); short_pair = True
+                            if best_f is None or sc > best_f[0]:
+                                best_f = (sc, i, k)
+                    if best_f is not None:
+                        # hand the pair to the common "both" branch as a two-element pool
+                        _, i, k = best_f
+                        peaks = np.array([peaks_f[i], peaks_f[k]]); x_peak = (peaks + 1.0) * f
+                        val = [val_f[i], val_f[k]]
+                        best = (best_f[0], 0, 1); short_pair = True
                 strength = {}; sign_l = sign_r = None
                 if best is not None:
                     _, i, k = best
@@ -541,7 +597,7 @@ class VerticalDetector(FittingClass):
                     prof = sub.band.flatten()
                     self._results[side] = VerticalEdgeResult(position=pos, edge_local=int(sub.to_local_x(pos)) if hasattr(sub, "to_local_x") else 0,
                                                              gradient_ratio=float(strength.get(side, 0.0)), sub_image=sub, profile=prof)
-                self.n_candidates_ = int(peaks.size)
+                self.n_candidates_ = int(len(getattr(self, "candidates_", []) or peaks))
             except DetectionError as e:
                 self._failed = True
                 logger.warning("%s - failed to detect edges: %s", self.logging_prefix, e)

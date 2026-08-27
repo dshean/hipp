@@ -67,13 +67,37 @@ def plot_vertical_edges(
             w = sub_image.window
             extent = [w.col_off, w.col_off + w.width, w.row_off + w.height, w.row_off]
             ax.imshow(sub_image.band, cmap="gray", aspect="auto", extent=extent)
-
-            ax.axvline(x=edge_col, color="red")
+            # dshean 2026-08-27: show WHAT decided the edge -- every row-coherent DN-step candidate in
+            # view (thin, labelled with its z and single/trunc flags), the true exposure edges when
+            # the crop is anchored elsewhere, and the expected-width-derived position for the other
+            # side -- so a derived edge, a film boundary and an exposure edge can be told apart.
+            x0, x1 = extent[0], extent[1]
+            for c in getattr(detector, "candidates_", []) or []:
+                if x0 <= c["x"] <= x1 and abs(c["x"] - edge_col) > 8:
+                    flag = ("S" if c[f"single_{side}"] else "") + ("T" if c[f"trunc_{side}"] else "")
+                    ax.axvline(c["x"], color="0.7" if c.get("pool") == "coarse" else "0.85", lw=0.7, ls="--")
+                    ax.text(c["x"], extent[3] + 0.04 * (extent[2] - extent[3]), f"z{c['z']:+.0f}{flag}", color="w",
+                            fontsize=6, rotation=90, va="top", ha="right")
+            true_edges = getattr(detector, "true_edges_", None)
+            if true_edges:
+                te = true_edges[0] if side == "left" else true_edges[1]
+                if abs(te - edge_col) > 8 and x0 <= te <= x1:
+                    ax.axvline(te, color="orange", lw=1.2, ls="--", label=f"true exposure edge {int(te)}")
+            exp_w = getattr(detector, "expected_width_", None)
+            if exp_w:
+                other = detector.edges_[1] - exp_w if side == "left" else detector.edges_[0] + exp_w
+                if abs(other - edge_col) > 8 and x0 <= other <= x1:
+                    ax.axvline(other, color="deepskyblue", lw=1.0, ls=":", label=f"expected width from the other edge {int(other)}")
+            ax.axvline(x=edge_col, color="red", label=f"chosen {side} edge {int(edge_col)}")
             ax.set_title(f"{side} edge (col={edge_col})")
             ax.set_xlabel("column (full-res px)")
             ax.set_ylabel("row (full-res px)")
+            ax.legend(fontsize=6, loc="lower right", framealpha=0.6)
 
-    fig.suptitle(detector.raster_filepath_.stem, fontsize=12, fontweight="bold")
+    src_desc = getattr(detector, "edge_source_", None) or "?"
+    fig.suptitle(f"{detector.raster_filepath_.stem}   edges from {src_desc}"
+                 f"{'   (grey dashed = DN-step candidates: S strict single, T truncation)' if getattr(detector, 'candidates_', None) else ''}",
+                 fontsize=9, fontweight="bold")
     return fig
 
 

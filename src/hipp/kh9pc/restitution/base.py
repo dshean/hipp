@@ -21,6 +21,32 @@ from sklearn.preprocessing import PolynomialFeatures, StandardScaler
 logger = logging.getLogger(__name__)
 
 DEFAULT_OUTPUT_HEIGHT: int = 22064
+
+
+def scan_scale(scan_pitch_um, raster_filepath=None) -> tuple[float, float]:
+    """(sx, sy) = scan pitch / canvas pitch: multiply SOURCE px by these to get
+    canvas px at CANVAS_PITCH_UM. ``scan_pitch_um`` = (x_um, y_um) from the scan
+    session (TIFF XResolution/YResolution of the scanner-written sections --
+    Photoshop-resaved sections carry X==Y metadata, not the true Y). None ->
+    try the raster's own TIFFTAG_[XY]RESOLUTION (px/cm or px/in); if absent
+    return (1, 1) = legacy behaviour (raw pitch passes through)."""
+    from hipp.kh9pc.kh9_image_spec import CANVAS_PITCH_UM
+    if scan_pitch_um is None and raster_filepath is not None:
+        try:
+            import rasterio
+            with rasterio.open(raster_filepath) as src:
+                t = src.tags()
+            xr, yr = float(t["TIFFTAG_XRESOLUTION"]), float(t["TIFFTAG_YRESOLUTION"])
+            per_cm = 1.0 if t.get("TIFFTAG_RESOLUTIONUNIT", "3").strip() in ("3", "cm") else 1 / 2.54
+            scan_pitch_um = (1e4 / (xr * per_cm), 1e4 / (yr * per_cm))
+        except Exception:
+            scan_pitch_um = None
+    if scan_pitch_um is None:
+        return 1.0, 1.0
+    sx, sy = float(scan_pitch_um[0]) / CANVAS_PITCH_UM, float(scan_pitch_um[1]) / CANVAS_PITCH_UM
+    if not (0.97 < sx < 1.03 and 0.97 < sy < 1.03):
+        raise ValueError(f"scan pitch {scan_pitch_um} um is not a KH-9 7-um-class scan")
+    return sx, sy
 """Standard output height in pixels for restituted KH-9 PC images (22064 px at nominal scan resolution)."""
 
 
@@ -162,7 +188,7 @@ def fit_ransac_poly(
     min_samples = min(degree * 3, len(x))
     ransac = RANSACRegressor(
         poly_model, residual_threshold=residual_threshold, min_samples=min_samples, max_trials=max_trials
-    )
+    , random_state=0)
     ransac.fit(x.reshape(-1, 1), y)
     return ransac
 

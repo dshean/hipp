@@ -38,8 +38,16 @@ def _log_to_file(path: Path) -> Generator[None, None, None]:
         handler.close()
 
 
+def _fit_with_pitch(joined_image, scan_pitch_um):
+    strat = FiducialStrategy()
+    if hasattr(strat, "scan_pitch_um"):
+        strat.scan_pitch_um = scan_pitch_um
+    return strat.fit(joined_image)
+
+
 def preprocess_kh9pc(
-    input: str | Path | Sequence[str | Path], output_dir: str | Path, overwrite: bool = False, keep_work: bool = False
+    input: str | Path | Sequence[str | Path], output_dir: str | Path, overwrite: bool = False, keep_work: bool = False,
+    scan_pitch_um: tuple[float, float] | None = None,
 ) -> None:
     """Preprocess a single KH-9 PC scan from raw tiles to a restituted GeoTIFF.
 
@@ -82,7 +90,7 @@ def preprocess_kh9pc(
     log_path = output_dir / "logs" / f"{entity_id}.log"
     with _log_to_file(log_path):
         try:
-            _preprocess_kh9pc(input_paths, entity_id, output_path, qc_dir, work_dir, overwrite, keep_work)
+            _preprocess_kh9pc(input_paths, entity_id, output_path, qc_dir, work_dir, overwrite, keep_work, scan_pitch_um=scan_pitch_um)
         except Exception:
             logger.error("Failed to preprocess %s", entity_id, exc_info=True)
             raise
@@ -116,6 +124,7 @@ def _preprocess_kh9pc(
     work_dir: Path,
     overwrite: bool,
     keep_work: bool,
+    scan_pitch_um: tuple[float, float] | None = None,
 ) -> None:
     """Run the actual preprocessing steps (called inside a file-logging context)."""
     logger.info("Start preprocessing of %s", entity_id)
@@ -141,7 +150,9 @@ def _preprocess_kh9pc(
     )
 
     # STEP 3 : RESTITUTION
-    strategy = FiducialStrategy().fit(joined_image)
+    # scan_pitch_um: (x_um, y_um) of the scan session -> restituted image at the
+    # canvas pitch (kh9_image_spec.CANVAS_PITCH_UM). None keeps the raw pitch.
+    strategy = FiducialStrategy().fit(joined_image) if scan_pitch_um is None else _fit_with_pitch(joined_image, scan_pitch_um)
     (work_dir / "joblibs").mkdir(parents=True, exist_ok=True)
     joblib.dump(strategy, work_dir / "joblibs" / f"{entity_id}.joblib")
 

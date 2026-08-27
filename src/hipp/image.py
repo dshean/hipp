@@ -368,7 +368,9 @@ def remap_tif_blockwise(
         # exists-checks mistake for a product (two partials shipped on
         # D3C1210-200323A022 before the sliver fix). Write to a .part name
         # and rename only on success.
-        part_path = Path(output_path).with_name(Path(output_path).name + ".part.tif")
+        # ".part" (not ".part.tif"): a killed run must not leave temp files that
+        # match the products' D3C*.tif globs (audit H1, dshean 2026-08-25)
+        part_path = Path(output_path).with_name(Path(output_path).name + ".part")
         with rasterio.open(part_path, "w", **profile) as dst:
             blocks = [
                 (dst_x0, dst_y0)

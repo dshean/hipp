@@ -52,6 +52,18 @@ class ImageAlignment:
     absolute_transform: np.ndarray
     n_matches: int
     n_inliers: int
+    # seam diagnostics (2026-08-26): the RANSAC seam as measured (tx, ty px; rot deg) and
+    # whether it was replaced by the frame's median step (see validate_seams)
+    tx: float = 0.0
+    ty: float = 0.0
+    rot_deg: float = 0.0
+    fallback: bool = False
+    reason: str = ""
+    # per-seam ORB matches kept for diagnostics (dshean 2026-08-26: weak overlaps are
+    # spotted from the matches, not from seam lines): global coords in each section
+    match_points_a: "np.ndarray | None" = None
+    match_points_b: "np.ndarray | None" = None
+    match_inliers: "np.ndarray | None" = None
 
 
 logger = logging.getLogger(__name__)
@@ -116,7 +128,29 @@ def image_mosaic(
         ransac_residual_threshold=ransac_residual_threshold,
     )
 
+    alignments = level_gauge(alignments)
     write_mosaic(alignments, output_tif, resampling=resampling)
+    return alignments
+
+
+
+def level_gauge(alignments: list[ImageAlignment]) -> list[ImageAlignment]:
+    """Re-gauge the chain so its MEAN rotation is zero (dshean 2026-08-25).
+    Sequential joins are chained from section 0, so every section inherits the
+    running sum of the small per-join rotations and the far end tilts -- the
+    canvas then grows (~5 % on a 12-section frame, docs/mosaic_gauge_2026-08-24.md).
+    Rotating every absolute transform by minus the mean angle keeps all relative
+    geometry and shrinks the canvas; the collimation lines end up close to
+    horizontal, so the restitution has less rigid rotation to absorb."""
+    import dataclasses
+    th = np.array([np.arctan2(a.absolute_transform[1, 0], a.absolute_transform[0, 0]) for a in alignments])
+    mean = float(th.mean())
+    c, s_ = np.cos(-mean), np.sin(-mean)
+    R = np.array([[c, -s_, 0.0], [s_, c, 0.0], [0.0, 0.0, 1.0]])
+    out = [dataclasses.replace(a, absolute_transform=R @ a.absolute_transform) for a in alignments]
+    logger.info("level gauge: chain rotation min/max %.4f/%.4f deg, mean %.4f deg removed",
+                float(np.degrees(th.min())), float(np.degrees(th.max())), float(np.degrees(mean)))
+    return out
 
 
 def compute_sequential_alignments(
@@ -171,6 +205,7 @@ def compute_sequential_alignments(
         relative_transform: np.ndarray = model_robust.params
         absolute_transform: np.ndarray = alignments[i].absolute_transform @ relative_transform
 
+        rot = float(np.degrees(np.arctan2(relative_transform[1, 0], relative_transform[0, 0])))
         alignments.append(
             ImageAlignment(
                 image_path=Path(paths[i + 1]),
@@ -178,10 +213,96 @@ def compute_sequential_alignments(
                 absolute_transform=absolute_transform,
                 n_matches=len(points_a),
                 n_inliers=n_inliers,
+                tx=float(relative_transform[0, 2]), ty=float(relative_transform[1, 2]), rot_deg=rot,
+                match_points_a=np.asarray(points_a, dtype=np.float32),
+                match_points_b=np.asarray(points_b, dtype=np.float32),
+                match_inliers=np.asarray(inliers, dtype=bool),
             )
         )
 
-    return alignments
+    return validate_seams(alignments)
+
+
+def validate_seams(alignments: list[ImageAlignment], min_inliers: int = 30, strong_inliers: int = 500,
+                   max_rot_deg: float = 0.3, max_dty: float = 600.0, max_dtx: float = 2000.0,
+                   margin_refine: bool = False) -> list[ImageAlignment]:
+    """Guard every seam with the scanner's physics (dshean 2026-08-26, ops323 A003: a
+    featureless ocean overlap gave RANSAC a noise fit -- 2 inliers, 3.9 deg -- that placed
+    the last section ~17 k px to the right and ~150 rows low; the canvas grew to 366 k for
+    a 343.5 k sweep and the duplicated strip manufactured an exposure edge).
+
+    2026-08-26 relaunch lesson: the first version replaced STRONG seams too (6-15 k
+    inliers, rotation 0.10-0.15 deg -- the good-seam population spans +-0.1 deg) and
+    moved sections by 450-1350 px; the margin-profile ncc refinement locked one
+    timing-mark period (~1300 px) off. Rule now: a seam with >= strong_inliers is kept
+    as measured whatever its rotation / step (the RANSAC fit on thousands of matches IS
+    the measurement); only a WEAK seam (< strong_inliers) is replaced by the frame's
+    median step (pure translation) when it has too few inliers, a rotation above
+    max_rot_deg, a ty far from the median, or a tx more than max_dtx from the median
+    step. The median step comes from the strong seams. margin_refine is OFF by default
+    (period-ambiguous on the timing-mark train)."""
+    import dataclasses
+    if len(alignments) < 2:
+        return alignments
+    seams = alignments[1:]
+    strong = [a for a in seams if a.n_inliers >= strong_inliers]
+    good = strong or [a for a in seams if a.n_inliers >= min_inliers and abs(a.rot_deg) <= max_rot_deg]
+    if len(good) >= 2:
+        tx_med = float(np.median([a.tx for a in good])); ty_med = float(np.median([a.ty for a in good]))
+    elif len(good) == 1:
+        tx_med, ty_med = good[0].tx, good[0].ty
+    else:
+        logger.error("seam validation: no trustworthy seam in this frame (%d seams) -- mosaic left as measured; REVIEW",
+                     len(seams))
+        return alignments
+    out = [alignments[0]]
+    for a in seams:
+        why = []
+        if a.n_inliers >= strong_inliers:
+            if abs(a.rot_deg) > 0.1 or abs(a.tx - tx_med) > 1000:
+                logger.info("seam %s: strong (%d inliers) but rot %.3f deg / tx %+.0f vs median step -- kept as measured",
+                            a.image_path.name, a.n_inliers, a.rot_deg, a.tx - tx_med)
+        else:
+            if a.n_inliers < min_inliers: why.append(f"inliers {a.n_inliers} < {min_inliers}")
+            if abs(a.rot_deg) > max_rot_deg: why.append(f"rot {a.rot_deg:.3f} deg")
+            if abs(a.ty - ty_med) > max_dty: why.append(f"ty {a.ty:.0f} vs median {ty_med:.0f}")
+            if abs(a.tx - tx_med) > max_dtx: why.append(f"tx {a.tx:.0f} vs median step {tx_med:.0f}")
+        if why:
+            tx_use, ty_use, how = tx_med, ty_med, "median step"
+            if margin_refine:
+                # margin-profile refinement (period-ambiguous on the timing-mark train; off by default)
+                try:
+                    prev_path = out[-1].image_path
+                    with rasterio.open(str(prev_path)) as sa, rasterio.open(str(a.image_path)) as sb:
+                        Wa, Ha = sa.width, sa.height; Hb = sb.height
+                        band_h = 1400
+                        ov = int(max(1000, Wa - tx_med + 500))
+                        wa_ = min(ov + 2 * 1500, Wa)
+                        pa = sa.read(1, window=Window(Wa - wa_, Ha - band_h, wa_, band_h)).astype(np.float32)
+                        pb = sb.read(1, window=Window(0, Hb - band_h, min(ov, sb.width), band_h)).astype(np.float32)
+                        prof_a = np.median(pa, axis=0); prof_b = np.median(pb, axis=0)
+                        prof_a -= prof_a.mean(); prof_b -= prof_b.mean()
+                        cc = np.correlate(prof_a, prof_b, mode="valid")
+                        norm = np.sqrt(np.convolve(prof_a ** 2, np.ones(prof_b.size), mode="valid") * (prof_b ** 2).sum()) + 1e-6
+                        ncc = cc / norm
+                        lag = int(np.argmax(ncc)); score = float(ncc[lag])
+                        tx_ref = (Wa - wa_) + lag
+                        if score >= 0.5 and abs(tx_ref - tx_med) <= 1500:
+                            tx_use, how = float(tx_ref), f"margin-profile ncc {score:.2f}"
+                except Exception as e_:  # noqa: BLE001
+                    logger.warning("seam %s: margin-profile refinement failed (%s) -- median step kept", a.image_path.name, e_)
+            rel = np.array([[1.0, 0.0, tx_use], [0.0, 1.0, ty_use], [0.0, 0.0, 1.0]])
+            logger.warning("seam %s: %s -> FALLBACK (tx %.0f, ty %.0f via %s)",
+                           a.image_path.name, "; ".join(why), tx_use, ty_use, how)
+            # the record carries the translation USED (provenance + seam figures read tx/ty);
+            # the measured seam survives in `reason` (audit r2 2026-08-26)
+            a = dataclasses.replace(a, relative_transform=rel, tx=float(tx_use), ty=float(ty_use), rot_deg=0.0, fallback=True,
+                                    reason="; ".join(why) + f" [{how}; measured tx {a.tx:.0f} ty {a.ty:.0f} rot {a.rot_deg:.3f}]")
+        a = dataclasses.replace(a, absolute_transform=out[-1].absolute_transform @ a.relative_transform)
+        out.append(a)
+    logger.info("seams: %d measured, %d strong, %d fallback; median step tx %.0f ty %.0f", len(seams), len(strong),
+                sum(1 for a in out[1:] if a.fallback), tx_med, ty_med)
+    return out
 
 
 def write_mosaic(
@@ -229,6 +350,10 @@ def write_mosaic(
 
     logger.info("Mosaicing %d images → %s (%d×%d px)", len(alignments), str(output_tif), output_width, output_height)
 
+    widths = []
+    for al in alignments:
+        with rasterio.open(al.image_path) as _s:
+            widths.append(_s.width)
     with rasterio.open(output_tif, "w+", **profile) as dst:
         for i, alignment in enumerate(alignments):
             logger.info("[%d/%d] %s", i + 1, len(alignments), alignment.image_path.name)
@@ -247,8 +372,17 @@ def write_mosaic(
                 logger.info("%s: dark scan background (self-masking) or no "
                             "bright surround -- legacy full-part paste",
                             alignment.image_path.name)
-            else:
-                inv_t = np.linalg.inv(adjusted_transform)
+            # interior cut budget from the measured overlaps (see _section_border_cuts)
+            ovl_prev = (widths[i - 1] - alignments[i].tx) if i > 0 else None
+            ovl_next = (widths[i] - alignments[i + 1].tx) if i + 1 < len(alignments) else None
+            cuts = _section_border_cuts(alignment.image_path, first=(i == 0), last=(i == len(alignments) - 1),
+                                        left_cut_px=None if ovl_prev is None else max(64, 0.35 * ovl_prev),
+                                        right_cut_px=None if ovl_next is None else max(64, 0.35 * ovl_next))
+            if ovl_prev is not None or ovl_next is not None:
+                logger.info("%s: overlap prev %s next %s px -> interior cut caps %s / %s px", alignment.image_path.name,
+                            None if ovl_prev is None else int(ovl_prev), None if ovl_next is None else int(ovl_next),
+                            None if ovl_prev is None else int(max(64, 0.35 * ovl_prev)), None if ovl_next is None else int(max(64, 0.35 * ovl_next)))
+            inv_t = np.linalg.inv(adjusted_transform)
 
             with rasterio.open(alignment.image_path) as src:
                 with WarpedVRT(
@@ -266,15 +400,22 @@ def write_mosaic(
                         warped = vrt.read(1, window=window)
                         # no nodata metadata is set: valid pixels can legitimately be 0 (dark areas)
                         mask = warped != 0
-                        if bbox is not None and mask.any():
-                            # map this block's dst pixels back to part pixel
-                            # coords; keep only pixels inside the content bbox
+                        if (bbox is not None or cuts is not None) and mask.any():
+                            # map this block's dst pixels back to part pixel coords
                             yy, xx = np.mgrid[window.row_off:window.row_off + window.height,
                                               window.col_off:window.col_off + window.width]
                             sx = inv_t[0, 0] * xx + inv_t[0, 1] * yy + inv_t[0, 2]
                             sy = inv_t[1, 0] * xx + inv_t[1, 1] * yy + inv_t[1, 2]
-                            x0, y0, x1, y1 = bbox
-                            mask &= (sx >= x0) & (sx < x1) & (sy >= y0) & (sy < y1)
+                            if bbox is not None:
+                                x0, y0, x1, y1 = bbox
+                                mask &= (sx >= x0) & (sx < x1) & (sy >= y0) & (sy < y1)
+                            if cuts is not None:
+                                # scanner border (white plateau / dark band / border line)
+                                # of THIS section -> nodata, per column and per row
+                                ix = np.clip(sx.astype(int), 0, cuts["top"].size - 1)
+                                iy = np.clip(sy.astype(int), 0, cuts["left"].size - 1)
+                                mask &= (sy >= cuts["top"][ix]) & (sy < cuts["bottom"][ix]) \
+                                        & (sx >= cuts["left"][iy]) & (sx < cuts["right"][iy])
                         if not mask.any():
                             continue
                         existing = dst.read(1, window=window)
@@ -332,6 +473,96 @@ def image_mosaic_asp(
 ####################################################################################################################################
 #                                                   PRIVATE FUNCTIONS
 ####################################################################################################################################
+
+
+
+def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float = 6.0,
+                         left_cut_px: int | None = None, right_cut_px: int | None = None,
+                         bright_dn: float = 200.0, bright_run_px: int = 100, dec: int = 1024,
+                         first: bool = False, last: bool = False, outer_cut_px: int = 800):
+    """Scanner-border cuts of one scan section, derived from its OUTER rows/cols
+    (dshean 2026-08-25: "figure out the nodata value for each section from the
+    outer rows/cols"). Per column (top/bottom) and per row (left/right), walk
+    inward from the edge while the decimated profile stays SMOOTH (|step| <=
+    smooth_step: a white plateau, a pinned background or a dark band with its
+    gradient are all smooth; film base/grain and marks are not); if a short
+    bright run (<= bright_run_px, the thin white border line) immediately follows
+    that smooth run, include it. Never cut deeper than max_cut_px (absolute) of the
+    dimension (3 % ~ 750 rows) -- the collimation lines sit >= 1400 px in.
+    Returns full-resolution cut arrays (top[W], bottom[W], left[H], right[H]) in
+    section pixel coords, or None when nothing is cut. Verified on the archive
+    USGS sections: F013_a top plateau 0-284 (DN 233), bottom white line
+    24314-24349 (DN 232) + dark band DN 17 to the edge."""
+    with rasterio.open(image_path) as s:
+        H, W = s.height, s.width
+        oh, ow = min(dec, H), min(dec, W)
+        # block AVERAGES (nearest decimation keeps the film grain, +-6-10 DN per
+        # sample, which breaks the smooth-run walk after a few blocks)
+        a = s.read(1, out_shape=(oh, ow), resampling=Resampling.average).astype(np.float32)
+    fy, fx = H / oh, W / ow
+
+    def _walk(prof2d, n_full, f, cut_px):
+        # prof2d: (n_edge_axis, n_other) rows ordered edge -> inward
+        # audit M-6 (2026-08-25): the cap is ABSOLUTE px -- a scanner border is a physical
+        # ~300-1100 px (border survey, 26 session x writer combos) whatever the section
+        # size; 3 % of a 31.8 k-px section (954 px) clipped real borders by ~140 px
+        n = prof2d.shape[0]
+        max_cut = max(1, min(n, int(cut_px / f)))
+        run_blocks = max(1, int(bright_run_px / f))
+        cuts = np.zeros(prof2d.shape[1], dtype=np.float32)
+        for j in range(prof2d.shape[1]):
+            v = prof2d[:, j]
+            i = 1
+            while i < max_cut and abs(v[i] - v[i - 1]) <= smooth_step:
+                i += 1
+            if i <= 1:
+                continue
+            # thin bright border line right after the background run (F013: a
+            # ~50-px mixed transition zone sits between the dark band and the
+            # white line, so look a few blocks past the run for the bright start)
+            k = i
+            start = None
+            # the bright border LINE follows a dark BAND (DN >= ~10, F013: 12-29);
+            # never extend after a near-zero margin -- on dark sessions the DN-0
+            # unexposed margin can run up to the collimation line itself
+            if float(np.mean(v[:i])) >= 10.0:
+                for t in range(i, min(max_cut, i + 3 + run_blocks)):
+                    if v[t] >= bright_dn:
+                        start = t; break
+            if start is not None:
+                k = start
+                lim = min(max_cut, start + run_blocks)
+                while k < lim and v[k] >= bright_dn:
+                    k += 1
+            cuts[j] = k * f
+        return cuts
+
+    top = _walk(a, H, fy, max_cut_px)                   # rows from the top, per column
+    bot = H - _walk(a[::-1], H, fy, max_cut_px)          # rows from the bottom, per column
+    # the frame's outer ends (first section's left, last section's right) are not
+    # covered by a neighbour: a smooth run there can be uniform content (cloud),
+    # so cap them at outer_cut_px; interior section edges lie inside the ~3000-px
+    # overlaps and may be cut to max_cut_px (the neighbour supplies the pixels)
+    # 2026-08-26 (dshean: "unexpected nodata in the overlap area / seams"): an interior edge
+    # may only be cut as deep as its measured overlap allows -- the caller passes
+    # left_cut_px / right_cut_px = min(max_cut_px, 0.35 x overlap with that neighbour);
+    # with both sides bounded this way >= 30 % of every overlap stays covered by both
+    # sections and the partial-height notch (0.5-1.7 k px, 40-74 % of rows nodata, right
+    # of every seam on the 2026-08-26 relaunch mosaics) cannot form.
+    lcap = outer_cut_px if first else (max_cut_px if left_cut_px is None else int(min(max_cut_px, left_cut_px)))
+    rcap = outer_cut_px if last else (max_cut_px if right_cut_px is None else int(min(max_cut_px, right_cut_px)))
+    left = _walk(a.T, W, fx, lcap)
+    right = W - _walk(a.T[::-1], W, fx, rcap)
+    if not (top.any() or (bot < H).any() or left.any() or (right < W).any()):
+        return None
+    xs = np.arange(W); ys = np.arange(H)
+    xd = (np.arange(ow) + 0.5) * fx; yd = (np.arange(oh) + 0.5) * fy
+    cuts = dict(top=np.interp(xs, xd, top), bottom=np.interp(xs, xd, bot),
+                left=np.interp(ys, yd, left), right=np.interp(ys, yd, right))
+    logger.info("%s: scanner border nodata (px, median) top %d bottom %d left %d right %d",
+                Path(image_path).name, int(np.median(cuts["top"])), int(H - np.median(cuts["bottom"])),
+                int(np.median(cuts["left"])), int(W - np.median(cuts["right"])))
+    return cuts
 
 
 def _part_content_bbox(image_path, dark_dn: float = 8.0,

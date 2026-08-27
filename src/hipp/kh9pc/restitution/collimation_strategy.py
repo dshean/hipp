@@ -23,6 +23,7 @@ from sklearn.linear_model import RANSACRegressor
 
 from hipp.image import SubImage, remap_tif_blockwise
 from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, _featureless_edge, fit_ransac_poly, tps_from_estimate
+from hipp.kh9pc.restitution.base import scan_scale
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, DetectionError, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.poly_strategy import PolyStrategy
 
@@ -114,6 +115,18 @@ class CollimationStrategy(RestitutionStrategy):
     # (D3C1217 F004: +0.28% line spacing, +0.9% detected width), so 2% separates
     # scan-scale variation from a genuinely wrong line lock.
     min_inliers_threshold: float = 0.5
+    # One-sided waiver (dshean 2026-08-25 "all Iceland images in the block";
+    # iceland ops533 A006): sections a-c are cloud-saturated to the frame edge,
+    # so the TOP line has no detectable peak in ~30 % of the columns (inliers
+    # 0.31) while the bottom line is clean (0.67) and the pair separation is
+    # physical (21809 vs 21770). After the joint PARALLEL refit the weak side's
+    # shape comes from the clean side and its own inliers only fix an offset,
+    # so the per-side 0.5 floor rejects a well-determined frame. Waive it to
+    # ``min_inliers_threshold_paired`` when (a) the joint refit succeeded,
+    # (b) the separation is physical and (c) the strong side clears the full
+    # floor. A wrong lock still fails: it moves the separation (caught here)
+    # or the line-pair/pitch ratio (caught by the worker's A6 gate).
+    min_inliers_threshold_paired: float = 0.25
     # Per-side INWARD shift of the detection strip start (px, default 0 = strip
     # anchored at the poly edge as before). Escape hatch for frames where a
     # bright OUTER secondary band inside the strip out-competes the true
@@ -124,6 +137,7 @@ class CollimationStrategy(RestitutionStrategy):
     # the separation validator still gates the result, so a wrong inset can
     # only produce a loud FAIL, never a silent wrong lock.
     search_inset_top: int = 0
+    search_band_rows: int = 4000   # dshean 2026-08-25: fixed slab from each raster edge
     search_inset_bottom: int = 0
     # Exposure edge = the collimation line + a conservative fixed OUTWARD offset
     # (David 2026-07-22: "set the edge some distance outward from the
@@ -189,12 +203,17 @@ class CollimationStrategy(RestitutionStrategy):
     crop_offset_from_line_bottom: int | None = None
     output_width: int | None = None
     output_height: int | None = DEFAULT_OUTPUT_HEIGHT
+    # (x_um, y_um) scanner pitch of this scan session (x scale to the canvas; y is
+    # already physical through the 21770-px line pair). None -> raster tags or 1:1
+    scan_pitch_um: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
         self._results: dict[str, CollimationResult] = {}
         self.__transformation_: Transformation | None = None
         self._separation_ok: bool = True
+        self._joint_refit_ok: bool = False
+        self._edge_results: dict = {}
 
     @property
     def is_failed(self) -> bool:
@@ -202,7 +221,19 @@ class CollimationStrategy(RestitutionStrategy):
         top-bottom separation could not be reconciled with ``collimation_line_dist``."""
         if not self._separation_ok:
             return True
-        return min(self.top_.inlier_ratio, self.bottom_.inlier_ratio) < self.min_inliers_threshold
+        lo, hi = sorted((self.top_.inlier_ratio, self.bottom_.inlier_ratio))
+        if lo >= self.min_inliers_threshold:
+            return False
+        if (getattr(self, "_joint_refit_ok", False) and hi >= self.min_inliers_threshold
+                and lo >= self.min_inliers_threshold_paired):
+            weak = "top" if self.top_.inlier_ratio < self.bottom_.inlier_ratio else "bottom"
+            logger.warning(
+                "[CollimationStrategy] one-sided inlier waiver: %s line inliers %.2f "
+                "< %.2f but the pair is parallel-refit with physical separation and "
+                "the other side has %.2f -- accepted (paired floor %.2f)",
+                weak, lo, self.min_inliers_threshold, hi, self.min_inliers_threshold_paired)
+            return False
+        return True
 
     @property
     def top_(self) -> CollimationResult:
@@ -238,34 +269,69 @@ class CollimationStrategy(RestitutionStrategy):
         an unreconciled separation marks the fit FAILED rather than silently
         producing a wrong rectification.
         """
+        self._joint_refit_ok = False
+        self._pairing_ = {}
+        self.line_extent_ = {}
+        self.crop_x_source_ = "detector"
         if not self.poly_strategy.is_fitted or raster_filepath != self.poly_strategy.raster_filepath_:
+            # 2026-08-26: MixedStrategy sets scan_pitch_um on the top-level strategies only;
+            # this strategy's OWN poly_strategy (and its vertical detector) never got it, so
+            # the expected sweep width was the nominal 7-um one (0.2 % off) -- the 30-deg
+            # frames (+0.67 % sweeps) then lost their edge pair inside the strategy while the
+            # standalone detector, given the pitch, found it (ops327 A004, ops395 F014)
+            if self.scan_pitch_um is not None:
+                self.poly_strategy.scan_pitch_um = self.scan_pitch_um
             self.poly_strategy.fit(raster_filepath)
-            if self.poly_strategy.is_failed:
-                raise DetectionError(
-                    f"poly edge model failed on {raster_filepath.name} — cannot "
-                    "anchor collimation strip placement (review C2/M-1, 2026-08-23)")
+        poly_ok = not self.poly_strategy.is_failed
+        if self.poly_strategy.vertical_detector.is_failed:
+            raise DetectionError(
+                f"vertical (left/right) edge detection failed on {raster_filepath.name} — cannot "
+                "anchor the collimation search columns (review C2/M-1, 2026-08-23)")
 
         col_off, col_end = self.poly_strategy.vertical_detector.edges_
         window_width = self.poly_strategy.vertical_detector.detected_width_
         col_center = (col_off + col_end) // 2
 
         with rasterio.open(raster_filepath) as src:
-            window_height = int(src.height * self.refinement_fraction)
-
-            top_edge = int(self.poly_strategy.top_.model.predict(np.array([[col_center]])).flat[0])
-            bot_edge = int(self.poly_strategy.bottom_.model.predict(np.array([[col_center]])).flat[0])
-
-            # Both collimation lines lie inside the effective image content, not outside it.
-            # top window starts at top_edge and extends downward; bottom window ends at bot_edge and extends upward.
-            for side, window in {
-                "top": Window(col_off, top_edge + self.search_inset_top,
-                              window_width, window_height),
-                "bottom": Window(col_off,
-                                 bot_edge - window_height - self.search_inset_bottom,
-                                 window_width, window_height),
-            }.items():
-                sub_image = SubImage(src, window, resampling=Resampling.average, out_shape=self._out_shape(window))
-                self._results[side] = self._process_side(sub_image, side)
+            H = int(src.height)
+            # dshean 2026-08-25: the search band is a FIXED slab from each raster
+            # edge inward (search_band_rows, ~4000 full-res rows): it brackets the
+            # scanner border, the collimation line AND the exposure edge with exposed
+            # film beyond it on every frame, without depending on the poly edge model
+            # (ops395 F001/F021 fail there; iceland F024's poly edge sits deeper than
+            # its faint line) and without trimming anything from the mosaic. The
+            # furniture inside the slab (USGS scanner white plateau, thin white line,
+            # dark band -- verified in the archive sections, not introduced by the
+            # merge) is handled by ridge detection + the physical line-pair separation.
+            band_rows = int(min(H // 2, self.search_band_rows))
+            window_height = band_rows
+            if not poly_ok:
+                logger.warning("[CollimationStrategy] poly edge model failed on %s -- "
+                               "collimation search proceeds on the fixed %d-row bands",
+                               raster_filepath.name, band_rows)
+            windows = {
+                "top": Window(col_off, 0, window_width, band_rows),
+                "bottom": Window(col_off, H - band_rows, window_width, band_rows),
+            }
+            subs = {side: SubImage(src, win, resampling=Resampling.average, out_shape=self._out_shape(win))
+                    for side, win in windows.items()}
+            # per-column candidate ridges on BOTH margins, paired by the physical
+            # line separation (line-line 21770 at 7 um; rail-rail ~24200, mixed
+            # ~22500 -> unambiguous). Unpaired columns fall back to the most
+            # prominent ridge and become RANSAC outliers if wrong.
+            cands = {side: self._column_candidates(subs[side], side=side) for side in subs}
+            peaks = self._pair_columns(cands, subs)
+            for side in ("top", "bottom"):
+                self._results[side] = self._fit_side(subs[side], peaks[side])
+            # second pass (ops395 F001, dshean 2026-08-25 "all problem images solid"):
+            # with the pair of lines fitted, every column re-picks the candidate
+            # nearest the fitted row (within prior_px) -- columns where a content
+            # pair happened to match the separation come back to the line -- and
+            # the fit is redone on the refined picks.
+            peaks2 = self._repick_with_prior(cands, subs, prior_px=200.0)
+            if peaks2 is not None:
+                for side in ("top", "bottom"):
+                    self._results[side] = self._fit_side(subs[side], peaks2[side])
 
             self._validate_separation()
             if not self._separation_ok:
@@ -314,7 +380,21 @@ class CollimationStrategy(RestitutionStrategy):
                         self._results[bad].inlier_ratio)
             if self._separation_ok:
                 self._joint_parallel_refit()
-                self._refit_edges_from_lines(src, col_off, window_width, window_height)
+                # audit H-4: the refit replaces both models -- re-validate, and never
+                # let a refit that broke the separation unlock the one-sided waiver
+                self._validate_separation()
+                if not self._separation_ok:
+                    self._joint_refit_ok = False
+                    logger.error("[CollimationStrategy] separation failed AFTER the joint refit -- fit FAILED")
+                else:
+                    self._refit_edges_from_lines(src, col_off, window_width, window_height)
+                    try:
+                        ext = self._line_x_extent(src)
+                        for side, (xa, xb, fr) in ext.items():
+                            logger.info("[CollimationStrategy] %s line x-extent %d..%d (width %d, presence %.2f)", side, xa, xb, xb - xa, fr)
+                    except Exception as e:      # the extent is a cross-check, never a failure
+                        logger.warning("[CollimationStrategy] line x-extent probe failed: %s", e)
+                        self.line_extent_ = {}
 
         return self
 
@@ -384,6 +464,7 @@ class CollimationStrategy(RestitutionStrategy):
             "[CollimationStrategy] joint parallel refit: shared shape, "
             "offsets %.1f/%.1f (sep %.1f), kept %d/%d line points",
             o_t, o_b, o_b - o_t, int(keep.sum()), keep.size)
+        self._joint_refit_ok = True
 
     def _refit_edges_from_lines(self, src: rasterio.DatasetReader, col_off: int, window_width: int, window_height: int) -> None:
         """Re-detect the EXPOSURE edges in windows ANCHORED at the fitted
@@ -452,7 +533,7 @@ class CollimationStrategy(RestitutionStrategy):
                 logger.warning(
                     "[CollimationStrategy] no room to refit the %s exposure edge "
                     "(line at raster boundary) - using the derived line+offset edge", side)
-                self.poly_strategy._results[side] = derived
+                self._edge_results[side] = derived   # audit H-7: never overwrite the poly fit
                 continue
             sub_image = SubImage(src, window, out_shape=(
                 1, max(int(window.height) // stride, 1),
@@ -506,7 +587,7 @@ class CollimationStrategy(RestitutionStrategy):
                     "columns in-band (%d rejected out-of-band) - using the "
                     "derived line+offset edge",
                     side, len(res), sub_image.band.shape[1], rejected_band)
-                self.poly_strategy._results[side] = derived
+                self._edge_results[side] = derived   # audit H-7: never overwrite the poly fit
                 continue
             ruptures_local = np.array(res)
             ruptures_global = sub_image.to_global(ruptures_local)
@@ -524,7 +605,7 @@ class CollimationStrategy(RestitutionStrategy):
                     "[CollimationStrategy] %s exposure-edge refit REJECTED "
                     "(inliers %.2f < %.2f) - using the derived line+offset edge",
                     side, inlier_ratio, self.poly_strategy.min_inliers_threshold)
-                self.poly_strategy._results[side] = derived
+                self._edge_results[side] = derived   # audit H-7: never overwrite the poly fit
                 continue
             # GEOMETRY vs CROP separation (David 2026-07-22 round 3): the edge
             # MODEL is the clean SMOOTH poly2 fit to the accepted inliers -- the
@@ -594,6 +675,70 @@ class CollimationStrategy(RestitutionStrategy):
             model=model,
             sub_image=self._results[side].sub_image)   # reuse the line strip for QC background
 
+    line_extent_gap_cols: int = 8      # x-extent walk: tolerate <= 8 absent columns (~2 k px)
+
+    def _line_x_extent(self, src: rasterio.DatasetReader, step_px: int = 256,
+                       prior_px: float = 60.0, min_frac: float = 0.35) -> dict:
+        """Sweep x-extent from the collimation LINES themselves (dshean 2026-08-25,
+        iceland A025/A024, ops323 F001/F026: the exposure-edge walk stops inside dark
+        ocean or fog, and block-end scans are truncated). The line pair is exposed by
+        the camera across the whole sweep whatever the scene, so the outermost columns
+        where a ridge sits on the fitted line row bound the sweep independently of
+        scene content and of the vertical detector's window.
+
+        Per side: one slab of rows around the fitted line over the FULL raster width,
+        averaged into step_px-wide columns (the line is continuous in x, texture is
+        not); presence = a ridge candidate within prior_px of the model row with a
+        prominence >= min_frac x the central-half median.  Walk outward from the
+        centre; the extent ends at the first 3-column run without presence.
+        Returns {side: (x_first, x_last, frac_present)} in source px."""
+        W = int(src.width); H = int(src.height); st = max(1, self.stride)
+        ncol = max(8, W // step_px)
+        xc = (np.arange(ncol) + 0.5) * (W / ncol)
+        out = {}
+        for side in ("top", "bottom"):
+            res = self._results.get(side)
+            if res is None or res.model is None:
+                continue
+            pred = np.asarray(res.model.predict(xc.reshape(-1, 1))).ravel()
+            r0 = int(max(0, np.floor(pred.min() - 3 * prior_px))); r1 = int(min(H, np.ceil(pred.max() + 3 * prior_px)))
+            if r1 - r0 < 4 * st:
+                continue
+            win = Window(0, r0, W, r1 - r0)
+            band = src.read(1, window=win, out_shape=(max(4, (r1 - r0) // st), ncol), resampling=Resampling.average).astype(np.float32)
+            mpw = max(2, self.max_width_peak // st)
+            prom = np.zeros(ncol)
+            for c in range(ncol):
+                idx, pr = detect_collimation_candidates(band[:, c], mpw, k=3)
+                if idx.size:
+                    d = np.abs(idx * st + r0 - pred[c])
+                    j = int(np.argmin(d))
+                    if d[j] <= prior_px:
+                        prom[c] = float(pr[j])
+            mid = slice(ncol // 4, 3 * ncol // 4)
+            ref = float(np.median(prom[mid][prom[mid] > 0])) if (prom[mid] > 0).any() else 0.0
+            if ref <= 0:
+                continue
+            present = prom >= min_frac * ref
+            c0 = ncol // 2
+            def walk(direction):
+                k, gap = c0, 0
+                last = c0
+                while 0 <= k < ncol:
+                    if present[k]:
+                        last, gap = k, 0
+                    else:
+                        gap += 1
+                        if gap >= self.line_extent_gap_cols:      # F013 bottom: the USGS logo band breaks the line
+                            break
+                    k += direction
+                return last
+            kl, kr = walk(-1), walk(+1)
+            x_first = int(kl * (W / ncol)); x_last = int((kr + 1) * (W / ncol))
+            out[side] = (x_first, x_last, float(present[kl:kr + 1].mean()))
+        self.line_extent_ = out
+        return out
+
     def _out_shape(self, window: Window) -> tuple[int, int, int]:
         """Decimated read shape for a search window (rows strided, columns gridded)."""
         return (1, max(int(window.height) // self.stride, 1), self.grid_shape[0])
@@ -614,8 +759,8 @@ class CollimationStrategy(RestitutionStrategy):
         secondary band, so the fit is marked FAILED (``is_failed``) instead of
         silently rectifying to a wrong height.
         """
-        dist = self.collimation_line_dist
-        tol = self.separation_tolerance * dist
+        dist = self._expected_separation_px()   # audit H-5: same target as the pairing
+        tol = min(self.separation_tolerance * dist, 0.015 * dist)   # never looser than the 1.5 % pairing window
         sep = self._line_row("bottom") - self._line_row("top")
         self._separation_ok = abs(sep - dist) <= tol
         if self._separation_ok:
@@ -630,7 +775,174 @@ class CollimationStrategy(RestitutionStrategy):
                 sep, dist, sep - dist, tol,
             )
 
+    def _masked_band(self, sub_image: SubImage) -> NDArray:
+        """Strip band with pinned-bright furniture (USGS logo, margin bands) zeroed."""
+        band = sub_image.band
+        pin = band >= 249
+        if pin.any():
+            from scipy.ndimage import binary_opening
+            maxrun = max(3, self.max_width_peak // max(1, self.stride))
+            furniture = binary_opening(pin, structure=np.ones((maxrun, 1), bool))
+            if furniture.any():
+                band = band.copy()
+                band[furniture] = 0
+        return band
+
+    def _column_candidates(self, sub_image: SubImage, k: int = 4, side: str = "top"):
+        """Per-column candidate ridges: global rows (w, k) NaN-padded + scores.
+        Score = prominence, halved when the ridge is NOT a margin/content boundary
+        (ops395 F001, dshean 2026-08-25: on an overexposed frame the bright content
+        texture out-ranks the line; the collimation line always separates the dark
+        outer margin from the exposed area, so the outer side of a true line is
+        darker than its inner side)."""
+        band = self._masked_band(sub_image)
+        h, w = band.shape
+        rows = np.full((w, k), np.nan); prom = np.zeros((w, k))
+        mpw = max(2, self.max_width_peak // max(1, self.stride))
+        ctx = max(3, int(300 / max(1, self.stride)))     # ~300 full-res px each side
+        for col in range(w):
+            v = band[:, col]
+            idx, pr = detect_collimation_candidates(v, mpw, k=k)
+            if idx.size:
+                sc = pr.copy()
+                for n, i in enumerate(idx):
+                    i = int(i)
+                    lo, hi = max(0, i - ctx), min(h, i + ctx + 1)
+                    before, after = v[lo:max(lo, i - 1)], v[min(hi, i + 2):hi]
+                    outer, inner = (before, after) if side == "top" else (after, before)
+                    ov, iv = outer[outer > 0], inner[inner > 0]
+                    if ov.size and iv.size and np.median(ov) >= np.median(iv) - 5:
+                        sc[n] *= 0.5          # not a dark-margin / content boundary
+                order = np.argsort(-sc)
+                idx, sc = idx[order], sc[order]
+                g = sub_image.to_global(np.column_stack([np.full(idx.size, col), idx]).astype(float))
+                rows[col, :idx.size] = g[:, 1]; prom[col, :idx.size] = sc
+        return rows, prom
+
+    def _expected_separation_px(self) -> float:
+        """Line-pair separation in THIS scan's pixels: 21770 at 7 um, scaled by the session pitch."""
+        d = float(self.collimation_line_dist)
+        if self.scan_pitch_um is not None and self.scan_pitch_um[1] > 0:
+            d *= 7.0 / float(self.scan_pitch_um[1])
+        return d
+
+    def _pair_columns(self, cands, subs, pair_tol_frac: float = 0.015):
+        """Choose, per column, the (top, bottom) candidate pair whose separation
+        matches the physical line pair; returns local (col, row) peak arrays."""
+        d = self._expected_separation_px(); tol = pair_tol_frac * d
+        tr, tp = cands["top"]; br, bp = cands["bottom"]
+        w = tr.shape[0]
+        out = {"top": np.zeros((w, 2)), "bottom": np.zeros((w, 2))}
+        paired = 0
+        for col in range(w):
+            t = tr[col]; b = br[col]
+            ti = np.flatnonzero(np.isfinite(t)); bi = np.flatnonzero(np.isfinite(b))
+            choice = None
+            if ti.size and bi.size:
+                diff = np.abs(b[bi][None, :] - t[ti][:, None] - d)
+                i, j = np.unravel_index(np.argmin(diff), diff.shape)
+                if diff[i, j] <= tol:
+                    choice = (t[ti[i]], b[bi[j]]); paired += 1
+            if choice is None:   # fallback: most prominent ridge on each side (RANSAC sorts it out)
+                choice = (t[ti[0]] if ti.size else np.nan, b[bi[0]] if bi.size else np.nan)
+            for side, row in (("top", choice[0]), ("bottom", choice[1])):
+                sub = subs[side]
+                if np.isfinite(row):
+                    loc = sub.to_local(np.array([[sub.to_global_x(float(col)), row]]))[0]
+                    out[side][col] = (col, loc[1])
+                else:
+                    out[side][col] = (col, np.nan)   # audit M-2: no candidate -> no point (never row 0)
+        self._pairing_ = {"expected_sep_px": d, "tol_px": tol, "paired_cols": int(paired), "cols": int(w)}
+        logger.info("[CollimationStrategy] pair-constrained detection: %d/%d columns paired "
+                    "(expected separation %.0f px, tol %.0f)", paired, w, d, tol)
+        return out
+
+    def _repick_with_prior(self, cands, subs, prior_px: float = 200.0):
+        """Per column, the candidate nearest the CURRENT fitted line row (within
+        prior_px) becomes the pick; columns without one keep their first pick."""
+        out = {}
+        changed = 0
+        for side in ("top", "bottom"):
+            rows, prom = cands[side]
+            sub = subs[side]; r = self._results[side]
+            # audit M-1: the re-pick is a confirmation step -- only when the first fit
+            # already had a real straight-line consensus (RANSAC ratio >= 0.25)
+            if getattr(r, "inlier_ratio", 0.0) < 0.25:
+                out[side] = r.peaks_local.astype(float)
+                continue
+            pk_rows = []
+            for col in range(rows.shape[0]):
+                c = rows[col]; ok = np.isfinite(c)
+                if not ok.any():
+                    continue
+                xg_col = sub.to_global_x(float(col))
+                pred = float(np.asarray(r.model.predict(np.array([[xg_col]]))).ravel()[0])
+                d = np.abs(c[ok] - pred); j = int(np.argmin(d))
+                if d[j] <= prior_px:
+                    loc = sub.to_local(np.array([[xg_col, c[ok][j]]]))[0]
+                    pk_rows.append((col, loc[1])); changed += 1
+                else:
+                    pk_rows.append((col, np.nan))
+            out[side] = np.array(pk_rows, dtype=float) if pk_rows else r.peaks_local.astype(float)
+        logger.info("[CollimationStrategy] prior re-pick: %d column picks moved onto the fitted lines", changed)
+        self._pairing_["repicked_cols"] = int(changed)
+        return out if changed else None
+
+    def _fit_side(self, sub_image: SubImage, peaks_local: NDArray) -> CollimationResult:
+        """RANSAC polynomial + distortion curve from per-column peaks (local coords).
+        Inlier selection uses a STRAIGHT-LINE RANSAC first (ops395 F001, dshean
+        2026-08-25: a degree-2 RANSAC bent through a cluster of wrong picks and kept
+        28 of 100 columns while a straight line explained 42); the collimation line
+        is nearly straight (curvature << the 80-px residual threshold), so the line
+        consensus is the right inlier set, and the final polynomial_degree model is
+        then fitted on those inliers only."""
+        peaks_local = np.asarray(peaks_local, dtype=float)
+        peaks_local = peaks_local[np.isfinite(peaks_local[:, 1])]      # audit M-2: drop empty columns
+        if peaks_local.shape[0] < 8:
+            raise DetectionError("fewer than 8 columns with a line candidate")
+        peaks_global = sub_image.to_global(peaks_local).astype(int)
+        x, y = peaks_global[:, 0], peaks_global[:, 1]
+        line = fit_ransac_poly(x, y, degree=1,
+                               residual_threshold=self.ransac_residual_threshold,
+                               max_trials=self.ransac_max_trials)
+        sel = np.asarray(line.inlier_mask_, bool)
+        if sel.sum() >= max(8, self.polynomial_degree + 2):
+            model = fit_ransac_poly(x[sel], y[sel], degree=self.polynomial_degree,
+                                    residual_threshold=self.ransac_residual_threshold,
+                                    max_trials=self.ransac_max_trials)
+            # inlier mask in the FULL peak set: within threshold of the refined model
+            resid = np.abs(y - np.asarray(model.predict(x.reshape(-1, 1))).ravel())
+            full = resid <= self.ransac_residual_threshold
+            model.inlier_mask_ = full
+        else:
+            model = fit_ransac_poly(x, y, degree=self.polynomial_degree,
+                                    residual_threshold=self.ransac_residual_threshold,
+                                    max_trials=self.ransac_max_trials)
+        inlier_ratio = float(model.inlier_mask_.mean())
+        y_global_pred = model.predict(peaks_global[:, 0].reshape(-1, 1))
+        y_distortion = y_global_pred - y_global_pred.mean()
+        distortion = np.column_stack([peaks_global[:, 0], y_distortion])
+        return CollimationResult(
+            peaks_local=peaks_local.astype(int),
+            peaks_global=peaks_global,
+            distortion=distortion,
+            inlier_ratio=inlier_ratio,
+            model=model,
+            sub_image=sub_image,
+        )
+
     def _process_side(self, sub_image: SubImage, side: str) -> CollimationResult:
+        """Single-side detection (pair rescue windows): most prominent ridge per column."""
+        band = self._masked_band(sub_image)
+        _, w = band.shape
+        peaks_local = np.zeros((w, 2), dtype=int)
+        mpw = max(2, self.max_width_peak // max(1, self.stride))
+        for col in range(w):
+            peaks_local[col, 0] = col
+            peaks_local[col, 1] = detect_collimation_peak(band[:, col], max_peak_width=mpw)
+        return self._fit_side(sub_image, peaks_local)
+
+    def _process_side_legacy(self, sub_image: SubImage, side: str) -> CollimationResult:
         """Detect collimation peaks column-by-column, fit a RANSAC polynomial, and compute the distortion curve."""
         _, w = sub_image.band.shape
 
@@ -689,7 +1001,7 @@ class CollimationStrategy(RestitutionStrategy):
         conservative) derived line+offset ``model``. Since the fixed-offset
         crop ruling (David 2026-07-22) this feeds ONLY the black-leak sentinel
         and QC figures -- never the delivered crop, never the geometry."""
-        r = self.poly_strategy._results[side]
+        r = self._edge_results.get(side, self.poly_strategy._results[side])
         return r.crop_model if getattr(r, "crop_model", None) is not None else r.model
 
     def _compute_transformation(self) -> Transformation:
@@ -697,6 +1009,7 @@ class CollimationStrategy(RestitutionStrategy):
         left, right = self.poly_strategy.vertical_detector.edges_
         detected_width = self.poly_strategy.vertical_detector.detected_width_
         output_width = self.output_width or detected_width
+        sx, sy_meta = scan_scale(self.scan_pitch_um, self.raster_filepath_)
 
         x = np.linspace(left, right, self.grid_shape[0])
 
@@ -711,7 +1024,15 @@ class CollimationStrategy(RestitutionStrategy):
         y_bot_dst = np.full_like(x, bot)
 
         src = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_src, y_bot_src))))
-        dst = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_dst, y_bot_dst))))
+        dst = np.column_stack((np.concatenate((x * sx, x * sx)), np.concatenate((y_top_dst, y_bot_dst))))
+        # x: source px * sx = canvas px at CANVAS_PITCH_UM; y: the detected line pair
+        # maps to exactly collimation_line_dist canvas px. The implied y scale from
+        # the lines vs the metadata pitch is a free consistency check:
+        sy_lines = self.collimation_line_dist / max(float(np.median(y_bot_src) - np.median(y_top_src)), 1.0)
+        logger.info("[CollimationStrategy] scan scale to canvas: sx=%.5f (metadata) sy=%.5f (line pair) sy_meta=%.5f -> ratio %.5f",
+                    sx, sy_lines, sy_meta, sy_lines / sy_meta)
+        detected_width = detected_width * sx
+        left = left * sx
 
         # inverse source destination (important). GEOMETRY: the warp uses ONLY
         # the smooth collimation line models -> no shear (David 2026-07-22 r3).
@@ -765,7 +1086,59 @@ class CollimationStrategy(RestitutionStrategy):
             "centered on lines (line rows %d/%d -> crop rows [%d, %d])",
             output_width, output_height, top, bot, crop_top, crop_bot)
 
-        x_center = (left + right) / 2.0
+        # audit H-1 (2026-08-25): `left` is already canvas px (scaled above); `right`
+        # is still source px -- scale it too or the crop window shifts by right*(sx-1)/2
+        _vd = self.poly_strategy.vertical_detector
+        x_center = (_vd.crop_center_ * sx if getattr(_vd, "crop_center_", None) is not None
+                    else (left + right * sx) / 2.0)          # strength-weighted centre (vertical_detector)
+        # cross-check / override from the collimation-line x-extent (source px):
+        #  - a line extent whose width matches the sweep (1 %) is the sweep; if the
+        #    detector found BOTH edges within 1000 px of it keep the detector (finer),
+        #    else centre on the line extent;
+        #  - an extent clipped by the raster (block-end truncated scan) anchors the
+        #    centre on its free end + the expected sweep width.
+        _exp = float(output_width) / sx          # expected sweep width in source px
+        _ext = getattr(self, "line_extent_", {}) or {}
+        with rasterio.open(self.raster_filepath_) as _s:
+            src_w = float(_s.width)
+        # each side on its own (F013: the top line spans the sweep to +-200 px, the bottom
+        # breaks at the USGS logo band): keep a side whose width matches the sweep (1 %)
+        # or is clipped by the raster and narrower; best presence wins -- never average
+        _cands = []
+        for _side, (_xa, _xb, _fr) in _ext.items():
+            _w = _xb - _xa
+            ok = abs(_w - _exp) <= 0.01 * _exp or ((_xa <= 512 or _xb >= src_w - 512) and _w < _exp)
+            logger.info("[CollimationStrategy] %s line extent %d..%d width %d vs sweep %.0f presence %.2f -> %s",
+                        _side, _xa, _xb, _w, _exp, _fr, "candidate" if ok else "rejected")
+            if ok and _fr >= 0.5:
+                _cands.append((_fr, _xa, _xb, _side))
+        if _cands:
+            _fr, xa, xb, _side = max(_cands)
+            xa, xb = float(xa), float(xb)
+            det_l, det_r = self.poly_strategy.vertical_detector.edges_
+            det_src = getattr(_vd, "edge_source_", "") or ""
+            # dshean 2026-08-25: the line extent is a CROSS-CHECK, never the placement --
+            # ops323 A001: a presence gap at 278 k made the "clipped" branch put the crop
+            # at x=-64565 while the detector's 339171 - expected was right. Agreement is
+            # judged per side the detector actually measured; the derived side is not
+            # compared. Any disagreement is flagged for the sheet, the detector stands.
+            checks = []
+            if det_src == "both" or det_src.startswith("left"):
+                checks.append(("left", abs(det_l - xa) <= 1000))
+            if det_src == "both" or det_src.startswith("right"):
+                checks.append(("right", abs(det_r - xb) <= 1000))
+            bad = [sd for sd, ok in checks if not ok]
+            if not bad:
+                self.crop_x_source_ = "detector (line extent agrees)"
+            else:
+                self.crop_x_source_ = "detector (line extent CONFLICTS on %s: line %d..%d vs detector %d..%d -- review)" % (
+                    ",".join(bad), xa, xb, det_l, det_r)
+                logger.warning("[CollimationStrategy] crop x: %s", self.crop_x_source_)
+            logger.info("[CollimationStrategy] crop x: %s; %s line extent %d..%d, detector %d..%d (%s), centre %.0f canvas px",
+                        self.crop_x_source_, _side, xa, xb, det_l, det_r, det_src, x_center)
+        else:
+            logger.info("[CollimationStrategy] crop x: detector (no usable line extent); detector %d..%d (%s), centre %.0f canvas px",
+                        *self.poly_strategy.vertical_detector.edges_, getattr(_vd, "edge_source_", "?"), x_center)
         crop_offset = (int(x_center - output_width / 2), crop_top)
 
         return Transformation(
@@ -848,6 +1221,35 @@ def _variance_edge(
     return None
 
 
+def detect_collimation_candidates(x: NDArray[np.number], max_peak_width: int, k: int = 4,
+                                  sigma: int = 2) -> tuple[NDArray[np.int64], NDArray[np.float64]]:
+    """Up to ``k`` compact bright ridges in a column profile, prominence-ranked
+    (canvas <= 0 and a guard band next to it excluded). The KH-9 margin holds
+    TWO ridges -- the rail band edge and the fainter collimation line ~1000-1300
+    px inside it -- so a single per-column pick flips between them (ops323 F013,
+    dshean 2026-08-25); the caller pairs top/bottom candidates by the known
+    physical line separation instead."""
+    from scipy.signal import find_peaks
+    smooth = gaussian_filter1d(np.asarray(x, dtype=np.float64), sigma=sigma)
+    # Only the zero pixels themselves are excluded -- NO dilation: on dark
+    # scan sessions the unexposed film margin is DN 0 right up to the
+    # collimation line (iceland F024: 5/100 columns paired, top inliers 0.15
+    # with a 200-px guard), so a guard band masks the line. A step from 0 to
+    # bright film is not a compact ridge and pairing rejects any thin white
+    # border line by separation, so the guard is not needed for them.
+    canvas = np.asarray(x) <= 0
+    valid = ~canvas
+    if valid.sum() < 3:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    prof = np.where(valid, smooth, float(np.min(smooth[valid])))
+    pk, props = find_peaks(prof, width=(1, max(2, max_peak_width)), prominence=1.0)
+    if pk.size == 0:
+        return np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.float64)
+    sel = valid[pk]; pk = pk[sel]; prom = props["prominences"][sel]
+    order = np.argsort(-prom)[:k]
+    return pk[order].astype(np.int64), prom[order].astype(np.float64)
+
+
 def detect_collimation_peak(x: NDArray[np.number], max_peak_width: int, sigma: int = 2) -> int:
     """Locate the center of the collimation line in a 1D column profile.
 
@@ -856,18 +1258,34 @@ def detect_collimation_peak(x: NDArray[np.number], max_peak_width: int, sigma: i
     Returns the index of the intensity maximum between the two gradient peaks,
     or the global maximum as a fallback when no compact peak is found.
     """
-    smooth = gaussian_filter1d(x, sigma=sigma)
-
+    smooth = gaussian_filter1d(np.asarray(x, dtype=np.float64), sigma=sigma)
+    # dshean 2026-08-25 (ops323 F013/F026, iceland F024/F025/A025 "edge locks"):
+    # the collimation line is a THIN BRIGHT RIDGE with film on both sides. The
+    # gradient-pair test below fell back to the global maximum whenever the strip
+    # held a scan-window edge (canvas 0 -> bright film = one huge rising gradient,
+    # no falling partner) or a wide bright margin band, and that maximum sits AT
+    # the edge/band: an edge-to-edge separation of 24224 px passed the gate on
+    # F013. Detect ridges explicitly: compact peaks (width <= max_peak_width at
+    # half prominence) ranked by prominence, with the canvas and a guard band
+    # next to it excluded so a step can never be a candidate.
+    from scipy.signal import find_peaks
+    canvas = np.asarray(x) <= 0
+    valid = ~canvas          # zero pixels only, no guard band (see detect_collimation_candidates)
+    if valid.sum() >= 3:
+        prof = np.where(valid, smooth, float(np.min(smooth[valid])))
+        pk_all, props = find_peaks(prof, width=(1, max(2, max_peak_width)), prominence=1.0)
+        if pk_all.size:
+            sel = valid[pk_all]
+            if sel.any():
+                return int(pk_all[sel][np.argmax(props["prominences"][sel])])
+    # legacy fallback (no compact ridge): gradient pair, else global maximum
     grad = np.gradient(smooth)
-
     idx_max = np.argmax(grad)
     idx_min = np.argmin(grad)
-
     if abs(idx_max - idx_min) < max_peak_width and idx_max != idx_min:
         w_start = min(idx_max, idx_min)
         w_end = max(idx_max, idx_min)
         idx = np.argmax(smooth[w_start:w_end]) + w_start
     else:
         idx = np.argmax(smooth)  # fallback
-
     return int(idx)

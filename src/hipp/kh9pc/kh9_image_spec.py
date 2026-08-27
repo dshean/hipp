@@ -17,6 +17,12 @@ from hipp.kh9pc.fiducial_patterns import Patterns
 # Nominal widths for 1, 2, 3, and 4-frame scans at 0.007 mm/px resolution.
 IMAGE_WIDTHS_PX: list[int] = [114082, 228165, 342247, 456329]
 IMAGE_HEIGHT_PX: int = 21771
+# Physical pitch of the canvas: the collimation lines are 152.4 mm (6.000 in)
+# apart = 21770 px, and a 90 deg sector = f * pi/2 = 2394 mm = 342247 px, i.e.
+# the canonical dims are defined at 7.000 um/px. Scanner sessions run at
+# 6.955-6.988 um (TIFF X/YResolution, non-square at the 1e-4 level); pass the
+# scan pitch to the strategies so every restituted image is at CANVAS_PITCH_UM.
+CANVAS_PITCH_UM: float = 7.0
 
 
 @dataclass
@@ -108,12 +114,37 @@ class KH9ImageSpec:
 
     @staticmethod
     def expected_size_from_file(filepath: str | Path) -> tuple[int, int]:
-        """Return the expected (width, height) by snapping the actual width down to the nearest known nominal width."""
+        """Return the expected (width, height) by snapping the actual width to the NEAREST
+        known nominal width (sector tiers 30/60/90/120 deg are 33 % apart).
+
+        kh9pc 2026-08-25: the old snap-DOWN picked the 60-deg tier (228165) for a
+        90-deg mosaic that came out 293 px under 342247 (ops323 F001: sections at
+        6.988 um and a slightly short scan) and the vertical detector then anchored a
+        228 k sweep inside a 342 k frame.  A mosaic can legitimately sit a few 0.1 %
+        either side of its tier (scan pitch, canvas gauge); the tier is a class, not
+        a lower bound.  Widths more than 15 % from every tier are an error."""
         with rasterio.open(filepath) as src:
             width = src.width
 
-        expected_widths_px = sorted(IMAGE_WIDTHS_PX)
-        candidates = [w for w in expected_widths_px if w <= width]
-        if not candidates:
-            raise ValueError(f"Image width {width} is smaller than all known expected widths.")
-        return (candidates[-1], IMAGE_HEIGHT_PX)
+        # kh9pc 2026-08-26: a mosaic's width cannot identify the sector tier on its own --
+        # 30-deg sector scans carry ~25 % of extra film (ops327 A004 142846 px, ops395
+        # F001 142462 px for a 114082 sweep) and a 5-section scan (~175 k) would even
+        # sit nearer the 60-deg tier. The block's tier is physics known to the caller
+        # (prep wrapper TIER); pass it as KH9_SECTOR_WIDTH_PX. Without it, fall back to
+        # the nearest tier in log space and warn when the raster is > 1.3x the tier.
+        import logging, os
+        env = os.environ.get("KH9_SECTOR_WIDTH_PX")
+        if env:
+            tier = int(env)
+            if tier not in IMAGE_WIDTHS_PX:
+                raise ValueError(f"KH9_SECTOR_WIDTH_PX={tier} is not a known sector width {sorted(IMAGE_WIDTHS_PX)}")
+            if width < 0.95 * tier or width > 2.0 * tier:
+                raise ValueError(f"Image width {width} is not plausible for the declared sector width {tier} (0.95..2.0x).")
+            return (tier, IMAGE_HEIGHT_PX)
+        import math
+        nearest = min(IMAGE_WIDTHS_PX, key=lambda w: abs(math.log(width / w)))
+        if width > 1.3 * nearest or width < 0.95 * nearest:
+            logging.getLogger(__name__).warning(
+                "KH9ImageSpec: raster width %d is %.2fx the nearest sector width %d -- set KH9_SECTOR_WIDTH_PX from the block tier",
+                width, width / nearest, nearest)
+        return (nearest, IMAGE_HEIGHT_PX)

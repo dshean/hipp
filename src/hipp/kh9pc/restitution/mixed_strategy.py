@@ -33,9 +33,14 @@ class MixedStrategy(RestitutionStrategy):
         default_factory=lambda: [FiducialStrategy(), CollimationStrategy(), PolyStrategy(), FlatStrategy()]
     )
     poly_strategy: PolyStrategy = field(default_factory=PolyStrategy)
+    # (x_um, y_um) scan pitch, propagated to every sub-strategy that has the field
+    scan_pitch_um: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
+        for strat in list(self.strategies) + [self.poly_strategy]:
+            if hasattr(strat, "scan_pitch_um") and self.scan_pitch_um is not None:
+                strat.scan_pitch_um = self.scan_pitch_um
         self.__selected_strategy_: RestitutionStrategy | None = None
 
         for i, strat in enumerate(self.strategies):
@@ -92,6 +97,14 @@ class MixedStrategy(RestitutionStrategy):
 
         vd = self.poly_strategy.vertical_detector
         if not vd.is_fitted or raster_filepath != vd.raster_filepath_:
+            # 2026-08-26: the SHARED detector is fitted here first; every strategy's poly
+            # then finds it fitted and never sets the pitch -> the worker ran the sweep
+            # width unscaled (0.2 % off; F013 paired 4828..346641 instead of ..348290) while
+            # the gate, which builds CollimationStrategy directly, was correct (audit H7 class)
+            if self.scan_pitch_um is not None:
+                vd.scan_pitch_um = self.scan_pitch_um
+                if hasattr(self.poly_strategy, "scan_pitch_um"):
+                    self.poly_strategy.scan_pitch_um = self.scan_pitch_um
             vd.fit(raster_filepath)
 
         for strat in self.strategies:

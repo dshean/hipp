@@ -22,6 +22,7 @@ from sklearn.linear_model import RANSACRegressor
 from hipp.image import SubImage, remap_tif_blockwise
 from hipp.kh9pc.redaction_mask import detect_ruptures_skip_redacted, redacted_region_mask
 from hipp.kh9pc.restitution.base import _InwardEnvelopeModel, detect_content_edges, fit_ransac_poly, tps_from_estimate
+from hipp.kh9pc.restitution.base import scan_scale
 from hipp.kh9pc.restitution.base import DEFAULT_OUTPUT_HEIGHT, RestitutionStrategy, Transformation
 from hipp.kh9pc.restitution.vertical_detector import VerticalDetector
 
@@ -87,6 +88,8 @@ class PolyStrategy(RestitutionStrategy):
     output_width: int | None = None
     # None -> canonical KH9ImageSpec height (ed2c30e port); set only to override
     output_height: int | None = None
+    # (x_um, y_um) scanner pitch of this scan session; None -> raster tags or 1:1
+    scan_pitch_um: tuple[float, float] | None = None
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -122,7 +125,8 @@ class PolyStrategy(RestitutionStrategy):
     def _fit(self, raster_filepath: Path) -> Self:
         """Detect and fit polynomial models for the top and bottom edges."""
         if not self.vertical_detector.is_fitted or raster_filepath != self.vertical_detector.raster_filepath_:
-            self.vertical_detector.fit(raster_filepath)
+            self.vertical_detector.scan_pitch_um = self.scan_pitch_um   # sweep width in this scan's px
+        self.vertical_detector.fit(raster_filepath)
 
         col_off, _ = self.vertical_detector.edges_
         window_width = self.vertical_detector.detected_width_
@@ -259,6 +263,9 @@ class PolyStrategy(RestitutionStrategy):
         from hipp.kh9pc.kh9_image_spec import KH9ImageSpec
         _spec_w, _spec_h = KH9ImageSpec.from_raster_filepath(self.raster_filepath_).expected_size
         output_width = self.output_width or _spec_w
+        # canvas scale: source px -> canvas px at CANVAS_PITCH_UM (base.scan_scale)
+        sx, sy = scan_scale(self.scan_pitch_um, self.raster_filepath_)
+        logger.info("[PolyStrategy] scan scale to canvas: sx=%.5f sy=%.5f", sx, sy)
 
         x = np.linspace(left, right, self.grid_shape[0])
 
@@ -272,11 +279,12 @@ class PolyStrategy(RestitutionStrategy):
 
         top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
 
-        y_top_dst = np.full_like(x, top)
-        y_bot_dst = np.full_like(x, bot)
+        # destination (canvas) coordinates: straightened edges, scaled to the canvas pitch
+        y_top_dst = np.full_like(x, top * sy)
+        y_bot_dst = np.full_like(x, bot * sy)
 
         src = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_src, y_bot_src))))
-        dst = np.column_stack((np.concatenate((x, x)), np.concatenate((y_top_dst, y_bot_dst))))
+        dst = np.column_stack((np.concatenate((x * sx, x * sx)), np.concatenate((y_top_dst, y_bot_dst))))
 
         # inverse source destination (important)
         deformation = tps_from_estimate(dst, src)
@@ -293,8 +301,10 @@ class PolyStrategy(RestitutionStrategy):
         # re-admit frame.
         top_inset = int(max(0.0, float(np.max(top_crop.predict(x.reshape(-1, 1)).ravel() - y_top_src)))) if top_crop else 0
         bot_inset = int(max(0.0, float(np.max(y_bot_src - bot_crop.predict(x.reshape(-1, 1)).ravel())))) if bot_crop else 0
-        crop_top, crop_bot = top + top_inset, bot - bot_inset
+        crop_top, crop_bot = (top + top_inset) * sy, (bot - bot_inset) * sy   # canvas px
         detected_height = crop_bot - crop_top
+        detected_width = detected_width * sx
+        left = left * sx
         # canonical spec height unless the caller explicitly overrides
         # (second half of the ed2c30e port; the old min(default, detected)
         # collapsed to the detected height whenever the film sat tilted or
@@ -304,7 +314,11 @@ class PolyStrategy(RestitutionStrategy):
         pad_x = (output_width - detected_width) / 2
         pad_y = (output_height - detected_height) / 2
 
-        crop_offset = (int(left - pad_x), int(crop_top - pad_y))
+        # x: strength-weighted crop centre from the vertical detector (== left - pad_x when
+        # both edges are equally strong); y: detected height centred in the spec height
+        _c = getattr(self.vertical_detector, "crop_center_", None)
+        x0 = (_c * sx - output_width / 2) if _c is not None else (left - pad_x)
+        crop_offset = (int(x0), int(crop_top - pad_y))
 
         return Transformation(
             self.raster_filepath_,

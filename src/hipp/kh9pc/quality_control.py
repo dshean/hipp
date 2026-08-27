@@ -222,39 +222,237 @@ def plot_poly_distortions(detector: PolyStrategy) -> Figure:
 # --- Collimation ---
 
 
-def plot_collimation_edges(detector: CollimationStrategy) -> Figure:
-    """Subimage thumbnails with RANSAC inliers/outliers and polynomial model for top and bottom collimation lines."""
-    fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
+def _collimation_context_panel(ax, detector: CollimationStrategy, src, side: str,
+                               context_px: int = 1500, out_cols: int = 1400, out_rows: int = 700) -> None:
+    """One margin: full context from the raster edge (row 0 / bottom row) through the
+    line + context_px, scan-canvas NODATA shaded, detector search band outlined,
+    RANSAC inliers/outliers, model and delivered crop. dshean 2026-08-25."""
+    result = detector.top_ if side == "top" else detector.bottom_
+    cmap = plt.get_cmap("gray").copy()
+    cmap.set_bad("#ffb3b3")
+    w = result.sub_image.window
+    cols = result.peaks_global[:, 0]
+    line_rows = np.asarray(result.model.predict(cols.reshape(-1, 1))).ravel()
+    # display window capped at panel_rows (dshean 2026-08-26: 3000 rows, not the full 4000-row
+    # search slab -- less valid exposed area, more margin detail); the detection slab is unchanged
+    panel_rows = 3000
+    if side == "top":
+        r0 = 0
+        r1 = int(min(src.height, max(min(w.row_off + w.height, panel_rows), np.nanmax(line_rows) + context_px)))
+    else:
+        r0 = int(max(0, min(max(w.row_off, src.height - panel_rows), np.nanmin(line_rows) - context_px)))
+        r1 = int(src.height)
+    win = Window(int(w.col_off), r0, int(w.width), r1 - r0)
+    band = SubImage(src, window=win, out_shape=(1, out_rows, out_cols)).band.astype(np.float32)
+    nod = band <= 0
+    valid = band[~nod]
+    vmin, vmax = (np.percentile(valid, [2, 98]) if valid.size else (0, 255))
+    extent = [win.col_off, win.col_off + win.width, win.row_off + win.height, win.row_off]
+    ax.imshow(np.ma.masked_where(nod, band), cmap=cmap, aspect="auto",
+              extent=extent, vmin=vmin, vmax=vmax, interpolation="nearest")
+    ax.add_patch(patches.Rectangle((w.col_off, w.row_off), w.width, w.height,
+                                   fill=False, ec="cyan", lw=0.8, ls="--", label="detector search band"))
+    inliers = result.model.inlier_mask_
+    peaks = result.peaks_global
+    ax.scatter(peaks[~inliers, 0], peaks[~inliers, 1], s=10, c="red", label="outliers")
+    ax.scatter(peaks[inliers, 0], peaks[inliers, 1], s=10, c="green", label="inliers")
+    ax.plot(cols, line_rows, color="blue", linewidth=1, label="model")
+    off = getattr(detector, "crop_offset_from_line", None)
+    if off is not None:
+        sign = -1.0 if side == "top" else 1.0
+        ax.plot(cols, line_rows + sign * off, color="red", linewidth=1.0, linestyle=":",
+                label=f"delivered crop = line {'-' if side == 'top' else '+'} {off} px")
+    ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[2], extent[3])
+    ax.set_title(f"{side} collimation line (rows {r0}-{r1}; inliers {result.inlier_ratio:.2f})", fontsize=10)
+    ax.set_xlabel("column (full-res px)")
+    ax.set_ylabel("row (full-res px)")
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(patches.Patch(fc="#ffb3b3", ec="none", label="nodata (scan canvas)"))
+    ax.legend(handles=handles, loc="best", fontsize=7)
 
-    for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
-        w = result.sub_image.window
-        extent = [w.col_off, w.col_off + w.width, w.row_off + w.height, w.row_off]
-        ax.imshow(result.sub_image.band, cmap="gray", aspect="auto", extent=extent)
 
-        inliers = result.model.inlier_mask_
-        peaks = result.peaks_global
-        ax.scatter(peaks[~inliers, 0], peaks[~inliers, 1], s=12, c="red", label="outliers")
-        ax.scatter(peaks[inliers, 0], peaks[inliers, 1], s=12, c="green", label="inliers")
+def plot_collimation_edges(detector: CollimationStrategy, context_px: int = 1500,
+                           out_cols: int = 1400, out_rows: int = 700) -> Figure:
+    """Both margins, full context (see _collimation_context_panel)."""
+    fig, axes = plt.subplots(1, 2, figsize=(9, 4.4), constrained_layout=True)
+    with rasterio.open(detector.raster_filepath_) as src:
+        for ax, side in zip(axes, ["top", "bottom"]):
+            _collimation_context_panel(ax, detector, src, side, context_px, out_cols, out_rows)
+    return fig
 
-        y_global_pred = result.model.predict(result.peaks_global[:, 0].reshape(-1, 1))
-        ax.plot(result.peaks_global[:, 0], np.asarray(y_global_pred).ravel(),
-                color="blue", linewidth=1, label="model")
 
-        # Delivered crop = the line shifted a fixed distance OUTWARD, parallel
-        # by construction (David 2026-07-22 fixed-offset crop ruling).
-        off = getattr(detector, "crop_offset_from_line", None)
-        if off is not None:
-            sign = -1.0 if side == "top" else 1.0
-            ax.plot(result.peaks_global[:, 0],
-                    np.asarray(y_global_pred).ravel() + sign * off,
-                    color="red", linewidth=1.0, linestyle=":",
-                    label=f"delivered crop = line {'-' if side == 'top' else '+'} {off} px")
+def _read_decimated(src, window: Window, out_w: int, out_h: int):
+    return SubImage(src, window=window, out_shape=(1, max(1, out_h), max(1, out_w))).band.astype(np.float32)
 
-        ax.set_title(f"{side} collimation line")
-        ax.set_xlabel("column (full-res px)")
-        ax.set_ylabel("row (full-res px)")
-        ax.legend(loc="best", fontsize=8)
 
+def plot_restitution_sheet(fitting_class: FittingClass, entity: str | None = None,
+                           extra_text: str | None = None, product: str | Path | None = None,
+                           context_px: int = 1500) -> Figure:
+    """ONE page per frame = what gets reviewed. Layout (dshean 2026-08-25, merging
+    the useful parts of the 08-22 harness sheet, all driven by the PRODUCTION fit):
+      1 raw mosaic + delivered crop polygon (lines -/+ crop offset, vertical edges)
+      2/3 top / bottom margin in full context from the raster edge (nodata shaded,
+          search band, picks, model, delivered crop) + row median-DN profile
+      4 left / right vertical-edge panels + column median-DN profile
+      5 native-resolution zoom tiles on the line at 4 x positions (top, bottom)
+      6 final restituted product (when ``product`` exists)
+      7 verdict / metrics text (strategy, separation vs expected, inliers, pairing,
+        pitch, crop offset, generation tag)."""
+    import datetime as _dt
+    sel = getattr(fitting_class, "selected_strategy_", fitting_class)
+    name = type(sel).__name__
+    is_col = isinstance(sel, CollimationStrategy)
+    gen = getattr(sel, "generation_tag", None) or getattr(fitting_class, "generation_tag", None)
+    fig = plt.figure(figsize=(13, 36), constrained_layout=True)
+    gs = fig.add_gridspec(9, 4, height_ratios=[0.9, 1.5, 1.5, 1.6, 0.7, 2.6, 0.7, 0.9, 0.55],
+                          width_ratios=[0.18, 1, 1, 1])
+    rf = Path(str(getattr(sel, "raster_filepath_", "")))
+    title = (f"{entity or rf.stem}  --  restitution evidence  --  {name}\n"
+             f"generation: {gen or 'untagged'}  |  rendered {_dt.datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    fig.suptitle(title, fontsize=12)
+    lines = [f"strategy: {name}"]
+    cmap = plt.get_cmap("gray").copy(); cmap.set_bad("#ffb3b3")
+    try:
+        with rasterio.open(rf) as src:
+            H, W = src.height, src.width
+            poly = sel.poly_strategy if hasattr(sel, "poly_strategy") else (sel if isinstance(sel, PolyStrategy) else None)
+            left = right = None
+            if poly is not None and getattr(poly, "is_fitted", False):
+                try:
+                    left, right = poly.vertical_detector.edges_
+                except Exception:  # noqa: BLE001
+                    pass
+            off = getattr(sel, "crop_offset_from_line", 75)
+            # ---- 1: raw mosaic overview + crop polygon ----
+            ax = fig.add_subplot(gs[0, :])
+            ov = _read_decimated(src, Window(0, 0, W, H), 2400, max(60, int(2400 * H / W)))
+            nod = ov <= 0; v = ov[~nod]; vmin, vmax = (np.percentile(v, [2, 98]) if v.size else (0, 255))
+            ax.imshow(np.ma.masked_where(nod, ov), cmap=cmap, aspect="auto", extent=[0, W, H, 0], vmin=vmin, vmax=vmax, interpolation="nearest")
+            if is_col:
+                xs = np.linspace(left if left is not None else 0, right if right is not None else W, 200)
+                yt = np.asarray(sel.top_.model.predict(xs.reshape(-1, 1))).ravel(); yb = np.asarray(sel.bottom_.model.predict(xs.reshape(-1, 1))).ravel()
+                ax.plot(xs, yt, color="lime", lw=1.0, label="collimation lines (fit)"); ax.plot(xs, yb, color="lime", lw=1.0)
+                ax.plot(xs, yt - off, color="red", lw=0.9, ls=":", label=f"delivered crop (lines -/+ {off} px)"); ax.plot(xs, yb + off, color="red", lw=0.9, ls=":")
+            if left is not None:
+                ax.axvline(left, color="cyan", lw=0.9, ls="--", label=f"vertical edges (left {int(left)}, right {int(right)})"); ax.axvline(right, color="cyan", lw=0.9, ls="--")
+            ax.set_title(f"raw mosaic {W}x{H} + delivered crop", fontsize=10); ax.legend(loc="lower right", fontsize=7, framealpha=0.85)
+            ax.set_xlim(0, W); ax.set_ylim(H, 0)
+            # ---- 2/3: margins with row profiles ----
+            if is_col:
+                for k, side in enumerate(["top", "bottom"]):
+                    axp = fig.add_subplot(gs[1 + k, 0]); axm = fig.add_subplot(gs[1 + k, 1:], sharey=axp)
+                    _collimation_context_panel(axm, sel, src, side, context_px)
+                    r0, r1 = (int(axm.get_ylim()[1]), int(axm.get_ylim()[0]))
+                    prof = _read_decimated(src, Window(0, max(0, r0), W, max(1, r1 - r0)), 512, max(1, r1 - r0))
+                    med = np.array([np.median(row[row > 0]) if (row > 0).any() else np.nan for row in prof])
+                    axp.plot(med, np.linspace(r0, r1, med.size), color="k", lw=0.8); axp.set_ylim(r1, r0); axp.set_xlabel("median DN", fontsize=8)
+                    axp.set_ylabel("row (full-res px)", fontsize=8); axp.tick_params(labelsize=7); axm.tick_params(labelleft=False)
+                    axm.set_ylabel("")
+            else:
+                ax0 = fig.add_subplot(gs[1:3, :]); ax0.axis("off"); ax0.text(0.5, 0.5, f"no collimation-line fit ({name})", ha="center", va="center", fontsize=12)
+            # ---- 4: vertical edges with column profiles ----
+            # ---- 4: left / right exposure edges (dshean 2026-08-26: +-1500 px, not 10 k;
+            #         the column-median DN profile BELOW each panel on a shared x axis) ----
+            gs4 = gs[3, :].subgridspec(2, 2, height_ratios=[3, 1])
+            for k, (side, col) in enumerate([("left", left), ("right", right)]):
+                ax = fig.add_subplot(gs4[0, k])
+                if col is None:
+                    ax.axis("off"); ax.text(0.5, 0.5, f"{side} edge: n/a", ha="center", va="center"); continue
+                w0 = int(max(0, col - 1500)); w1 = int(min(W, col + 1500))
+                band = _read_decimated(src, Window(w0, 0, w1 - w0, H), 600, 800)
+                nod = band <= 0; v = band[~nod]; vmin, vmax = (np.percentile(v, [2, 98]) if v.size else (0, 255))
+                ax.imshow(np.ma.masked_where(nod, band), cmap=cmap, aspect="auto", extent=[w0, w1, H, 0], vmin=vmin, vmax=vmax, interpolation="nearest")
+                ax.axvline(col, color="cyan", lw=1.0, ls="--"); ax.set_title(f"{side} vertical edge (col {int(col)}, +-1500 px)", fontsize=9); ax.tick_params(labelsize=7)
+                cm = np.array([np.median(c[c > 0]) if (c > 0).any() else np.nan for c in band.T])
+                axc = fig.add_subplot(gs4[1, k], sharex=ax)
+                axc.plot(np.linspace(w0, w1, cm.size), cm, color="k", lw=0.8); axc.axvline(col, color="cyan", lw=0.8, ls="--")
+                axc.set_ylabel("col median DN", fontsize=7); axc.tick_params(labelsize=7); axc.set_xlim(w0, w1)
+            # ---- 5: native-resolution zoom tiles on the lines: TOP tiles above the corner
+            #         block, BOTTOM tiles below it (dshean 2026-08-26) ----
+            if is_col:
+                x0 = left if left is not None else 0; x1 = right if right is not None else W
+                xs4 = np.linspace(x0 + 0.1 * (x1 - x0), x1 - 0.1 * (x1 - x0), 4)
+                for k, side in enumerate(["top", "bottom"]):
+                    gsr = gs[4 if side == "top" else 6, :].subgridspec(1, 4)
+                    r_ = sel.top_ if side == "top" else sel.bottom_
+                    for n, xc in enumerate(xs4):
+                        yc = float(np.asarray(r_.model.predict(np.array([[xc]]))).ravel()[0])
+                        c0, rr0 = int(max(0, xc - 512)), int(max(0, yc - 512)); win = Window(c0, rr0, min(1024, W - c0), min(1024, H - rr0))
+                        tile = src.read(1, window=win).astype(np.float32)
+                        axz = fig.add_subplot(gsr[0, n]); nod = tile <= 0; v = tile[~nod]
+                        vmin, vmax = (np.percentile(v, [2, 98]) if v.size else (0, 255))
+                        axz.imshow(np.ma.masked_where(nod, tile), cmap=cmap, extent=[c0, c0 + win.width, rr0 + win.height, rr0], vmin=vmin, vmax=vmax, interpolation="nearest")
+                        axz.axhline(yc, color="lime", lw=0.8); axz.axhline(yc - off if side == "top" else yc + off, color="red", lw=0.8, ls=":")
+                        axz.set_title(f"{side} line @x={xc/1e3:.0f}k NATIVE", fontsize=7); axz.set_xticks([]); axz.set_yticks([])
+                # ---- 5b: the four crop CORNERS at native resolution, 2x2 in their relative
+                #          positions (dshean 2026-08-26): vertical exposure edge (cyan), collimation
+                #          line (lime), delivered crop (red) ----
+                gs5b = gs[5, :].subgridspec(2, 2)
+                corners = [("top-left", left, sel.top_, "top", 0, 0), ("top-right", right, sel.top_, "top", 0, 1),
+                           ("bottom-left", left, sel.bottom_, "bottom", 1, 0), ("bottom-right", right, sel.bottom_, "bottom", 1, 1)]
+                for lab, xc_, r_, side, gr, gc in corners:
+                    axz = fig.add_subplot(gs5b[gr, gc])
+                    if xc_ is None:
+                        axz.axis("off"); axz.text(0.5, 0.5, f"{lab}: n/a", ha="center", va="center", fontsize=8); continue
+                    xc_ = float(min(max(xc_, 0), W)); yc = float(np.asarray(r_.model.predict(np.array([[xc_]]))).ravel()[0])
+                    half = 1024
+                    c0 = int(min(max(0, xc_ - half), max(0, W - 2 * half))); rr0 = int(min(max(0, yc - half), max(0, H - 2 * half)))
+                    win = Window(c0, rr0, min(2 * half, W - c0), min(2 * half, H - rr0))
+                    tile = src.read(1, window=win).astype(np.float32); nod = tile <= 0; v = tile[~nod]
+                    vmin, vmax = (np.percentile(v, [2, 98]) if v.size else (0, 255))
+                    axz.imshow(np.ma.masked_where(nod, tile), cmap=cmap, extent=[c0, c0 + win.width, rr0 + win.height, rr0], vmin=vmin, vmax=vmax, interpolation="nearest")
+                    axz.axvline(xc_, color="cyan", lw=1.0, ls="--"); axz.axhline(yc, color="lime", lw=0.9)
+                    axz.axhline(yc - off if side == "top" else yc + off, color="red", lw=0.9, ls=":")
+                    axz.set_title(f"{lab} corner NATIVE (x {xc_/1e3:.1f}k, y {yc:.0f})", fontsize=8); axz.tick_params(labelsize=7)
+            # ---- 6: final product ----
+            axf = fig.add_subplot(gs[7, :])
+            if product is not None and Path(product).is_file():
+                with rasterio.open(product) as pr:
+                    PW, PH = pr.width, pr.height
+                    pv = _read_decimated(pr, Window(0, 0, PW, PH), 2400, max(60, int(2400 * PH / PW)))
+                nod = pv <= 0; v = pv[~nod]; vmin, vmax = (np.percentile(v, [2, 98]) if v.size else (0, 255))
+                axf.imshow(np.ma.masked_where(nod, pv), cmap=cmap, aspect="auto", extent=[0, PW, PH, 0], vmin=vmin, vmax=vmax, interpolation="nearest")
+                axf.set_title(f"FINAL restituted product {PW}x{PH} (7.000 um canvas)", fontsize=10); axf.tick_params(labelsize=7)
+            else:
+                axf.axis("off"); axf.text(0.5, 0.5, "restituted product not written yet (gate / dry run)", ha="center", va="center", fontsize=10, color="0.4")
+            # ---- 7: text ----
+            if is_col:
+                try:
+                    x = np.linspace(left, right, 100).reshape(-1, 1)
+                    sep = float(np.median(sel.bottom_.model.predict(x) - sel.top_.model.predict(x)))
+                    exp = sel._expected_separation_px() if hasattr(sel, "_expected_separation_px") else float(sel.collimation_line_dist)
+                    lines.append(f"line separation {sep:.1f} px vs expected {exp:.1f} px ({100 * (sep / exp - 1):+.2f} %)")
+                except Exception as e:  # noqa: BLE001
+                    lines.append(f"line separation: n/a ({e})")
+                lines.append(f"inlier ratios top {sel.top_.inlier_ratio:.2f} / bottom {sel.bottom_.inlier_ratio:.2f}  (floor {sel.min_inliers_threshold}, paired floor {getattr(sel, 'min_inliers_threshold_paired', 'n/a')})")
+                pr_ = getattr(sel, "_pairing_", None) or {}
+                if pr_:
+                    lines.append(f"pair-constrained detection: {pr_.get('paired_cols')}/{pr_.get('cols')} columns paired (tol {pr_.get('tol_px', 0):.0f} px); re-picked {pr_.get('repicked_cols', 0)}")
+                lines.append(f"joint parallel refit: {'ok' if getattr(sel, '_joint_refit_ok', False) else 'NOT applied'}; separation check: {'ok' if getattr(sel, '_separation_ok', True) else 'FAILED'}; is_failed: {sel.is_failed}")
+                if getattr(sel, "scan_pitch_um", None):
+                    lines.append(f"scan pitch (x, y) um: {sel.scan_pitch_um[0]:.4f}, {sel.scan_pitch_um[1]:.4f}")
+            if left is not None:
+                vd = poly.vertical_detector if poly is not None else None
+                lines.append(f"vertical exposure edges: left {int(left)} right {int(right)} (width {int(right - left)} px source; from {getattr(vd, 'edge_source_', 'n/a')}, strengths {getattr(vd.left_, 'gradient_ratio', 0):.1f}/{getattr(vd.right_, 'gradient_ratio', 0):.1f} DN)" if vd is not None else f"vertical edges: left {int(left)} right {int(right)}")
+                lines.append(f"  coherent DN steps found: {getattr(vd, 'n_candidates_', 'n/a')}; strength-weighted centre {getattr(vd, 'crop_center_', float('nan')):.0f} px source")
+                for _side, _v in (getattr(sel, "line_extent_", {}) or {}).items():
+                    lines.append(f"  {_side} collimation line x-extent {int(_v[0])}..{int(_v[1])} (width {int(_v[1] - _v[0])} px, presence {_v[2]:.2f})")
+                lines.append(f"crop x placed by: {getattr(sel, 'crop_x_source_', 'detector')}")
+            try:
+                tr = sel.transformation_
+                lines.append(f"delivered crop offset (canvas px): {tuple(int(v) for v in getattr(tr, 'crop_offset', (0, 0)))}")
+            except Exception as e:  # noqa: BLE001
+                lines.append(f"delivered crop offset: n/a ({str(e)[:60]})")
+            if poly is not None and getattr(poly, "is_fitted", False) and not poly.is_failed:
+                lines.append(f"poly exposure edges: ok (inliers {poly.top_.inlier_ratio:.2f}/{poly.bottom_.inlier_ratio:.2f})")
+            elif poly is not None:
+                lines.append("poly exposure edges: FAILED / not fitted")
+    except Exception as e:  # noqa: BLE001
+        lines.append(f"sheet error: {e}")
+    if extra_text:
+        lines.append(extra_text)
+    axt = fig.add_subplot(gs[8, :]); axt.axis("off")
+    axt.text(0.01, 0.95, "\n".join(lines), va="top", ha="left", fontsize=9, family="monospace")
     return fig
 
 
@@ -648,6 +846,16 @@ def plot_crop_area(transform: Transformation, figsize: tuple[int, int] = (6, 6))
 # --- Dispatch ---
 
 
+def _safe_fig(fn, *args, **kw):
+    """audit M-4: an exception inside a figure must not end the generator (which
+    silently dropped every later figure of the frame) -- return None, log, continue."""
+    try:
+        return fn(*args, **kw)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("QC figure %s failed: %s", getattr(fn, "__name__", fn), e)
+        return None
+
+
 def save_figures(fitting_class: FittingClass, output_dir: str | Path) -> None:
     """Save all QC figures for a fitted strategy to ``output_dir/<figure_name>/<stem>.png``.
 
@@ -660,6 +868,8 @@ def save_figures(fitting_class: FittingClass, output_dir: str | Path) -> None:
     while True:
         try:
             name, fig = next(gen)
+            if fig is None:
+                continue
             (output_dir / name).mkdir(parents=True, exist_ok=True)
             fig.savefig(output_dir / name / f"{fitting_class.raster_filepath_.stem}.png")
             plt.close(fig)
@@ -684,6 +894,8 @@ def get_figures(
         yield "vertical_edges", plot_vertical_edges(fitting_class)
         yield "vertical_ruptures", plot_vertical_ruptures(fitting_class)
         return
+    if isinstance(fitting_class, (FlatStrategy, PolyStrategy, FiducialStrategy)) and not isinstance(fitting_class, CollimationStrategy):
+        yield "sheet", _safe_fig(plot_restitution_sheet, fitting_class)   # audit M-5: every strategy gets the one-page sheet
     if isinstance(fitting_class, FlatStrategy):
         yield from get_figures(fitting_class.vertical_detector, plot_transformation=False)
         yield "flat_edges", plot_flat_edges(fitting_class)
@@ -702,8 +914,9 @@ def get_figures(
     if isinstance(fitting_class, CollimationStrategy):
         yield from get_figures(fitting_class.poly_strategy, plot_transformation=False,
                                poly_crop_is_delivered=False)
-        yield "collimation_edges", plot_collimation_edges(fitting_class)
-        yield "collimation_distortions", plot_collimation_distortions(fitting_class)
+        yield "sheet", _safe_fig(plot_restitution_sheet, fitting_class)
+        yield "collimation_edges", _safe_fig(plot_collimation_edges, fitting_class)
+        yield "collimation_distortions", _safe_fig(plot_collimation_distortions, fitting_class)
         if plot_transformation:
             yield "deformation_grid", plot_deformation_grid(fitting_class.transformation_)
             yield "crop_area", plot_crop_area(fitting_class.transformation_)

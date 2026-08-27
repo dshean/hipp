@@ -97,6 +97,8 @@ class VerticalDetector(FittingClass):
     width_tol_px: int = 1500          # 2026-08-26: sweep variation is ~+-1000 px on BOTH tiers (90-deg +-0.3 %,
     width_sigma: float = 0.002        #   30-deg +-1 %: ops327 A004 +0.67 %, ops196 A004 +0.95 %), so absolute px
     width_sigma_px: int = 700         # Gaussian width prior for ranking pairs: max(fraction, px)
+    short_pair_tol: float = 0.08      # v10.3 (2026-08-27): accept a pair down to this fraction SHORT of the sweep when no
+                                      #   full-width pair exists (first frames: ops196 A001 -3 %, F001 -4 %); ranked by the weaker edge
     edge_margin_px: int = 64          # 2026-08-26 (dshean: A002/F002 exposures start at 200-600 px): only the very edge is excluded; the width prior handles the black-margin|film step
     boundary_suspect_px: int = 600    # single-edge fallback: a step this close to the raster edge is suspect (scan cut through film)
     boundary_factor: float = 2.0      # ... unless it is this much stronger than every interior candidate
@@ -321,6 +323,38 @@ class VerticalDetector(FittingClass):
                         # dark->bright->dark bonus tipped F002 to a next-frame cut at the raster end
                         if best is None or sc > best[0]:
                             best = (sc, i, k)
+                short_pair = False
+                if best is None:
+                    # SHORT PAIR (v10.3, dshean 2026-08-27 on the ops196 first-frame panels: A001 3142..~114000
+                    # and F001 ~3000..112671 -- BOTH exposure edges visible and row-coherent, 3-4 % closer than
+                    # the sweep because a first frame's exposure starts late / ends early). The full-width rule
+                    # can never accept them and the single-edge fallback anchored ONE edge + the expected
+                    # width, putting the crop centre (nominal - true)/2 off the true midpoint and the width
+                    # (-> exposure window) at the nominal. Accept a pair down to short_pair_tol below the sweep
+                    # when both candidates are pair-eligible and at least one is a STRICT single edge (no
+                    # exposure beyond it -- a content step inside the exposure fails that), neither within
+                    # boundary_suspect_px of a raster edge (ops323 A001: the scanner strip at x=384 is a
+                    # strict single; the scan there started INSIDE the exposure, the single-edge fallback
+                    # handles it), ranked by the WEAKER edge's strength with NO width prior -- a prior
+                    # toward the nominal width picks the spurious step further out (ops196 F001: base-
+                    # strip step at 2176, z 7, beat the exposure start at 2992, z 17). Full-width pairs,
+                    # when they exist, are never affected.
+                    for i, pi in enumerate(peaks):
+                        if not ok_left[i]:
+                            continue
+                        for k, pk in enumerate(peaks):
+                            if not ok_right[k]:
+                                continue
+                            sep = x_peak[k] - x_peak[i]
+                            if sep <= 0 or sep >= expected - tol or sep < expected * (1.0 - self.short_pair_tol):
+                                continue
+                            if not (val[i]["single_left"] or val[k]["single_right"]):
+                                continue
+                            if x_peak[i] <= self.boundary_suspect_px or (W - x_peak[k]) <= self.boundary_suspect_px:
+                                continue
+                            sc = float(min(az[pi], az[pk]))
+                            if best is None or sc > best[0]:
+                                best = (sc, i, k); short_pair = True
                 strength = {}; sign_l = sign_r = None
                 if best is not None:
                     _, i, k = best
@@ -328,6 +362,11 @@ class VerticalDetector(FittingClass):
                     strength = {"left": float(az[peaks[i]]), "right": float(az[peaks[k]])}
                     sign_l, sign_r = float(np.sign(z[peaks[i]])), float(np.sign(z[peaks[k]]))
                     src_desc = "both"
+                    if short_pair:
+                        src_desc = "both|short-pair"; self.short_scan_ = True
+                        self.true_edges_ = (coarse_l, coarse_r)
+                        logger.warning("[VerticalDetector] SHORT PAIR: exposure %d..%d (%.0f px = %.1f %% of the sweep) -- both edges measured, "
+                                       "crop centred on the true midpoint", coarse_l, coarse_r, coarse_r - coarse_l, 100 * (coarse_r - coarse_l) / expected)
                 else:
                     # no pair: strongest step decides the side by its sign and position
                     # single edge: prefer a candidate away from the raster boundary -- a step
@@ -477,11 +516,12 @@ class VerticalDetector(FittingClass):
                                            self.true_edges_[0], self.true_edges_[1], span, 100 * span / expected, role)
                     logger.warning("[VerticalDetector] no coherent step pair %.0f+-%.0f px apart -- %s (z=%.1f); "
                                    "block-end truncated scan or a missing edge", expected, tol, src_desc, az[pj])
-                meas_l = src_desc == "both" or src_desc.startswith("left")     # which sides were MEASURED (the other is anchor + sweep)
-                meas_r = src_desc == "both" or src_desc.startswith("right")
+                meas_l = src_desc.startswith("both") or src_desc.startswith("left")     # which sides were MEASURED (the other is anchor + sweep)
+                meas_r = src_desc.startswith("both") or src_desc.startswith("right")
                 left = self._refine_edge(src, coarse_l, "left", sign_l) if (meas_l and 0 <= coarse_l < W) else coarse_l
                 right = self._refine_edge(src, coarse_r, "right", sign_r) if (meas_r and 0 < coarse_r <= W) else coarse_r
-                if src_desc == "both" and abs((right - left) - expected) > tol:
+                _ref = expected if src_desc == "both" else (coarse_r - coarse_l)     # a short pair is judged against its own coarse width
+                if src_desc.startswith("both") and abs((right - left) - _ref) > tol:
                     # the refinement drifted (a stronger local gradient within +-256 px): keep the coarse pair
                     logger.warning("[VerticalDetector] refinement broke the pair (%d vs %.0f) -- keeping the coarse pair", right - left, expected)
                     left, right = coarse_l, coarse_r

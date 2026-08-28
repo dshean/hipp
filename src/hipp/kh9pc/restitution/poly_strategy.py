@@ -124,9 +124,12 @@ class PolyStrategy(RestitutionStrategy):
 
     def _fit(self, raster_filepath: Path) -> Self:
         """Detect and fit polynomial models for the top and bottom edges."""
-        if not self.vertical_detector.is_fitted or raster_filepath != self.vertical_detector.raster_filepath_:
+        # Reuse a detector that is already fitted on THIS raster (2026-08-28): the kh9pc_stereo gate
+        # and worker pre-fit the detector and overwrite ruled edge positions (EDGE_OVERRIDES);
+        # the unconditional fit() here silently discarded that (nepal ops251 A055).
+        if not self.vertical_detector.is_fitted or Path(raster_filepath) != Path(self.vertical_detector.raster_filepath_):
             self.vertical_detector.scan_pitch_um = self.scan_pitch_um   # sweep width in this scan's px
-        self.vertical_detector.fit(raster_filepath)
+            self.vertical_detector.fit(raster_filepath)
 
         col_off, _ = self.vertical_detector.edges_
         window_width = self.vertical_detector.detected_width_

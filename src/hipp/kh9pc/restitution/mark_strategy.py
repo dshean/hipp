@@ -207,7 +207,11 @@ class MarkOptions:
     exposure_pad_px: int = 300
     nodata: int = 0
     max_x_scale_mismatch_px: float = 2.0
-    # PolyStrategy escape (mission 1205); see the class docstring
+    #: Refuse any strategy whose rail-band anchor is NOT tied to the film -- a
+    #: fixed-height crop window can put the band inside the exposure, where terrain
+    #: fits a "ladder" (the ops251 F050 failure, fleet sec 2).  Both strategies here
+    #: anchor on the film (collimation lines / the rupture-scan film-frame boundary),
+    #: so this is a guard for a future anchor rather than a live refusal.
     require_margin_anchor: bool = True
 
 

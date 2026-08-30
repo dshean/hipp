@@ -702,6 +702,13 @@ class _MarkPlacementMixin:
                 logger.error("%s: MARK LADDER REFUSED -- %s", self.logging_prefix, exc)
                 return
             st = [v for v in (info.get("straightness") or {}).values() if "rms_px" in v]
+            if not st:
+                logger.warning("%s: no mark train carried enough marks to judge STRAIGHTNESS "
+                               "(%s) -- the y rectification is unchecked on this frame",
+                               self.logging_prefix,
+                               "; ".join(f"{k}: {v.get('verdict')}"
+                                         for k, v in (info.get("straightness") or {}).items())
+                               or "no trains at all")
             worst = max(st, key=lambda v: v["rms_px"]) if st else None
             if worst and worst["verdict"] == "FAIL":
                 self.mark_error_ = (
@@ -1074,9 +1081,11 @@ def plot_mark_ladder(strategy, strip_cols: int = 2600):
 
     # 3. mark SEPARATIONS vs x -- the x / warp check, in raw spacings
     ax = axes[2]
+    ax.axhline(warp.period_canvas, color="tab:orange", lw=0.8, ls="--",
+               label=f"designed {warp.period_canvas:.0f} px")
     for sd in ("top", "bottom"):
-        for cls, key, col, des in (("ladder", "ladder_row", "tab:blue", warp.period_canvas),
-                                   ("dense", "dense_row", "tab:grey", None)):
+        for cls, key, col in (("ladder", "ladder_row", "tab:blue"),
+                              ("dense", "dense_row", "tab:grey")):
             row = (det.get(sd) or {}).get(key)
             if row is None:
                 continue
@@ -1087,9 +1096,6 @@ def plot_mark_ladder(strategy, strip_cols: int = 2600):
             keep = d < 1.6 * np.median(d)          # skip gaps at missing slots
             ax.plot(0.5 * (xx[:-1] + xx[1:])[keep], d[keep], ".", ms=2.5, color=col,
                     alpha=0.8, label=f"{sd} {cls} (median {np.median(d[keep]):.1f} px)")
-            if des:
-                ax.axhline(des, color="tab:orange", lw=0.8, ls="--",
-                           label=f"designed {des:.0f} px")
     ax.grid(alpha=0.3)
     ax.set_xlabel("mosaic column (px)", fontsize=9)
     ax.set_ylabel("separation (px)", fontsize=9)

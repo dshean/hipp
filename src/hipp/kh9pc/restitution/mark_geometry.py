@@ -9,41 +9,54 @@ Description: Mark-based x-geometry for KH-9 PC restitution -- the pure-math core
     of detected marks into
 
       * the alpha = 0 column on the canonical canvas (the true cx), and
-      * an x-resampling that puts every mark at its EXACT designed angle,
+      * an x-resampling that puts every mark at its designed angle,
 
     so that on the delivered canvas the scan angle maps LINEARLY to the column by
     construction and ``cx = width / 2`` is true for every frame regardless of where
     the exposure landed on the film.
 
     Nothing here reads a raster; everything is arrays in, arrays out, so the
-    geometry is testable against synthetic ladders with a known drift, a known
-    seam step and a known cx offset.
+    geometry is testable against synthetic ladders with a known truth.
 
-    Warp form (chosen from the 2026-08-30 fleet mark survey, 183 frames / 7 blocks;
-    the medians below were independently recomputed from the fleet mark tables):
+    THE WARP FORM IS FIXED BY THE FLEET, NOT FITTED PER FRAME
+    ---------------------------------------------------------
+    ``docs/mark_fleet_2026-08-30.md`` (186 frames, 342 rails, 14 397 marks at
+    native resolution, 5 missions 1973-1982, 24 scanner sessions) measured the
+    along-scan distortion and found ONE curve per sensor:
 
-      residual of the detected marks to ...        median rms
-        a constant period (one P for the frame)     46 px
-        a QUADRATIC in the ladder index k            4.5 - 5.4 px
-        a cubic in k                                 3.3 - 3.8 px
-        quadratic + explicit per-section steps       2.2 - 3.5 px
+      * residual against a uniform grid: 44.5 px, falling to 4.6 px after a single
+        QUADRATIC and 3.3 px after a cubic -- smooth, no piecewise structure, no
+        case for a spline;
+      * the curvature is the same number everywhere -- fleet median
+        -0.0745 px/deg^2, NMAD 0.0041 across every mission, epoch and scanner
+        session -- and it crosses merge seams unbroken, so it is a property of the
+        CAMERA, not of the scan or the mosaic;
+      * F and A carry the same distortion mirrored (the A image is stored 180 deg
+        rotated, VERIFIED from the printed angle labels), so the shape is
+        calibrated per sensor in the CAMERA scan frame;
+      * pooled over a sensor's rails, the scatter about the shared shape is
+        3.5-3.7 px rms against a 3.0 px measurement noise floor.
 
-    so the drift is smooth and second order, and the structure left over is the
-    section-mosaic seam STEP (the fleet's ``var_explained_by_steps`` is 0.64-0.83 on
-    the 1 deg missions).  The model is therefore a low-order polynomial in k (the
-    smooth intra-section drift) PLUS a free constant per mosaic section (the seam
-    steps -- a MOSAICKING-QUALITY metric, never smoothed across; dshean 2026-08-30,
-    per_frame_canvas_design sec 11 addendum).
+    So the shape is a FIXED per-sensor quartic in alpha (orders 2-4), and each
+    frame's own marks supply only the two things the shared shape cannot carry --
+    PHASE (the alpha = 0 column) and PERIOD (the scale).  A per-frame shape fit is
+    refuted: it would re-fit noise, and on a 30-deg block with a 5-deg ladder
+    (ops196: 7 marks per rail) it is not even possible.  Two free parameters are.
 
-    Interpolating straight through every mark is deliberately NOT the default: the
-    per-mark scatter about the smooth model is 2-5 px and an interpolant injects all
-    of it into the delivered geometry as local wiggle, whereas the fit averages it
-    down.  ``warp_form="interp"`` is kept for the A/B and applies the same explicit
-    section offsets, so it does not smooth across a seam either.
+    SEAM STEPS ARE QA, NOT GEOMETRY
+    -------------------------------
+    Residual join errors do appear as steps at the merge seams, but the fleet's
+    true statistics over 1279 seams are median 3.3 px, p90 7.5 px, max 23.8 px --
+    at the noise floor and an order of magnitude below the 40-50 px smooth drift.
+    They stay OUT of the warp (a fixed low-order polynomial has no freedom to chase
+    a step anyway) and are reported by :func:`seam_step_qa` as a merge-stage
+    metric.  Only missions >= 1214 have enough marks per section to resolve them.
 """
 
+import json
 import logging
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import numpy as np
 from numpy.typing import NDArray
@@ -56,13 +69,42 @@ logger = logging.getLogger(__name__)
 #: Sector tiers are 30 deg apart: IMAGE_WIDTHS_PX[i] spans (i + 1) * 30 deg.
 TIER_DEGREES: tuple[float, ...] = tuple(30.0 * (i + 1) for i in range(len(IMAGE_WIDTHS_PX)))
 
-#: Degrees per mark for the two printed ladders, keyed by designed px spacing, so
+#: Degrees per mark for the two printed ladders, keyed by designed px spacing so
 #: the constants stay single sourced in ``fiducial_patterns``: SPARSE_SPACING
 #: 19014 px = 5.24 in = 5 deg, MID_SPACING 3803 px = 1.048 in = 1 deg.
 _DEG_PER_MARK_BY_SPACING: dict[int, float] = {
     theorical_spacing_from_pattern("regulare_sparse"): 5.0,
     theorical_spacing_from_pattern("regulare_mid"): 1.0,
 }
+
+#: Scan angle increases with mosaic x on F and decreases on A -- the A image is
+#: stored 180 deg rotated (VERIFIED 2026-08-30 from the printed angle labels,
+#: which run "1-45 ... 4+00" with increasing x on F and "1+45 ... 4+00" on A).
+CAMERA_SIGN: dict[str, float] = {"F": +1.0, "A": -1.0}
+
+#: Fleet-calibrated along-scan distortion, per sensor, in the CAMERA scan frame:
+#: ``dx_px = a2*alpha^2 + a3*alpha^3 + a4*alpha^4`` with alpha in DEGREES.  Orders
+#: 0 and 1 are not identifiable and are not part of the shape: a constant and a
+#: term linear in alpha are exactly the per-frame phase and period.
+#: Source: mark_fleet_2026-08-30 sec 3d, joint least squares over 134 F rails /
+#: 6691 marks and 144 A rails / 6551 marks; scatter about the shape 3.7 / 3.5 px
+#: rms against a 3.0 px noise floor.  Amplitude ~-160 px at alpha = +-45 deg.
+DISTORTION_SHAPE: dict[str, tuple[float, float, float]] = {
+    #        a2            a3             a4
+    "F": (-0.090687, +1.0113e-4, +8.864e-6),
+    "A": (-0.086740, -2.2053e-4, +7.316e-6),
+}
+#: Delivered canvas width as a multiple of the nominal sector tier.  The film is
+#: exposed slightly beyond the nominal sector: the fleet marks measure the exposed
+#: sweep at a median 1.0021 of the tier (p90 1.0074), with 171 of 172 frames under
+#: 1.0123 and one ops323 outlier at 1.043.  A strict-tier canvas would clip real
+#: content -- the harmful direction -- while extra nodata columns cost nothing but
+#: disk (dshean 2026-08-30).  1.015 keeps every non-outlier frame whole.
+DEFAULT_CANVAS_WIDEN: float = 1.015
+
+DISTORTION_SHAPE_PROVENANCE = (
+    "mark_fleet_2026-08-30 sec 3d (186 frames, 278 quality-gated rails, "
+    "13 242 marks; 5 missions 1973-1982, 24 scanner sessions)")
 
 
 class LadderError(Exception):
@@ -74,12 +116,32 @@ class LadderError(Exception):
     """
 
 
+def load_distortion_shape(path: str | Path) -> dict[str, tuple[float, float, float]]:
+    """Read a re-calibrated shape from ``mark_distortion_model.json``.
+
+    The file stores ``numpy.polyval`` order (descending powers, degree 4) per
+    sensor; only orders 2-4 are used, and a non-zero order 0/1 is refused because
+    it would silently double-count the per-frame phase and period.
+    """
+    d = json.loads(Path(path).read_text())
+    out: dict[str, tuple[float, float, float]] = {}
+    for cam, c in d.items():
+        c = [float(v) for v in c]
+        if len(c) != 5:
+            raise LadderError(f"{path}: sensor {cam} is not a degree-4 polynomial: {c}")
+        if abs(c[3]) > 1e-12 or abs(c[4]) > 1e-12:
+            raise LadderError(f"{path}: sensor {cam} carries order 0/1 terms {c[3:]}, which are "
+                              "the per-frame phase and period -- refusing to double-count them")
+        out[cam] = (c[2], c[1], c[0])
+    return out
+
+
 def deg_per_mark_from_pattern(pattern: Patterns) -> float:
     """Designed scan angle between consecutive marks of *pattern*, in degrees.
 
     Raises ``LadderError`` for patterns with no regular designed spacing
-    (``*_dense``, ``serialized_time_word``) -- those trains are diagnostics, not an
-    angular ruler.
+    (``*_dense``, ``serialized_time_word``) -- those trains carry the time record,
+    not an angular ruler.
     """
     try:
         spacing = theorical_spacing_from_pattern(pattern)
@@ -113,10 +175,9 @@ def canvas_px_per_deg(canvas_width_px: int, sweep_deg: float | None = None) -> f
 
     ``sweep_deg`` overrides the nominal tier width in degrees.  The marks measure
     the EXPOSED sweep at 90.11-90.19 deg (fleet median 2026-08-30) rather than
-    90.000, i.e. the film is exposed ~0.15 % beyond the nominal sector; whether the
-    USGS footprint describes 90.000 deg or the measured sweep is an OPEN question,
-    and this argument is the knob that settles it by A/B.  It is not a free
-    parameter: changing it rescales every frame's placement identically.
+    90.000; whether the USGS footprint describes 90.000 deg or the measured sweep
+    is an OPEN question, and this argument is the knob that settles it by A/B.  It
+    is not a free parameter: changing it rescales every frame's placement.
     """
     return float(canvas_width_px) / float(sweep_deg if sweep_deg else tier_degrees(canvas_width_px))
 
@@ -137,7 +198,7 @@ class MarkTrain:
     deg_per_mark:
         Designed scan angle between consecutive indices.
     period_src:
-        Fitted period in source px (diagnostic only; the warp never uses it).
+        Fitted period in source px (diagnostic only; the warp refits it).
     """
 
     side: str
@@ -152,61 +213,61 @@ class MarkTrain:
 
 
 @dataclass
-class SeamModel:
-    """Mosaic section boundaries used to break the smooth drift model.
-
-    ``x_src`` are seam columns in SOURCE (mosaic) pixels.  They come from the merge
-    provenance, never from the image: a seam is a fact about how the sections were
-    joined, not something to re-detect.
-    """
-
-    x_src: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
-    source: str = "none"
-    fallback: NDArray[np.bool_] = field(default_factory=lambda: np.empty(0, bool))
-
-
-@dataclass
 class MarkWarpModel:
-    """Canvas-x -> source-x mapping that places every mark at its designed angle.
+    """Canvas-x -> source-x mapping that places the marks at their designed angles.
 
-    The forward (design) direction is exact by construction::
+    Forward (design), exact by construction::
 
         canvas_x(k) = canvas_width / 2 + (k - k_ref) * period_canvas
+        alpha(canvas_x) = (canvas_x - canvas_width / 2) / px_per_deg
 
-    and the inverse -- the one ``remap_tif_blockwise`` calls -- is the fitted drift
-    model::
+    Inverse -- the direction ``remap_tif_blockwise`` calls::
 
-        source_x(canvas_x) = poly(kk) + step(kk),  kk = (canvas_x - W/2) / period_canvas
+        source_x(canvas_x) = x0 + scale_src_per_deg * alpha + shape(alpha) + refine(alpha)
 
-    where ``poly`` is the smooth intra-section drift and ``step`` the piecewise
-    constant seam offset.  ``kk`` is exactly ``k - k_ref``, so the model is a
-    function of SCAN ANGLE, not of pixel position.
+    ``shape`` is the FIXED fleet-calibrated per-sensor distortion, expressed in the
+    mosaic frame (even orders carry the camera sign, the cubic does not, because
+    the A image is stored 180 deg rotated).  ``x0`` and ``scale_src_per_deg`` are
+    the only per-frame parameters; ``refine`` is an opt-in quadratic escape that is
+    zero unless a frame earns it.
     """
 
     k_ref: float
     deg_per_mark: float
     px_per_deg: float
-    canvas_width: int
-    coeffs: NDArray[np.floating]                     # ascending powers of kk
-    section_edges_kk: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
-    section_offsets: NDArray[np.floating] = field(default_factory=lambda: np.zeros(1))
+    tier_width: int                          # the NOMINAL sweep, in canvas px
+    canvas_width: int                        # tier_width widened so nothing clips
+    x0: float                                # source x at alpha = 0
+    scale_src_per_deg: float                 # source px per degree of scan angle
+    camera: str = "F"
+    shape: tuple[float, float, float] = (0.0, 0.0, 0.0)     # a2, a3, a4 (camera frame)
+    refine: tuple[float, float, float] = (0.0, 0.0, 0.0)    # opt-in a2, a3, a4 on top
     # --- diagnostics; none of these is read by source_x ---
-    warp_form: str = "smooth"
     n_marks: int = 0
     n_marks_rejected: int = 0
     resid_rms_px: float = float("nan")
     resid_max_px: float = float("nan")
-    resid_rms_constant_period_px: float = float("nan")
-    period_src_px: float = float("nan")
-    drift_pct: float = float("nan")
-    seam_steps_px: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
-    seam_x_src: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
+    resid_rms_uniform_px: float = float("nan")
+    #: fitted SOURCE px per degree over CANVAS px per degree.  This carries the scan
+    #: pitch (source px are ~0.16 % larger than canvas px at 6.9887 um), so it is NOT
+    #: the period-vs-design ratio -- multiply by the scan scale sx for that, which
+    #: only a caller that knows the pitch can do (MarkStrategy.mark_qc does).
+    scale_ratio_src_per_canvas: float = float("nan")
     unwrap_phase: float = float("nan")
     unwrap_prior_deg: float = float("nan")
     unwrap_half_ambiguity_deg: float = float("nan")
     sides_used: tuple[str, ...] = ()
-    knots_canvas: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
-    knots_source: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
+    cover_frac: float = float("nan")
+    alpha_span_deg: tuple[float, float] = (float("nan"), float("nan"))
+    # the marks AS USED: k is on the model's own (reference-train) index, which is
+    # what k_ref counts in.  A caller must verify against these, never against a
+    # single train's raw k -- two rails' detector origins differ by an integer.
+    marks_k: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
+    marks_x: NDArray[np.floating] = field(default_factory=lambda: np.empty(0))
+    marks_side: tuple[str, ...] = ()
+    marks_inlier: NDArray[np.bool_] = field(default_factory=lambda: np.empty(0, bool))
+    shape_provenance: str = DISTORTION_SHAPE_PROVENANCE
+    seam_qa: dict = field(default_factory=dict)
     notes: tuple[str, ...] = ()
 
     # ---- forward: design geometry -------------------------------------------------
@@ -217,187 +278,269 @@ class MarkWarpModel:
 
     @property
     def cx(self) -> float:
-        """The alpha = 0 column on the delivered canvas -- the true cx."""
+        """The alpha = 0 column on the delivered canvas -- the true cx.
+
+        The canvas is widened symmetrically about the nominal sweep, so cx stays
+        exactly the centre and alpha stays linear in the column; only the ANGULAR
+        RANGE grows.
+        """
         return self.canvas_width / 2.0
 
-    def canvas_x_of_k(self, k: NDArray[np.floating] | float) -> NDArray[np.floating]:
+    @property
+    def canvas_widen(self) -> float:
+        """Delivered canvas width as a multiple of the nominal sector tier."""
+        return self.canvas_width / float(self.tier_width)
+
+    @property
+    def nominal_sweep_columns(self) -> tuple[float, float]:
+        """Canvas columns of the NOMINAL sweep edges (alpha = +- tier/2).
+
+        On a widened canvas the USGS footprint corners no longer coincide with the
+        image corners, so ``cam_gen`` must be given these columns explicitly via
+        ``--pixel-values`` instead of relying on its corner-pinning default
+        (cam_gen.cc:660-669).  They are exact by construction.
+        """
+        half = self.tier_width / 2.0
+        return (self.cx - half, self.cx + half)
+
+    def canvas_x_of_k(self, k) -> NDArray[np.floating]:
         """Designed canvas column of absolute ladder index *k*."""
         return self.cx + (np.asarray(k, float) - self.k_ref) * self.period_canvas
 
-    def alpha_deg(self, canvas_x: NDArray[np.floating] | float) -> NDArray[np.floating]:
+    def alpha_deg(self, canvas_x) -> NDArray[np.floating]:
         """Scan angle of a canvas column in degrees -- linear, by construction."""
         return (np.asarray(canvas_x, float) - self.cx) / self.px_per_deg
 
+    # ---- the fixed shape ----------------------------------------------------------
+    def shape_px(self, alpha_deg) -> NDArray[np.floating]:
+        """The calibrated distortion at a MOSAIC-frame scan angle, in source px.
+
+        In the camera frame the shape is ``a2 A^2 + a3 A^3 + a4 A^4`` with
+        ``A = sign * alpha``; the displacement itself is also mirrored, so in the
+        mosaic frame the even orders pick up the sign and the cubic does not.
+        """
+        a = np.asarray(alpha_deg, float)
+        s = CAMERA_SIGN.get(self.camera, 1.0)
+        out = np.zeros_like(a)
+        for (a2, a3, a4) in (self.shape, self.refine):
+            out = out + s * (a2 * a ** 2 + a4 * a ** 4) + a3 * a ** 3
+        return out
+
     # ---- inverse: what the remap calls --------------------------------------------
-    def _kk(self, canvas_x: NDArray[np.floating]) -> NDArray[np.floating]:
-        return (np.asarray(canvas_x, float) - self.cx) / self.period_canvas
-
-    def _section_of(self, kk: NDArray[np.floating]) -> NDArray[np.integer]:
-        if self.section_edges_kk.size == 0:
-            return np.zeros(np.shape(kk), int)
-        return np.searchsorted(self.section_edges_kk, kk, side="right")
-
-    def source_x(self, canvas_x: NDArray[np.floating] | float) -> NDArray[np.floating]:
+    def source_x(self, canvas_x) -> NDArray[np.floating]:
         """Source column for a canonical-canvas column (the inverse warp)."""
-        kk = self._kk(canvas_x)
-        step = self.section_offsets[self._section_of(kk)] if self.section_offsets.size > 1 else 0.0
-        if self.warp_form == "interp":
-            # knots hold the drift with the section offsets REMOVED, so the step
-            # stays explicit and the interpolant never spans a seam smoothly.
-            return np.interp(np.asarray(canvas_x, float), self.knots_canvas, self.knots_source) + step
-        return np.polyval(self.coeffs[::-1], kk) + step
+        a = self.alpha_deg(canvas_x)
+        return self.x0 + self.scale_src_per_deg * a + self.shape_px(a)
 
-    def canvas_x_of_source(self, x_src: NDArray[np.floating] | float, samples: int = 8192
+    def source_x_of_k(self, k) -> NDArray[np.floating]:
+        """Where the model expects ladder index *k* to sit in the source."""
+        return self.source_x(self.canvas_x_of_k(k))
+
+    def canvas_x_of_source(self, x_src, samples: int = 8192, pad_frac: float = 0.15
                            ) -> NDArray[np.floating]:
-        """Numeric inverse of :meth:`source_x` over the canvas (monotone by gate)."""
-        grid = np.linspace(0.0, float(self.canvas_width), samples)
+        """Numeric inverse of :meth:`source_x` (monotone by gate).
+
+        The grid runs PAST both canvas edges: a frame whose exposure reaches beyond
+        the canvas must report the angle it actually reaches, not a value clamped to
+        the edge -- that number is the exposed-sweep QA, and clamping it would hide
+        exactly the frames worth looking at.  Delivery clips separately.
+        """
+        w = float(self.canvas_width)
+        grid = np.linspace(-pad_frac * w, (1.0 + pad_frac) * w, samples)
         return np.interp(np.asarray(x_src, float), self.source_x(grid), grid)
 
     def is_monotonic(self, samples: int = 8192) -> bool:
-        """True when the inverse warp is strictly increasing across the canvas.
-
-        Section steps make ``source_x`` piecewise: a step that reverses the mapping
-        would fold the image, so it is refused rather than rendered.
-        """
+        """True when the inverse warp is strictly increasing across the canvas."""
         src = self.source_x(np.linspace(0.0, float(self.canvas_width), samples))
         return bool(np.all(np.diff(src) > 0))
 
     # ---- verification -------------------------------------------------------------
     def mark_residuals(self, k, x) -> NDArray[np.floating]:
         """Source-px error of the model at the given (absolute k, source x) marks."""
-        return np.asarray(x, float) - self.source_x(self.canvas_x_of_k(k))
+        return np.asarray(x, float) - self.source_x_of_k(k)
 
     def placement_error_canvas_px(self, k, x) -> NDArray[np.floating]:
         """Where each mark LANDS minus where it is DESIGNED to land, in canvas px.
 
-        This is the quantity the mark warp exists to drive to zero: the delivered
-        column of a mark, minus ``canvas_x_of_k``.
+        The quantity the mark warp exists to drive to zero.  Its floor is the
+        3.0 px per-rail measurement noise, not zero.
         """
         return self.canvas_x_of_source(np.asarray(x, float)) - self.canvas_x_of_k(k)
+
+    def mark_table(self) -> list[dict]:
+        """Per-mark QA rows: index, angle, source and canvas columns, residuals."""
+        if self.marks_k.size == 0:
+            return []
+        a = (self.marks_k - self.k_ref) * self.deg_per_mark
+        resid = self.mark_residuals(self.marks_k, self.marks_x)
+        place = self.placement_error_canvas_px(self.marks_k, self.marks_x)
+        return [{"k": float(k), "k_rel": float(k - self.k_ref), "alpha_deg": float(al),
+                 "side": s, "x_src": float(x), "x_canvas_designed": float(cd),
+                 "resid_src_px": float(r), "placement_err_canvas_px": float(pe),
+                 "inlier": bool(i)}
+                for k, al, s, x, cd, r, pe, i in zip(
+                    self.marks_k, a, self.marks_side, self.marks_x,
+                    self.canvas_x_of_k(self.marks_k), resid, place, self.marks_inlier)]
 
     def to_dict(self) -> dict:
         """JSON-safe summary for the per-frame QC record."""
         return {
             "k_ref": self.k_ref, "deg_per_mark": self.deg_per_mark,
-            "px_per_deg": self.px_per_deg, "canvas_width": self.canvas_width,
+            "px_per_deg": self.px_per_deg, "tier_width": self.tier_width,
+            "canvas_width": self.canvas_width, "canvas_widen": self.canvas_widen,
+            "nominal_sweep_columns": list(self.nominal_sweep_columns),
             "cx": self.cx, "period_canvas_px": self.period_canvas,
-            "period_src_px": self.period_src_px, "drift_pct": self.drift_pct,
-            "warp_form": self.warp_form, "poly_coeffs": [float(c) for c in self.coeffs],
+            "x0_src": self.x0, "scale_src_per_deg": self.scale_src_per_deg,
+            "scale_ratio_src_per_canvas": self.scale_ratio_src_per_canvas,
+            "camera": self.camera,
+            "shape": list(self.shape), "refine": list(self.refine),
+            "shape_provenance": self.shape_provenance,
             "n_marks": self.n_marks, "n_marks_rejected": self.n_marks_rejected,
             "resid_rms_px": self.resid_rms_px, "resid_max_px": self.resid_max_px,
-            "resid_rms_constant_period_px": self.resid_rms_constant_period_px,
-            "seam_steps_px": [float(s) for s in self.seam_steps_px],
-            "seam_x_src": [float(s) for s in self.seam_x_src],
+            "resid_rms_uniform_px": self.resid_rms_uniform_px,
+            "cover_frac": self.cover_frac, "alpha_span_deg": list(self.alpha_span_deg),
             "unwrap_phase": self.unwrap_phase, "unwrap_prior_deg": self.unwrap_prior_deg,
             "unwrap_half_ambiguity_deg": self.unwrap_half_ambiguity_deg,
-            "sides_used": list(self.sides_used), "notes": list(self.notes),
+            "sides_used": list(self.sides_used), "seam_qa": self.seam_qa,
+            "notes": list(self.notes),
         }
 
 
-def _drop_unidentifiable_seams(sec_counts: NDArray[np.integer], seam_x: NDArray[np.floating],
-                               min_marks: int) -> tuple[NDArray[np.floating], list[float]]:
-    """Merge sections that cannot identify their own offset, weakest seam first.
+def seam_step_qa(model: MarkWarpModel, k, x, seam_x_src, *, min_marks_per_section: int = 3,
+                 noise_px: float = 3.0) -> dict:
+    """Measure section-join steps in the mark residual.  A MERGE metric, not geometry.
 
-    Returns the retained seam positions and the dropped ones.  A dropped seam's
-    step is NOT modelled -- it stays in the residual and is reported as a mosaic
-    quality flag, which is the honest outcome: with < ``min_marks`` marks on a side
-    the step and the drift are not separable.
+    Fits ``resid ~ const + slope*alpha + sum_j step_j 1(x > seam_j)`` on the marks
+    and reports the step statistics.  Nothing here feeds the warp: the fleet's true
+    steps are median 3.3 px / p90 7.5 / max 23.8 over 1279 seams -- real, but at the
+    measurement noise floor and an order of magnitude under the smooth drift, so
+    correcting them is not the thing to fix.  Missions <= 1213 carry ~2 marks per
+    section and cannot resolve individual steps; the function says so instead of
+    returning noise.
     """
-    counts = list(sec_counts)
-    seams = list(seam_x)
-    dropped: list[float] = []
-    while len(counts) > 1:
-        weakest = min(range(len(seams)), key=lambda i: min(counts[i], counts[i + 1]))
-        if min(counts[weakest], counts[weakest + 1]) >= min_marks:
-            break
-        counts[weakest] = counts[weakest] + counts[weakest + 1]
-        del counts[weakest + 1]
-        dropped.append(seams.pop(weakest))
-    return np.asarray(seams, float), sorted(dropped)
-
-
-def _fit_drift(kk, x, section, n_sections, poly_degree, robust_iters, clip_sigma):
-    """Least squares of ``x ~ poly(kk) + step[section]`` with MAD clipping.
-
-    Returns ``(poly_coeffs_ascending, section_offsets, inlier_mask)``.  Section 0's
-    offset is pinned to 0 (absorbed by the polynomial constant).
-    """
-    n = len(kk)
-    cols = [kk ** p for p in range(poly_degree + 1)]
-    cols += [(section == s).astype(float) for s in range(1, n_sections)]
+    k = np.asarray(k, float)
+    x = np.asarray(x, float)
+    seams = np.sort(np.asarray(seam_x_src, float))
+    seams = seams[(seams > x.min()) & (seams < x.max())]
+    out: dict = {"n_seams_inside": int(seams.size), "resolvable": False}
+    if seams.size == 0:
+        return out
+    sec = np.searchsorted(seams, x, side="right")
+    counts = np.bincount(sec, minlength=seams.size + 1)
+    if counts.min() < min_marks_per_section:
+        out["reason"] = (f"{int((counts < min_marks_per_section).sum())} of {seams.size + 1} "
+                         f"sections carry < {min_marks_per_section} marks -- individual steps "
+                         "are not resolvable at this ladder class")
+        return out
+    resid = model.mark_residuals(k, x)
+    a = model.alpha_deg(model.canvas_x_of_k(k))
+    cols = [np.ones_like(a), a] + [(sec == s).astype(float) for s in range(1, seams.size + 1)]
     A = np.column_stack(cols)
-    n_par = A.shape[1]
-    keep = np.ones(n, bool)
+    sol, *_ = np.linalg.lstsq(A, resid, rcond=None)
+    steps = np.diff(np.concatenate([[0.0], sol[2:]]))
+    r = resid - A @ sol
+    out.update(resolvable=True, seam_x_src=[float(s) for s in seams],
+               steps_px=[float(s) for s in steps],
+               median_abs_step_px=float(np.median(np.abs(steps))),
+               p90_abs_step_px=float(np.percentile(np.abs(steps), 90)),
+               max_abs_step_px=float(np.abs(steps).max()),
+               n_significant_3sigma=int((np.abs(steps) > 3.0 * noise_px).sum()),
+               rms_after_steps_px=float(np.sqrt((r ** 2).mean())))
+    return out
+
+
+def _fit_phase_and_period(alpha, x, shape_px, robust_iters, clip_sigma):
+    """Least squares of ``x ~ x0 + scale*alpha + shape(alpha)`` with MAD clipping."""
+    y = np.asarray(x, float) - np.asarray(shape_px, float)
+    A = np.column_stack([np.ones_like(alpha), alpha])
+    keep = np.ones(len(alpha), bool)
     for _ in range(max(1, robust_iters)):
-        sol, *_ = np.linalg.lstsq(A[keep], x[keep], rcond=None)
-        r = x - A @ sol
+        sol, *_ = np.linalg.lstsq(A[keep], y[keep], rcond=None)
+        r = y - A @ sol
         med = np.median(r[keep])
         mad = 1.4826 * np.median(np.abs(r[keep] - med))
         new = np.abs(r - med) <= max(clip_sigma * mad, 3.0)
-        if new.sum() < n_par + 1 or np.array_equal(new, keep):
+        if new.sum() < 3 or np.array_equal(new, keep):
             break
         keep = new
-    sol, *_ = np.linalg.lstsq(A[keep], x[keep], rcond=None)
-    coeffs = sol[: poly_degree + 1]
-    offs = np.concatenate([[0.0], sol[poly_degree + 1:]]) if n_sections > 1 else np.zeros(1)
-    return coeffs, offs, keep
+    sol, *_ = np.linalg.lstsq(A[keep], y[keep], rcond=None)
+    return float(sol[0]), float(sol[1]), keep
 
 
 def fit_mark_warp(
     trains: list[MarkTrain],
-    canvas_width: int,
+    tier_width: int,
     prior_alpha_deg: float,
     prior_x_src: float,
     *,
+    camera: str = "F",
+    canvas_widen: float = DEFAULT_CANVAS_WIDEN,
     sweep_deg: float | None = None,
-    seams: SeamModel | None = None,
-    poly_degree: int = 2,
-    warp_form: str = "smooth",
-    min_marks: int = 6,
-    min_cover_frac: float = 0.5,
-    min_marks_per_section: int = 3,
-    max_resid_px: float = 60.0,
+    shape: dict[str, tuple[float, float, float]] | None = None,
+    seam_x_src=None,
+    min_marks: int = 5,
+    min_cover_frac: float = 0.3,
+    max_resid_px: float = 40.0,
     unwrap_warn_frac: float = 0.35,
-    rail_agree_px: float = 40.0,
     k_ref_override: float | None = None,
+    per_frame_refine: str = "off",
+    refine_min_marks: int = 40,
+    refine_resid_factor: float = 3.0,
+    noise_px: float = 3.0,
     robust_iters: int = 6,
     clip_sigma: float = 4.0,
 ) -> MarkWarpModel:
     """Fit the canvas-x -> source-x mark warp for one frame.
 
+    Only TWO parameters are fitted per frame -- the phase (alpha = 0 column) and
+    the period (scale).  The distortion SHAPE is the fleet-calibrated per-sensor
+    constant (``DISTORTION_SHAPE``); a per-frame shape fit is refuted by the fleet
+    (it would re-fit noise, and a 30-deg block on a 5-deg ladder has only ~7 marks).
+
     Parameters
     ----------
     trains:
-        One or more :class:`MarkTrain` (top and/or bottom rail).  Trains whose
-        ladder phase disagrees with the reference by more than a quarter mark are
+        One or more :class:`MarkTrain` (top and/or bottom rail).  A train whose
+        ladder phase disagrees with the reference by more than a quarter mark is
         dropped and recorded (a rail that locked onto the wrong train).
-    canvas_width:
-        Canonical canvas width in px -- a sector tier.  ``cx = canvas_width / 2``.
+    tier_width:
+        The NOMINAL sector width in px -- one of ``IMAGE_WIDTHS_PX``.  It sets the
+        angular scale (``px_per_deg``); the delivered canvas is this widened by
+        ``canvas_widen``, symmetrically, so ``cx = canvas_width / 2`` is still
+        exactly alpha = 0.
+    canvas_widen:
+        How much wider than the nominal sweep the delivered canvas is.  The film is
+        exposed slightly BEYOND the nominal sector -- the marks measure the exposed
+        sweep at a median 1.0021 of the tier, p90 1.0074, and 171 of 172 fleet
+        frames under 1.0123 -- so a strict-tier canvas would clip real content, the
+        harmful direction under dshean's conservative-crop principle.  Extra nodata
+        columns are not.  ``1.0`` is the strict-tier A/B arm.
     prior_alpha_deg, prior_x_src:
-        The a-priori scan angle (deg) believed to sit at source column
-        ``prior_x_src``.  Interior frame: 0 deg at the exposure centre.  First
-        frame: the regime offset (~6.5 deg, per-camera sign; first_frame_census
-        2026-08-30).  Used ONLY to resolve the ladder's integer ambiguity; it never
-        enters the geometry, and a wrong unwrap shifts placement by exactly one
-        mark period, nothing else.
-    seams:
-        Mosaic section boundaries in source px, from the merge provenance.  ``None``
-        = one section, and any step is absorbed into the smooth model (recorded).
-    warp_form:
-        ``"smooth"`` (default: polynomial drift + per-section steps) or ``"interp"``
-        (piecewise linear through every inlier mark, with the same explicit section
-        offsets; exact at the marks but carrying the full detection scatter).
-    k_ref_override:
-        Absolute index of the alpha = 0 mark, when a printed label has been read or
-        a ruling fixes it.  Bypasses the prior unwrap entirely.
+        The a-priori scan angle (deg, MOSAIC frame) believed to sit at source column
+        ``prior_x_src``.  Interior frame: 0 deg at the exposure centre -- the fleet
+        measured that prior good to NMAD 0.126 deg with a worst case of 0.389 deg
+        on collimation-anchored frames, so a 5-deg ladder is unambiguous and a
+        1-deg ladder has ~0.1 deg of margin.  A first frame takes the measured
+        regime offset (+6.35 deg in mosaic x for BOTH cameras, ops323).  Used ONLY
+        to resolve the integer ambiguity; a wrong unwrap shifts placement by exactly
+        one mark period and changes nothing else.
+    camera:
+        ``"F"`` or ``"A"``.  Selects the calibrated shape and its mirror.
+    seam_x_src:
+        Merge-seam columns, for the :func:`seam_step_qa` metric only.  Seam steps
+        are NOT modelled in the warp (fleet sec 4).
+    per_frame_refine:
+        ``"off"`` (default) or ``"auto"`` -- the opt-in escape of fleet sec 8.4: a
+        quadratic correction ON TOP of the shared shape, allowed only for a frame
+        with >= ``refine_min_marks`` marks whose residual exceeds
+        ``refine_resid_factor`` x the noise floor.
 
     Raises
     ------
     LadderError
         Too few marks, too little sweep coverage, a residual above ``max_resid_px``,
-        a folded (non-monotonic) warp, or trains that cannot be reconciled.
-        Refusing is the ruling: a silently degraded x geometry is worse than no
-        product.
+        a folded warp, or trains that cannot be reconciled.  Refusing is the ruling:
+        a silently degraded x geometry is worse than no product.
     """
     trains = [t for t in trains if len(t.k) >= 3]
     if not trains:
@@ -406,26 +549,34 @@ def fit_mark_warp(
     if len(degs) != 1:
         raise LadderError(f"trains disagree on the ladder class: {sorted(degs)}")
     deg_per_mark = degs.pop()
+    if camera not in CAMERA_SIGN:
+        raise LadderError(f"unknown camera {camera!r} (expected F or A)")
 
-    px_per_deg = canvas_px_per_deg(canvas_width, sweep_deg)
+    tier_width = int(tier_width)
+    px_per_deg = canvas_px_per_deg(tier_width, sweep_deg)
+    canvas_width = int(round(tier_width * float(canvas_widen)))
     period_canvas = deg_per_mark * px_per_deg
+    table = DISTORTION_SHAPE if shape is None else shape
+    if camera not in table:
+        raise LadderError(f"no calibrated distortion shape for camera {camera!r}")
+    shape_coeffs = tuple(float(v) for v in table[camera])
     notes: list[str] = []
 
     # ---- 1. put every train on ONE relative index --------------------------------
-    # Each train's k came from its own period fit, so origins differ by an integer.
-    # Align on the provisional linear model of the train with the most marks.
     trains = sorted(trains, key=lambda t: (-len(t.k), t.side))
     ref = trains[0]
-    p_ref = np.polyfit(np.asarray(ref.k, float), np.asarray(ref.x, float), 1)  # x = p0*k + p1
+    p_ref = np.polyfit(np.asarray(ref.k, float), np.asarray(ref.x, float), 1)   # x = p0*k + p1
     if not np.isfinite(p_ref).all() or p_ref[0] <= 0:
         raise LadderError(f"{ref.side} train has a non-increasing period")
     aligned: list[tuple[MarkTrain, float]] = [(ref, 0.0)]
     for t in trains[1:]:
-        shift = float(np.median((np.asarray(t.x, float) - p_ref[1]) / p_ref[0] - np.asarray(t.k, float)))
+        shift = float(np.median((np.asarray(t.x, float) - p_ref[1]) / p_ref[0]
+                                - np.asarray(t.k, float)))
         if abs(shift - round(shift)) > 0.25:
             notes.append(f"{t.side} rail ladder is {shift - round(shift):+.2f} mark out of phase "
                          f"with the {ref.side} rail -- rail dropped")
-            logger.warning("mark warp: dropping the %s rail (phase %+.2f mark)", t.side, shift - round(shift))
+            logger.warning("mark warp: dropping the %s rail (phase %+.2f mark)",
+                           t.side, shift - round(shift))
             continue
         aligned.append((t, float(round(shift))))
 
@@ -438,8 +589,7 @@ def fit_mark_warp(
 
     if len(k_all) < min_marks:
         raise LadderError(f"only {len(k_all)} marks fitted (need {min_marks})")
-    span_canvas = (x_all[-1] - x_all[0]) * period_canvas / p_ref[0]
-    cover = span_canvas / float(canvas_width)
+    cover = (x_all[-1] - x_all[0]) * period_canvas / p_ref[0] / float(tier_width)
     if cover < min_cover_frac:
         raise LadderError(f"the ladder covers {cover:.2f} of the sweep (need {min_cover_frac:.2f})")
 
@@ -450,7 +600,7 @@ def fit_mark_warp(
     if k_ref_override is not None:
         k_ref = float(k_ref_override)
         phase = float("nan")
-        notes.append(f"k_ref fixed at {k_ref:g} by the caller (prior would have given "
+        notes.append(f"k_ref fixed at {k_ref:g} by the caller (the prior would have given "
                      f"{np.round(k_ref_real):g})")
     else:
         k_ref = float(np.round(k_ref_real))
@@ -462,86 +612,70 @@ def fit_mark_warp(
                 "a label-derived k_ref settles it")
             logger.warning("mark unwrap is marginal: phase %+.3f mark (%+.3f deg), half-ambiguity "
                            "%.2f deg", phase, phase * deg_per_mark, half_amb)
-    kk = k_all - k_ref
 
-    # ---- 3. sections from the merge seams ----------------------------------------
-    # Seam positions are converted to ladder index with the PROVISIONAL linear model
-    # (accurate to a few tens of source px, i.e. ~1e-3 mark) and everything -- fit
-    # and evaluation -- is then indexed in kk, so both paths agree exactly.
-    seam_src = np.asarray(seams.x_src, float) if seams is not None else np.empty(0)
-    seam_src = np.sort(seam_src[(seam_src > x_all[0]) & (seam_src < x_all[-1])])
-    seam_kk = (seam_src - p_ref[1]) / p_ref[0] - k_ref if seam_src.size else np.empty(0)
-    if seam_kk.size:
-        counts = np.bincount(np.searchsorted(seam_kk, kk, side="right"), minlength=seam_kk.size + 1)
-        seam_kk, dropped = _drop_unidentifiable_seams(counts, seam_kk, min_marks_per_section)
-        if dropped:
-            notes.append(f"{len(dropped)} of {len(dropped) + seam_kk.size} interior seams have "
-                         f"< {min_marks_per_section} marks on a side: the step is not separable "
-                         "from the drift there, left unmodelled (mosaic-quality flag)")
-    sec = np.searchsorted(seam_kk, kk, side="right") if seam_kk.size else np.zeros(len(kk), int)
-    n_sections = int(seam_kk.size) + 1
+    alpha = (k_all - k_ref) * deg_per_mark
 
-    # ---- 4. the drift fit ---------------------------------------------------------
-    deg = int(np.clip(poly_degree, 1, max(1, len(k_all) - n_sections - 1)))
-    if deg != poly_degree:
-        notes.append(f"polynomial degree reduced {poly_degree} -> {deg} for {len(k_all)} marks "
-                     f"over {n_sections} sections")
-    coeffs, offs, inl = _fit_drift(kk, x_all, sec, n_sections, deg, robust_iters, clip_sigma)
-    resid = x_all - (np.polyval(coeffs[::-1], kk) + offs[sec])
+    # ---- 3. phase + period against the FIXED shape --------------------------------
+    def _shape(a, coeffs):
+        s = CAMERA_SIGN[camera]
+        a2, a3, a4 = coeffs
+        return s * (a2 * a ** 2 + a4 * a ** 4) + a3 * a ** 3
+
+    x0, scale, inl = _fit_phase_and_period(alpha, x_all, _shape(alpha, shape_coeffs),
+                                           robust_iters, clip_sigma)
+    resid = x_all - (x0 + scale * alpha + _shape(alpha, shape_coeffs))
     rms = float(np.sqrt((resid[inl] ** 2).mean()))
     rmax = float(np.abs(resid[inl]).max())
-    # what a single constant period would have left -- the number the warp beats
-    p1 = np.polyfit(kk[inl], x_all[inl], 1)
-    rms_const = float(np.sqrt(((x_all[inl] - np.polyval(p1, kk[inl])) ** 2).mean()))
+    # what a uniform grid with NO shape would have left -- the number the warp beats
+    x0u, scu, inu = _fit_phase_and_period(alpha, x_all, np.zeros_like(alpha),
+                                          robust_iters, clip_sigma)
+    rms_uniform = float(np.sqrt(((x_all - (x0u + scu * alpha))[inu] ** 2).mean()))
+
+    refine = (0.0, 0.0, 0.0)
+    if per_frame_refine == "auto":
+        if inl.sum() >= refine_min_marks and rms > refine_resid_factor * noise_px:
+            # a QUADRATIC correction on top of the shared shape, never a free reshape
+            A = np.column_stack([np.ones_like(alpha), alpha, alpha ** 2])
+            sol, *_ = np.linalg.lstsq(A[inl], (x_all - _shape(alpha, shape_coeffs))[inl],
+                                      rcond=None)
+            s = CAMERA_SIGN[camera]
+            refine = (float(sol[2]) * s, 0.0, 0.0)      # stored in the camera frame
+            x0, scale = float(sol[0]), float(sol[1])
+            resid = x_all - (x0 + scale * alpha + _shape(alpha, shape_coeffs)
+                             + _shape(alpha, refine))
+            rms = float(np.sqrt((resid[inl] ** 2).mean()))
+            rmax = float(np.abs(resid[inl]).max())
+            notes.append(f"PER_FRAME_REFINE applied: {inl.sum()} marks, residual about the shared "
+                         f"shape exceeded {refine_resid_factor:g}x the {noise_px:g} px noise floor")
+            logger.warning("mark warp: per-frame quadratic refinement applied (opt-in escape)")
+        else:
+            notes.append(f"per_frame_refine=auto declined ({int(inl.sum())} marks, {rms:.1f} px "
+                         f"rms): the shared shape already fits at the noise floor")
 
     if rms > max_resid_px:
         raise LadderError(
             f"ladder residual {rms:.1f} px rms (max {rmax:.1f}) over {len(k_all)} marks exceeds "
-            f"{max_resid_px:.0f} px -- this is not a clean {deg_per_mark:g} deg ladder")
-
-    if len(sides) > 1:
-        for side in sides:
-            m = (side_all == side) & inl
-            if m.any():
-                rr = float(np.sqrt((resid[m] ** 2).mean()))
-                if rr > rail_agree_px:
-                    notes.append(f"{side} rail residual {rr:.1f} px vs joint {rms:.1f} px -- the "
-                                 f"rails disagree beyond {rail_agree_px:.0f} px")
-
-    # ---- 5. optional interpolating form (same explicit section offsets) -----------
-    knots_c = np.empty(0)
-    knots_s = np.empty(0)
-    if warp_form == "interp":
-        ku, first = np.unique(k_all[inl], return_index=True)
-        xs = (x_all[inl] - offs[sec[inl]])[first]
-        if len(ku) < 3:
-            raise LadderError("interp warp form needs >= 3 distinct inlier marks")
-        c = canvas_width / 2.0 + (ku - k_ref) * period_canvas
-        s_lo = (xs[1] - xs[0]) / (c[1] - c[0])
-        s_hi = (xs[-1] - xs[-2]) / (c[-1] - c[-2])
-        knots_c = np.concatenate([[0.0], c, [float(canvas_width)]])
-        knots_s = np.concatenate([[xs[0] + s_lo * (0.0 - c[0])], xs,
-                                  [xs[-1] + s_hi * (float(canvas_width) - c[-1])]])
-        if not np.all(np.diff(knots_c) > 0):        # a mark outside the canvas edge
-            keep = np.concatenate([[True], np.diff(knots_c) > 0])
-            knots_c, knots_s = knots_c[keep], knots_s[keep]
-
-    drift = float(2.0 * coeffs[2] / coeffs[1] * (kk[inl].max() - kk[inl].min()) * 100.0) \
-        if deg >= 2 and coeffs[1] else float("nan")
+            f"{max_resid_px:.0f} px against the calibrated {camera} shape -- this is not a clean "
+            f"{deg_per_mark:g} deg ladder")
 
     model = MarkWarpModel(
         k_ref=k_ref, deg_per_mark=deg_per_mark, px_per_deg=px_per_deg,
-        canvas_width=int(canvas_width), coeffs=np.asarray(coeffs, float),
-        section_edges_kk=np.asarray(seam_kk, float), section_offsets=np.asarray(offs, float),
-        warp_form=warp_form, n_marks=int(inl.sum()), n_marks_rejected=int((~inl).sum()),
-        resid_rms_px=rms, resid_max_px=rmax, resid_rms_constant_period_px=rms_const,
-        period_src_px=float(coeffs[1]) if deg >= 1 else float("nan"), drift_pct=drift,
-        seam_steps_px=np.diff(offs) if offs.size > 1 else np.empty(0),
-        seam_x_src=np.asarray(seam_kk * p_ref[0] + p_ref[1] + k_ref * p_ref[0], float),
-        unwrap_phase=float(phase), unwrap_prior_deg=float(prior_alpha_deg),
-        unwrap_half_ambiguity_deg=float(half_amb), sides_used=sides,
-        knots_canvas=knots_c, knots_source=knots_s, notes=tuple(notes),
+        tier_width=tier_width, canvas_width=canvas_width, x0=x0,
+        scale_src_per_deg=scale, camera=camera,
+        shape=shape_coeffs, refine=refine,
+        n_marks=int(inl.sum()), n_marks_rejected=int((~inl).sum()),
+        resid_rms_px=rms, resid_max_px=rmax, resid_rms_uniform_px=rms_uniform,
+        scale_ratio_src_per_canvas=float(scale / px_per_deg), unwrap_phase=float(phase),
+        unwrap_prior_deg=float(prior_alpha_deg), unwrap_half_ambiguity_deg=float(half_amb),
+        sides_used=sides, cover_frac=float(cover),
+        alpha_span_deg=(float(alpha.min()), float(alpha.max())),
+        marks_k=k_all, marks_x=x_all, marks_side=tuple(str(s) for s in side_all),
+        marks_inlier=inl,
+        shape_provenance=(DISTORTION_SHAPE_PROVENANCE if shape is None else "caller-supplied"),
+        notes=tuple(notes),
     )
+    if seam_x_src is not None:
+        model.seam_qa = seam_step_qa(model, k_all, x_all, seam_x_src, noise_px=noise_px)
     if not model.is_monotonic():
         raise LadderError("the fitted mark warp is not monotonic across the canvas -- refusing "
                           "(a folded x mapping would duplicate terrain)")

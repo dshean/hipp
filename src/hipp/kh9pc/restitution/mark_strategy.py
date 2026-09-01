@@ -55,8 +55,9 @@ Description: Mark-based restitution -- the printed scan-angle ladder carries the
 
       ``MarkStrategy``     -- on top of :class:`CollimationStrategy` (missions >= 1206)
       ``MarkPolyStrategy`` -- on top of :class:`PolyStrategy` (mission 1205, no lines);
-                              anchored on the FILM-FRAME boundary the parent's
-                              rupture scan already locks, not on the crop window.
+                              anchored on the parent's DELIVERED content-edge model,
+                              not on the crop window and not on the rupture-scan
+                              film-frame boundary the parent only uses for placement.
 
     Both refuse loudly when the ladder cannot be fitted (``LadderError`` ->
     ``is_failed``); a frame whose x geometry is not pinned by the marks is not a
@@ -140,16 +141,43 @@ class MarkOptions:
     band_dy_px, band_half_px:
         The rail search band as (top, bottom) OUTWARD offsets from the anchor line,
         plus a half-height.  Outward means away from the image centre, so both are
-        positive for the collimation anchor and the ruling's "-600 top / +850
-        bottom" (signed rows) is ``(600, 850)`` here; a NEGATIVE value searches
-        inward, which is where the ladder sits relative to the FILM EDGE anchor the
-        no-collimation missions use.  Measured ladder rows on the
-        collimation-anchored frames: 834-879 outward at the bottom, 563-643 at the
-        top.
+        positive for the collimation anchor; a NEGATIVE value searches inward.
+
+        The default is the MEASURED per-class band, 380-980 px outward of the
+        collimation line on BOTH rails -- ``(680, 680)`` with a 300 px half-height
+        (review H4/M1, 2026-08-30).  The previous +-60 px window around a
+        hipp-calibrated 6.40 in constant covered only ~40 % of that span and
+        straddled the two rails' measured ladder rows (834-879 outward at the
+        bottom, 563-643 at the top), so on either rail it could miss the ladder --
+        and it certainly missed the DENSE timing train, which is the straightness
+        probe worth having.  Selection inside the band is by CLASS and fitted
+        period, not by position, so a wide band costs nothing but read time.
+
+        The band must stay clear of both ends of the margin: the collimation line
+        itself at 0, and the film-frame boundary ~1150 px outward of it, whose
+        edge artifacts fit pseudo-trains (which is what
+        ``straightness_edge_standoff_px`` keeps out of the straightness GATE).
     band_fallback_half_px:
         Widened half-height retried, loudly, when the ruled band yields no
-        acceptable ladder (the PolyStrategy anchor is not the collimation line, so
-        its ladder sits elsewhere).  ``None`` disables the retry.
+        acceptable ladder.  400 px (280-1080 outward) is the widest window that
+        still stops short of the ~1150 px film-frame boundary.  ``None`` disables
+        the retry.
+    straightness_edge_standoff_px:
+        A mark row may only GATE straightness if it sits at least this far inside
+        the fitted format/exposure edge.  Edge artifacts (the film-frame boundary,
+        scratches and glow along it) fit pseudo-trains whose row positions follow
+        the EDGE, not the rectification anchor; on the rectified strip they curve
+        by the difference between the two lines, which is neither a rectification
+        error nor a defect of this frame.  Left ungated they would either veto a
+        good frame or blame the y rectification for a curvature it did not cause
+        (review H4/M1, 2026-08-30).  Such rows are still MEASURED and reported --
+        they simply do not carry the verdict.
+    margin_min_block_frac:
+        Fraction of the JUDGED blocks along a rail that must look like film margin
+        for the rail to be trusted.  Blocks with no readable band (mosaic nodata --
+        a trailing block past the film, most often) are counted separately and do
+        not vote either way: ANDing every block's verdict let a single such block
+        veto a whole good rail (review M2, 2026-08-30).
     margin_max_dn, margin_max_bright_frac:
         The rail band must LOOK like unexposed film -- dark and flat.  The fleet
         found the PolyStrategy anchor putting the band on terrain, where a chance
@@ -173,19 +201,28 @@ class MarkOptions:
     min_marks: int = 5
     min_cover_frac: float = 0.3
     max_resid_px: float = 40.0
+    #: relative residual gate: the calibrated shape may not leave MORE residual than
+    #: the uniform grid it replaces, by more than this margin.  None -> noise_px.
+    #: The absolute ceiling above is sweep-blind and lets a wrong-sensor shape through
+    #: on the 30 deg tiers (review H3, 2026-08-30).
+    resid_vs_uniform_margin_px: float | None = None
     unwrap_warn_frac: float = 0.35
     period_ratio_tol: float = 0.02
     noise_px: float = 3.0
     distortion_shape_json: str | Path | None = None
     # detection
     sides: tuple[str, ...] = ("top", "bottom")
-    band_dy_px: tuple[float, float] = (600.0, 850.0)
-    band_half_px: float = 60.0
-    band_fallback_half_px: float | None = 350.0
+    #: the MEASURED class band, 380-980 px outward of the collimation line on both
+    #: rails (review H4/M1, 2026-08-30) -- wide enough to hold BOTH the sparse angle
+    #: ladder and the dense timing train, which the old +-60 px window did not.
+    band_dy_px: tuple[float, float] = (680.0, 680.0)
+    band_half_px: float = 300.0
+    band_fallback_half_px: float | None = 400.0
     score_min: float = 0.45
     block_w: int = 16384
     margin_max_dn: float = 120.0
     margin_max_bright_frac: float = 0.20
+    margin_min_block_frac: float = 0.6       # per-block VOTE, never an AND (review M2)
     redaction_max_std: float = 1.5           # USGS redaction fill is UNIFORM, film is noisy
     guard_zone_periods: float = 1.5          # near a frame start, require both neighbours
     #: A scan can contain part of the NEXT frame, rail marks included (ops327 A003;
@@ -199,6 +236,7 @@ class MarkOptions:
     # 2026-08-30) -- it would have caught the ops196 A002/F002 straightening failures.
     straightness_warn_px: float = 8.0
     straightness_fail_px: float = 40.0
+    straightness_edge_standoff_px: float = 150.0
     # seams -- QA only, never geometry
     use_seams: bool = True
     seam_provenance: str | Path | None = None
@@ -311,20 +349,29 @@ def strip_is_film_margin(strip, opts: MarkOptions) -> tuple[bool, dict]:
     """
     img = np.asarray(strip, dtype=np.float32)
     a = img[img > 0]                           # mosaic nodata is not evidence either way
-    stats: dict = {"n_px": int(a.size)}
+    stats: dict = {"n_px": int(a.size), "readable": True}
     if a.size < 4096:
-        stats["verdict"] = "no readable band (all nodata)"
+        # NOT evidence of terrain: a block past the end of the film reads all nodata.
+        # ``readable`` is what lets the caller count it apart from a real verdict.
+        stats.update(readable=False, verdict="no readable band (all nodata)")
         return False, stats
     stats["median_dn"] = float(np.median(a))
     stats["bright_frac"] = float((a > opts.margin_max_dn).mean())
     # REDACTION vs film: a USGS redaction box is a uniform fill, unexposed film is
     # noisy at a similar DN.  Column-wise std separates them, and a redacted stretch
     # is a "no marks HERE" fact, not a bad anchor -- mission 1205 carries them in the
-    # rail region (dshean 2026-08-30).
-    col_std = img.std(axis=0)
-    col_med = np.median(img, axis=0)
-    flat = (col_std <= opts.redaction_max_std) & (col_med <= opts.margin_max_dn)
-    stats["redacted_frac"] = float(flat.mean())
+    # rail region (dshean 2026-08-30).  MOSAIC NODATA is uniform 0 and would answer
+    # this test as "redacted" (review LOW, 2026-08-30): a column carrying any nodata
+    # is scored as nodata instead, and reported separately.
+    full = (img > 0).all(axis=0)
+    stats["nodata_frac"] = float(1.0 - full.mean())
+    if full.any():
+        col_std = img[:, full].std(axis=0)
+        col_med = np.median(img[:, full], axis=0)
+        flat = (col_std <= opts.redaction_max_std) & (col_med <= opts.margin_max_dn)
+        stats["redacted_frac"] = float(flat.mean())
+    else:
+        stats["redacted_frac"] = 0.0
     ok = (stats["median_dn"] <= opts.margin_max_dn
           and stats["bright_frac"] <= opts.margin_max_bright_frac)
     if ok and stats["redacted_frac"] > 0.5:
@@ -358,7 +405,10 @@ def detect_marks_on_straight_rail(raster, anchors, side: str, band_px: tuple[flo
     with rasterio.open(raster) as src:
         width = src.width
     ov = opts.block_w // 32
-    margin_ok = None
+    # per-block VOTE, not an AND (review M2, 2026-08-30): one trailing block of
+    # mosaic nodata used to veto a whole good rail.  A block with no readable band
+    # is not evidence either way and is counted apart from the film/content verdict.
+    votes = {"film": 0, "content": 0, "unreadable": 0}
     for x0 in range(0, width, opts.block_w):
         x1 = min(width, x0 + opts.block_w + ov)
         strip, row0 = rectified_rail_strip(raster, line, side, inner, outer, x0, x1)
@@ -366,10 +416,15 @@ def detect_marks_on_straight_rail(raster, anchors, side: str, band_px: tuple[flo
             continue
         info["blocks"] += 1
         ok, stats = strip_is_film_margin(strip, opts)
-        if info["margin"] is None or (stats.get("median_dn") or 0) > (
-                info["margin"].get("median_dn") or 0):
-            info["margin"] = stats            # keep the WORST (brightest) block's verdict
-        margin_ok = ok if margin_ok is None else (margin_ok and ok)
+        if not stats.get("readable", True):
+            votes["unreadable"] += 1
+            if info["margin"] is None:
+                info["margin"] = stats        # something is always reported
+            continue
+        if info["margin"] is None or not info["margin"].get("readable", True) or (
+                (stats.get("median_dn") or 0) > (info["margin"].get("median_dn") or 0)):
+            info["margin"] = stats            # keep the WORST (brightest) JUDGED block
+        votes["film" if ok else "content"] += 1
         if not ok:
             continue
         for xl, yl, score, tid in _match_block(strip, bank, opts.score_min, nms_px):
@@ -380,12 +435,55 @@ def detect_marks_on_straight_rail(raster, anchors, side: str, band_px: tuple[flo
             marks.append(Mark(x=float(gx), y=float(line(np.array([gx]))[0]) + dy, side=side,
                               score=float(score), kind=bank[tid].kind,
                               size_mm=bank[tid].size_mm, dy=float(dy)))
-    info["margin_ok"] = bool(margin_ok)
+    judged = votes["film"] + votes["content"]
+    frac = (votes["film"] / judged) if judged else 0.0
+    info["margin_votes"] = dict(votes)
+    info["margin_film_frac"] = float(frac)
+    info["margin_ok"] = bool(judged > 0 and frac >= opts.margin_min_block_frac)
+    if judged == 0:
+        info["margin_reason"] = (f"no readable block on the {side} rail "
+                                 f"({votes['unreadable']} all-nodata) -- nothing to judge")
+    elif not info["margin_ok"]:
+        info["margin_reason"] = (f"{votes['film']}/{judged} judged blocks look like film margin "
+                                 f"(need {opts.margin_min_block_frac:.0%}); "
+                                 f"{votes['unreadable']} block(s) unreadable and not voting")
     info["n_marks"] = len(marks)
     return marks, info
 
 
-def train_straightness(marks, opts: MarkOptions, label: str = "") -> dict:
+def gate_standoff_verdict(side: str, dy_median: float, edge_offsets, opts: MarkOptions
+                          ) -> tuple[bool, str | None]:
+    """May a mark row at this offset carry the STRAIGHTNESS verdict?
+
+    Only if it sits at least ``straightness_edge_standoff_px`` inside the fitted
+    format/exposure edge.  ``edge_offsets`` gives, per side, the OUTWARD distance in
+    px from the rectification anchor to that edge; an absent or non-positive entry
+    means the edge is unknown and no standoff is applied.
+
+    The wide class band (review H4) now reaches toward the film-frame boundary,
+    where edge artifacts fit pseudo-trains.  Their rows follow the EDGE, so on a
+    strip rectified against the ANCHOR they curve by the difference between the two
+    lines -- which is neither a rectification error nor a defect of this frame.
+    Gating on one would veto a good frame, or blame the y rectification for a
+    curvature it did not cause (review M1, 2026-08-30).
+    """
+    if not edge_offsets:
+        return True, None
+    edge = edge_offsets.get(side)
+    if edge is None or not np.isfinite(edge) or edge <= 0.0:
+        return True, None
+    outward = (-1.0 if side == "top" else 1.0) * float(dy_median)
+    if outward >= edge - opts.straightness_edge_standoff_px:
+        return False, (f"row sits {edge - outward:.0f} px inside the fitted format edge "
+                       f"({edge:.0f} px outward of the anchor), under the "
+                       f"{opts.straightness_edge_standoff_px:.0f} px standoff -- measured, but not "
+                       "carrying the straightness verdict (edge artifacts fit pseudo-trains whose "
+                       "curvature is the EDGE's, not the rectification's)")
+    return True, None
+
+
+def train_straightness(marks, opts: MarkOptions, label: str = "", *, gates: bool = True,
+                       gate_skip: str | None = None) -> dict:
     """How straight a mark train runs on the RECTIFIED strip -- the y/rectification check.
 
     After the collimation-line rectification a printed train MUST lie along a
@@ -395,11 +493,16 @@ def train_straightness(marks, opts: MarkOptions, label: str = "") -> dict:
     the better probe of the two -- hundreds of samples against the ladder's handful.
 
     Returns rms / max deviation about a robust straight line in ``dy``, plus the
-    residual curvature (the quadratic coefficient scaled to the frame).
+    residual curvature (the quadratic coefficient scaled to the frame).  ``gates``
+    says whether this row is allowed to carry the frame's verdict; a row too close
+    to the format edge is measured and reported but never gates
+    (:func:`gate_standoff_verdict`).
     """
     x = np.asarray([m.x for m in marks], float)
     dy = np.asarray([m.dy for m in marks], float)
-    out = {"label": label, "n": int(x.size)}
+    out = {"label": label, "n": int(x.size), "gates": bool(gates)}
+    if gate_skip:
+        out["gate_skip"] = gate_skip
     if x.size < 8:
         out["verdict"] = "too few marks to judge straightness"
         return out
@@ -422,8 +525,31 @@ def train_straightness(marks, opts: MarkOptions, label: str = "") -> dict:
     return out
 
 
+def straightness_verdict(straightness: dict | None) -> tuple[dict | None, list, list]:
+    """``(worst GATING row, gating rows, measured-but-not-gating rows)``.
+
+    One place decides which measured row carries the frame's straightness verdict,
+    so the wrapper, the figure and the refusal in ``_fit_marks`` cannot drift apart
+    -- and so the standoff rule is directly testable (review M1, 2026-08-30).
+
+    NOTE on the thresholds: ``timing_marks.cluster_rows`` only assigns a mark to a
+    row when its ``dy`` is within ``assign_px`` (45 px) of the row centre, so the
+    deviation of any row that reaches this function is bounded by 45 px and its rms
+    about a fitted line by ~26 px for a smooth curve.  ``straightness_fail_px``
+    above that bound is effectively unreachable and ``straightness_warn_px`` is the
+    operative gate -- see the 2026-08-30 note; the default is left where dshean set
+    it rather than changed here.
+    """
+    measured = [v for v in (straightness or {}).values() if "rms_px" in v]
+    gating = [v for v in measured if v.get("gates", True)]
+    skipped = [v for v in measured if not v.get("gates", True)]
+    worst = max(gating, key=lambda v: v["rms_px"]) if gating else None
+    return worst, gating, skipped
+
+
 def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
-                        band_px=None) -> tuple[list[MarkTrain], list, list, dict]:
+                        band_px=None, edge_offsets: dict | None = None
+                        ) -> tuple[list[MarkTrain], list, list, dict]:
     """Detect rail marks on the straight rails and keep this mission's angle ladder.
 
     Row selection is by FIT, not by position: the train's class must be the pattern
@@ -434,8 +560,13 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
     the fleet found the per-mission expected class agreed with the fitted class on
     338 of 338 trains.
 
+    ``edge_offsets`` (per side, OUTWARD px from the anchor to the fitted
+    format/exposure edge) decides which rows may carry the STRAIGHTNESS verdict --
+    see :func:`gate_standoff_verdict`.  Every row is measured either way.
+
     Returns ``(trains, all_marks, chosen_timing_marks_trains, info)``.
     """
+    import copy
     from hipp.kh9pc.restitution import timing_marks as tm
 
     kinds = ("disk",) if spec.fiducial_type == "disk" else ("wheel",)
@@ -449,8 +580,9 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
         marks, dinfo = detect_marks_on_straight_rail(raster, anchors, side, band, opts, kinds)
         info["detect"][side] = dinfo
         if not dinfo["margin_ok"]:
-            logger.warning("%s rail band is not unexposed film (%s; median DN %s, bright frac %s)"
-                           " -- marks from it are not trusted", side,
+            logger.warning("%s rail band is not unexposed film (%s; %s; median DN %s, bright frac "
+                           "%s) -- marks from it are not trusted", side,
+                           dinfo.get("margin_reason", "?"),
                            (dinfo["margin"] or {}).get("verdict"),
                            (dinfo["margin"] or {}).get("median_dn"),
                            (dinfo["margin"] or {}).get("bright_frac"))
@@ -471,18 +603,28 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
             "regulare_sparse" if expected == 5.0 else "regulare_mid")
         inside = [m for m in marks if lo_x - pad <= m.x <= hi_x + pad]
         outside = [m for m in marks if not (lo_x - pad <= m.x <= hi_x + pad)]
+        # recorded so every consumer -- the QC figure included -- can hold itself to
+        # the INSIDE set without re-deriving the window (review M6)
+        info["detect"][side]["frame_extent_x"] = [lo_x - pad, hi_x + pad]
         if outside:
             info["detect"][side]["outside_frame_extent"] = len(outside)
         marks = inside
-        best = None
-        dense = None
+        best = best_key = None
+        dense = dense_key = None
         for row in tm.cluster_rows(marks, side):
             t = tm.fit_train(marks, side, row, anchors)
             if t is None:
                 continue
+            # a row that cannot GATE straightness cannot WIN the selection either
+            # while an eligible row exists: an edge-artifact pseudo-train sitting
+            # against the format edge outnumbers the real train easily, and letting
+            # it win would discard the good probe before the gate ever saw it
+            # (review H4/M1, 2026-08-30).  It is still taken when nothing else is.
+            eligible = gate_standoff_verdict(side, t.dy_px, edge_offsets, opts)[0]
             if t.label == "dense":
-                if dense is None or t.n_inliers > dense.n_inliers:
-                    dense = t
+                key = (eligible, t.n_inliers)
+                if dense is None or key > dense_key:
+                    dense, dense_key = t, key
                 continue
             if _LABEL_TO_PATTERN.get(t.label) is None:
                 continue
@@ -490,9 +632,9 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
                 continue                    # a real train, but not the angle ladder
             if not t.period_deg or abs(t.period_deg / expected - 1.0) > opts.period_ratio_tol:
                 continue
-            if best is None or (t.n_inliers, -t.resid_rms_px) > (best.n_inliers,
-                                                                 -best.resid_rms_px):
-                best = t
+            key = (eligible, t.n_inliers, -t.resid_rms_px)
+            if best is None or key > best_key:
+                best, best_key = t, key
         info["detect"][side]["ladder"] = (
             None if best is None else
             {"row": best.row, "dy_px": best.dy_px, "label": best.label,
@@ -502,15 +644,21 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
         # probe: hundreds of samples where the ladder has a handful.
         if dense is not None:
             dms = [m for m in marks if m.side == side and m.row == dense.row and m.inlier]
+            g, why = gate_standoff_verdict(side, dense.dy_px, edge_offsets, opts)
             info["straightness"][f"{side}_dense"] = train_straightness(
-                dms, opts, f"{side} dense train")
+                dms, opts, f"{side} dense train", gates=g, gate_skip=why)
             info["detect"][side]["dense_row"] = dense.row
             info["detect"][side]["dense_period_px"] = dense.period_px
+            if not g:
+                logger.warning("%s dense train is not eligible to gate straightness: %s", side, why)
         if best is None:
             continue
         ms = [m for m in marks if m.side == side and m.row == best.row and m.inlier]
+        g, why = gate_standoff_verdict(side, best.dy_px, edge_offsets, opts)
         info["straightness"][f"{side}_ladder"] = train_straightness(
-            ms, opts, f"{side} {expected:g} deg ladder")
+            ms, opts, f"{side} {expected:g} deg ladder", gates=g, gate_skip=why)
+        if not g:
+            logger.warning("%s angle ladder is not eligible to gate straightness: %s", side, why)
         info["detect"][side]["ladder_row"] = best.row
         # START-OF-OPERATION / START-OF-FRAME marks live near a frame start and can
         # alias onto a ladder slot (dshean 2026-08-30), so inside a guard zone at
@@ -544,11 +692,18 @@ def detect_angle_ladder(raster, anchors, spec: KH9ImageSpec, opts: MarkOptions,
         if len(ms) < 3:
             continue
         if outside and best is not None:
-            for m in outside:
+            # COPIES (review M6, 2026-08-30): re-clustering the shared Mark objects
+            # hands the neighbour frame's marks row ids 0, 1, ... which COLLIDE with
+            # this frame's ladder_row / dense_row, and every consumer that selects by
+            # row -- the straightness and spacing panels above all -- then blends the
+            # next frame's ladder into this frame's evidence.  "Excluded, not blended"
+            # has to be true of the FIGURE too.
+            nb_marks = [copy.copy(m) for m in outside]
+            for m in nb_marks:
                 m.row = -1
-            nb = tm.cluster_rows(outside, side)
+            nb = tm.cluster_rows(nb_marks, side)
             for row in nb:
-                t = tm.fit_train(outside, side, row, anchors)
+                t = tm.fit_train(nb_marks, side, row, anchors)
                 if t is None or t.label != best.label or t.n_inliers < 3:
                     continue
                 dphase = ((t.x0 - best.x0) / best.period_px) % 1.0
@@ -585,6 +740,17 @@ class _MarkPlacementMixin:
     mark_marks_: list | None = None
     mark_trains_: list | None = None
     mark_info_: dict | None = None
+    #: None until ``transform`` runs; False when the conservative exposure crop could
+    #: not be applied, so ``keep_columns`` in the QC record describes an INTENT the
+    #: product on disk does not carry (review LOW, 2026-08-30).
+    mark_crop_applied_: bool | None = None
+    #: A mark refusal is TERMINAL in a MixedStrategy cascade (review H2, 2026-08-30):
+    #: falling through to the plain parent would deliver a product at a DIFFERENT
+    #: canvas width (tier vs tier x widen) under a name the worker accepts -- exactly
+    #: the silent degradation the loud-refusal design forbids.  Set it True on an
+    #: INSTANCE only to restore the old cascade, knowingly.  (No annotation: this must
+    #: stay a plain class attribute, never a dataclass field.)
+    cascade_on_failure = False
 
     # ---- pieces each concrete strategy supplies ---------------------------------
     def _mark_line_models(self) -> dict:
@@ -596,6 +762,39 @@ class _MarkPlacementMixin:
     def _mark_anchor_is_film_referenced(self) -> bool:
         """True when the anchor line is tied to the film, not to a fixed window."""
         raise NotImplementedError
+
+    def _mark_format_edge_offsets(self) -> dict[str, float]:
+        """Per side, the OUTWARD px from the rectification anchor to the fitted
+        format/exposure edge -- the standoff the straightness GATE keeps
+        (:func:`gate_standoff_verdict`).  ``{}`` means the edge is unknown here and
+        no standoff is applied; a subclass that knows it must say so.
+        """
+        return {}
+
+    def _mark_edge_offsets_between(self, anchor_models: dict, edge_models: dict) -> dict[str, float]:
+        """Median outward separation of two per-side line models over the sweep."""
+        left, right = (float(v) for v in self._mark_detector().edges_)
+        xs = np.linspace(left, right, 64).reshape(-1, 1)
+        out: dict[str, float] = {}
+        for side in ("top", "bottom"):
+            a, e = anchor_models.get(side), edge_models.get(side)
+            if a is None or e is None:
+                continue
+            try:
+                sep = np.asarray(e.predict(xs), float).ravel() - np.asarray(
+                    a.predict(xs), float).ravel()
+            except Exception as exc:                              # noqa: BLE001
+                logger.warning("%s: could not measure the %s format-edge standoff (%r) -- the "
+                               "straightness gate runs without it", self.logging_prefix, side, exc)
+                continue
+            d = float(np.median((-1.0 if side == "top" else 1.0) * sep))
+            if not np.isfinite(d) or d <= 0.0:
+                logger.warning("%s: the fitted %s format edge is %.0f px OUTWARD of the anchor "
+                               "(expected a positive separation) -- no straightness standoff "
+                               "applied on this rail", self.logging_prefix, side, d)
+                continue
+            out[side] = d
+        return out
 
     # ---- detection --------------------------------------------------------------
     def _mark_anchors(self):
@@ -616,7 +815,8 @@ class _MarkPlacementMixin:
     def _detect_trains(self, opts: MarkOptions, band_px):
         return detect_angle_ladder(
             self.raster_filepath_, self._mark_anchors(),
-            KH9ImageSpec.from_raster_filepath(self.raster_filepath_), opts, band_px)
+            KH9ImageSpec.from_raster_filepath(self.raster_filepath_), opts, band_px,
+            edge_offsets=self._mark_format_edge_offsets())
 
     # ---- the warp ---------------------------------------------------------------
     def _mark_seams(self, opts: MarkOptions) -> SeamPositions:
@@ -694,7 +894,9 @@ class _MarkPlacementMixin:
                        else {"canvas_widen": opts.canvas_widen}),
                     seam_x_src=(seams.x_src if seams.x_src.size else None),
                     min_marks=opts.min_marks, min_cover_frac=opts.min_cover_frac,
-                    max_resid_px=opts.max_resid_px, unwrap_warn_frac=opts.unwrap_warn_frac,
+                    max_resid_px=opts.max_resid_px,
+                    resid_vs_uniform_margin_px=opts.resid_vs_uniform_margin_px,
+                    unwrap_warn_frac=opts.unwrap_warn_frac,
                     k_ref_override=opts.k_ref_override,
                     per_frame_refine=opts.per_frame_refine, noise_px=opts.noise_px)
             except LadderError as exc:
@@ -705,15 +907,19 @@ class _MarkPlacementMixin:
                 self.mark_error_ = str(exc)
                 logger.error("%s: MARK LADDER REFUSED -- %s", self.logging_prefix, exc)
                 return
-            st = [v for v in (info.get("straightness") or {}).values() if "rms_px" in v]
+            # only rows that PASSED the format-edge standoff carry the verdict; the
+            # rest are measured and reported but never veto (review M1)
+            worst, st, skipped = straightness_verdict(info.get("straightness"))
             if not st:
-                logger.warning("%s: no mark train carried enough marks to judge STRAIGHTNESS "
-                               "(%s) -- the y rectification is unchecked on this frame",
-                               self.logging_prefix,
-                               "; ".join(f"{k}: {v.get('verdict')}"
+                logger.warning("%s: no mark train is eligible to judge STRAIGHTNESS (%s) -- the y "
+                               "rectification is unchecked on this frame", self.logging_prefix,
+                               "; ".join(f"{k}: {v.get('gate_skip') or v.get('verdict')}"
                                          for k, v in (info.get("straightness") or {}).items())
                                or "no trains at all")
-            worst = max(st, key=lambda v: v["rms_px"]) if st else None
+            for v in skipped:
+                logger.info("%s: %s measured at %.1f px rms (%s) but not gating -- %s",
+                            self.logging_prefix, v.get("label"), v.get("rms_px", float("nan")),
+                            v.get("verdict"), v.get("gate_skip"))
             if worst and worst["verdict"] == "FAIL":
                 self.mark_error_ = (
                     f"the mark trains are NOT straight after rectification: {worst['label']} "
@@ -792,6 +998,31 @@ class _MarkPlacementMixin:
                               crop_offset=(0.0, crop_top),
                               output_size=(warp.canvas_width, out_h))
 
+    def _note_output_width(self) -> None:
+        """Judge a caller-supplied ``output_width`` against the mark canvas (review H1).
+
+        The canvas is DERIVED (tier x widen, :func:`mark_geometry.expected_canvas_width`)
+        so the parent's ``output_width`` knob cannot steer it -- but ``block_prep`` can
+        only leave ``OUTPUT_WIDTH`` unset in tier mode, so refusing every set value
+        would make mark mode unreachable from the other width modes.  A value that
+        EQUALS the derived canvas is consistent and accepted silently (it is the same
+        number, however it arrived); any other value is loudly ignored, with the
+        expected width printed so the launch line can be fixed.
+        """
+        ow = getattr(self, "output_width", None)
+        if not ow:
+            return
+        expected = int(self.mark_warp_.canvas_width)
+        if int(ow) == expected:
+            logger.info("%s: output_width=%d equals the derived mark canvas (tier x %.4f) -- "
+                        "consistent", self.logging_prefix, ow, self.mark_warp_.canvas_widen)
+            return
+        logger.warning("%s: output_width=%d is IGNORED under mark placement -- the canvas is "
+                       "DERIVED as tier x widen = %d so that cx = W/2 is the alpha = 0 column. "
+                       "Unset OUTPUT_WIDTH for mark restitution, or pass "
+                       "expected_canvas_width(tier) = %d", self.logging_prefix, ow,
+                       expected, expected)
+
     def _mark_keep_columns(self) -> tuple[int, int]:
         """Conservative kept-column range on the canvas, biased OUTWARD.
 
@@ -805,6 +1036,20 @@ class _MarkPlacementMixin:
         lo = float(warp.canvas_x_of_source(left)) - self.mark.exposure_pad_px
         hi = float(warp.canvas_x_of_source(right)) + self.mark.exposure_pad_px
         return (int(max(0, np.floor(lo))), int(min(warp.canvas_width, np.ceil(hi))))
+
+    def _mark_exposure_clip_px(self) -> tuple[float, float]:
+        """How far the EXPOSED film runs past each canvas edge, in canvas px.
+
+        The keep-column clamp above cannot distinguish "the outward pad ran off the
+        canvas" (harmless) from "real exposure did" (content lost).  This measures
+        the exposure itself, so a frame wider than ``canvas_widen`` allows is a
+        reported number rather than a silent trim (review LOW, 2026-08-30).
+        """
+        warp = self.mark_warp_
+        left, right = (float(v) for v in self._mark_detector().edges_)
+        x0 = float(warp.canvas_x_of_source(left))
+        x1 = float(warp.canvas_x_of_source(right))
+        return (max(0.0, -min(x0, x1)), max(0.0, max(x0, x1) - warp.canvas_width))
 
     def _apply_exposure_nodata(self, output_path: Path) -> None:
         from osgeo import gdal, gdal_array
@@ -827,6 +1072,7 @@ class _MarkPlacementMixin:
         band.FlushCache()
         ds.FlushCache()
         ds = None
+        self.mark_crop_applied_ = True
         logger.info("exposure crop: kept canvas columns [%d, %d) of %d (%.2f deg .. %.2f deg), "
                     "%d px of outward slack", lo, hi, self.mark_warp_.canvas_width,
                     float(self.mark_warp_.alpha_deg(lo)), float(self.mark_warp_.alpha_deg(hi)),
@@ -836,11 +1082,13 @@ class _MarkPlacementMixin:
     def transform(self, output_path) -> None:
         """Write the restituted image, then apply the conservative exposure crop."""
         super().transform(output_path)
+        self.mark_crop_applied_ = False
         try:
             self._apply_exposure_nodata(Path(output_path))
         except Exception as exc:                                  # noqa: BLE001
-            logger.error("exposure crop failed on %s (%r) -- the product carries film margin; "
-                         "REVIEW", output_path, exc)
+            logger.error("exposure crop FAILED on %s (%r): the product carries film margin and "
+                         "the QC record's keep_columns describe an INTENT this file does not "
+                         "carry (exposure_crop_applied=False) -- REVIEW", output_path, exc)
 
     def mark_qc(self) -> dict:
         """Per-frame mark record for the QC json and the restitution sheet."""
@@ -852,6 +1100,13 @@ class _MarkPlacementMixin:
         vd = self._mark_detector()
         left, right = (float(v) for v in vd.edges_)
         lo, hi = self._mark_keep_columns()
+        c0, c1 = self._mark_exposure_clip_px()
+        if c0 > 0.0 or c1 > 0.0:
+            logger.warning("%s: EXPOSURE CLIPPED -- the exposed film runs %.0f px past the left "
+                           "canvas edge and %.0f px past the right, on a canvas already widened "
+                           "%.4fx the tier. Real content is lost; raise canvas_widen for this "
+                           "block or rule on the frame", self.logging_prefix, c0, c1,
+                           w.canvas_widen)
         a0 = float(w.alpha_deg(w.canvas_x_of_source(left)))
         a1 = float(w.alpha_deg(w.canvas_x_of_source(right)))
         nominal = w.tier_width / w.px_per_deg
@@ -877,6 +1132,13 @@ class _MarkPlacementMixin:
             "canvas_centring_error_deg": float(w.alpha_deg(0.5 * (
                 w.canvas_x_of_source(left) + w.canvas_x_of_source(right)))),
             "keep_columns": [lo, hi], "canvas_cx": w.cx,
+            # keep_columns is an INTENT until transform() has run: None before it,
+            # False when the crop write failed and the delivered file still carries
+            # film margin outside [lo, hi) (review LOW, 2026-08-30)
+            "exposure_crop_applied": self.mark_crop_applied_,
+            # real exposure past the canvas edges -- CONTENT LOST, not just pad
+            "exposure_clipped_px": [round(c0, 1), round(c1, 1)],
+            "exposure_clipped": bool(c0 > 0.0 or c1 > 0.0),
             # the frame's fitted mark period against the DESIGN, with the scan pitch
             # taken out (source px are ~0.16 % larger than canvas px at 6.9887 um)
             "period_ratio_vs_design": float(
@@ -902,6 +1164,9 @@ class MarkStrategy(_MarkPlacementMixin, CollimationStrategy):
     mark: MarkOptions = field(default_factory=MarkOptions)
 
     def _mark_line_models(self) -> dict:
+        # the collimation lines -- and CollimationStrategy._compute_transformation
+        # builds its TPS from exactly these (collimation_strategy.py:1016-1017), so
+        # the strip is rectified against the line the PRODUCT is rectified against
         return {"top": self._results["top"].model, "bottom": self._results["bottom"].model}
 
     def _mark_detector(self):
@@ -909,6 +1174,21 @@ class MarkStrategy(_MarkPlacementMixin, CollimationStrategy):
 
     def _mark_anchor_is_film_referenced(self) -> bool:
         return True                 # the fitted collimation lines are printed on the film
+
+    def _mark_format_edge_offsets(self) -> dict[str, float]:
+        """Collimation line -> film-frame boundary, measured, not assumed ~1150 px.
+
+        ``PolyStrategy._results[side].model`` is the rupture-scan film-frame
+        boundary the collimation search is itself anchored on, so the separation is
+        already fitted on this raster and costs nothing to read.
+        """
+        try:
+            edges = {s: self.poly_strategy._results[s].model for s in ("top", "bottom")}
+        except (KeyError, AttributeError, RuntimeError) as exc:
+            logger.warning("%s: no fitted film-frame edge to stand off from (%r) -- the "
+                           "straightness gate runs without a standoff", self.logging_prefix, exc)
+            return {}
+        return self._mark_edge_offsets_between(self._mark_line_models(), edges)
 
     @property
     def is_failed(self) -> bool:
@@ -924,11 +1204,7 @@ class MarkStrategy(_MarkPlacementMixin, CollimationStrategy):
         if self.mark_warp_ is None:
             raise LadderError(f"no mark ladder for {self.raster_filepath_.name}: "
                               f"{self.mark_error_}")
-        if self.output_width:
-            logger.warning("%s: output_width=%d is IGNORED under mark placement -- the canvas is "
-                           "the nominal sector tier so that cx = W/2 is the alpha = 0 column "
-                           "(unset OUTPUT_WIDTH for mark restitution)",
-                           self.logging_prefix, self.output_width)
+        self._note_output_width()
         return self._compose_transformation(super()._compute_transformation())
 
 
@@ -937,39 +1213,83 @@ class MarkPolyStrategy(_MarkPlacementMixin, PolyStrategy):
     """Film-edge y rectification + mark-derived x placement, for the no-line missions.
 
     Mission 1205 (nepal ops251) carries no usable collimation lines (dshean ruling
-    2026-08-28), so the anchor is the FILM-FRAME BOUNDARY that ``PolyStrategy``'s
-    rupture scan already locks -- ``_results[side].model``, the outer film edge, not
-    the delivered crop.  That distinction is the whole finding: the fleet detector
-    anchored its band on the restitution crop extent (a fixed 21771-row window),
-    which lands ~1000 px inside the exposure on several nepal frames, and F050's
-    "marks" were mountains.  Re-anchored on the measured film edge the same frames
-    show clean printed labels ("251 050", "2-30", "02 APR") -- the 2026-08-30 18:00
-    overturn of the "1205 has no labels" null.
+    2026-08-28), so the anchor is a measured FILM feature rather than a fixed window.
+    That distinction is the whole finding: the fleet detector anchored its band on
+    the restitution crop extent (a fixed 21771-row window), which lands ~1000 px
+    inside the exposure on several nepal frames, and F050's "marks" were mountains.
+    Re-anchored on a measured film edge the same frames show clean printed labels
+    ("251 050", "2-30", "02 APR") -- the 2026-08-30 18:00 overturn of the "1205 has
+    no labels" null.
 
-    The band offsets are the one UNCALIBRATED piece: the ladder sits between the
-    film edge and where a collimation line would be, i.e. INWARD of this anchor
-    rather than outward, so the default searches a wide inward window and lets the
-    class/period gate find the train.  Tighten it from the first real 1205 run.
+    WHICH measured edge is not a free choice (review M3, 2026-08-30): it is
+    ``PolyStrategy._content_edge_model``, the line the DELIVERED TPS is built from,
+    because a straightness verdict about any other line is a verdict about geometry
+    the product does not carry.
+
+    The band offsets are the one UNCALIBRATED piece, and the anchor change moves
+    them: the ladder sits in the margin BETWEEN the content end and the film-frame
+    boundary, so from this anchor it is OUTWARD.  The default searches a wide
+    outward window and lets the class/period gate find the train, with the
+    film-margin gate refusing terrain and the format-edge standoff keeping edge
+    artifacts out of the straightness verdict.  Tighten it from the first real
+    1205 run -- dshean's "~500 px top / ~900 px bottom inward of the film edge"
+    reading was against the OUTER film-frame boundary and does not transfer
+    unconverted.
     """
 
-    #: ~500 px (top) / ~900 px (bottom) INWARD of the film edge -- dshean's own
-    #: reading of the ops251 margins, 2026-08-30.  Negative = inward in the outward
-    #: sign convention.  The wide fallback stays armed until this is confirmed on a
-    #: real 1205 run.
+    #: UNCALIBRATED, and now measured from a DIFFERENT line than dshean's 2026-08-30
+    #: reading was (see ``_mark_line_models``): the anchor is the CONTENT edge, and
+    #: the printed ladder lies in the margin OUTWARD of it, between the content end
+    #: and the film-frame boundary.  A wide window with the class/period gate finding
+    #: the train, and the wider fallback still armed, until a real 1205 run pins it.
     mark: MarkOptions = field(default_factory=lambda: MarkOptions(
-        band_dy_px=(-500.0, -900.0), band_half_px=150.0, band_fallback_half_px=400.0))
+        band_dy_px=(680.0, 680.0), band_half_px=400.0, band_fallback_half_px=700.0))
 
     def _mark_line_models(self) -> dict:
-        # PolyStrategy._process_side fits the FILM-FRAME boundary (the rupture scan
-        # the collimation search is itself anchored on), not the exposure edge and
-        # not the crop window -- which is exactly the margin anchor the marks need.
-        return {"top": self._results["top"].model, "bottom": self._results["bottom"].model}
+        """The DELIVERED y-warp's own anchor: ``PolyStrategy._content_edge_model``.
+
+        Review M3, 2026-08-30.  ``_results[side].model`` is the rupture-scan
+        FILM-FRAME boundary, which feeds strip placement and the collimation search;
+        the delivered TPS is built from ``_content_edge_model`` instead
+        (poly_strategy.py:278-293) -- the edge-oracle format edge when its verdict
+        passes, else the smooth content-end poly2.  The straightness gate exists to
+        validate the rectification the PRODUCT carries, so it has to rectify against
+        the line the product uses; anchoring on the other one would have measured a
+        curvature nothing downstream ever sees, and missed the one that matters.
+        """
+        out: dict = {}
+        for side in ("top", "bottom"):
+            try:
+                out[side] = self._content_edge_model(side)[0]
+            except Exception as exc:                              # noqa: BLE001 -- never silent
+                logger.warning("%s: the delivered %s content-edge model is unavailable (%r) -- "
+                               "falling back to the rupture-scan film-frame boundary, which is "
+                               "NOT the line the product is rectified against; the straightness "
+                               "verdict on this frame is about the wrong line",
+                               self.logging_prefix, side, exc)
+                out[side] = self._results[side].model
+        return out
 
     def _mark_detector(self):
         return self.vertical_detector
 
     def _mark_anchor_is_film_referenced(self) -> bool:
-        return True                 # the rupture scan locks the film-frame boundary
+        return True                 # the content edge is measured on the film itself
+
+    def _mark_format_edge_offsets(self) -> dict[str, float]:
+        """Content edge -> film-frame boundary, the outward end of the mark margin.
+
+        The anchor here is already the inner (content) end of the margin, so the
+        standoff to keep is at the OUTER end: the rupture-scan film-frame boundary,
+        where the edge artifacts live.
+        """
+        try:
+            edges = {s: self._results[s].model for s in ("top", "bottom")}
+        except (KeyError, AttributeError, RuntimeError) as exc:
+            logger.warning("%s: no fitted film-frame edge to stand off from (%r) -- the "
+                           "straightness gate runs without a standoff", self.logging_prefix, exc)
+            return {}
+        return self._mark_edge_offsets_between(self._mark_line_models(), edges)
 
     @property
     def is_failed(self) -> bool:
@@ -985,9 +1305,7 @@ class MarkPolyStrategy(_MarkPlacementMixin, PolyStrategy):
         if self.mark_warp_ is None:
             raise LadderError(f"no mark ladder for {self.raster_filepath_.name}: "
                               f"{self.mark_error_}")
-        if self.output_width:
-            logger.warning("%s: output_width=%d is IGNORED under mark placement (see MarkStrategy)",
-                           self.logging_prefix, self.output_width)
+        self._note_output_width()
         return self._compose_transformation(super()._compute_transformation())
 
 
@@ -1058,21 +1376,36 @@ def plot_mark_ladder(strategy, strip_cols: int = 2600):
     det = (strategy.mark_info_ or {}).get("detect", {})
     st = (strategy.mark_info_ or {}).get("straightness", {})
     allm = strategy.mark_marks_ or []
+
+    def _row_marks(sd, row):
+        """Marks of one row, INSIDE this frame's exposure window only (review M6).
+
+        The neighbour frame's ladder is excluded, not blended -- and that has to be
+        true of the figure, not only of the fit.  ``frame_extent_x`` is the same
+        window the fit bounded itself to.
+        """
+        ext = (det.get(sd) or {}).get("frame_extent_x")
+        mm = [m for m in allm if m.side == sd and m.row == row]
+        if ext:
+            mm = [m for m in mm if ext[0] <= m.x <= ext[1]]
+        return mm
+
     for sd in ("top", "bottom"):
         for cls, key, col in (("ladder", "ladder_row", "tab:blue"),
                               ("dense", "dense_row", "tab:grey")):
             row = (det.get(sd) or {}).get(key)
             if row is None:
                 continue
-            mm = [m for m in allm if m.side == sd and m.row == row]
+            mm = _row_marks(sd, row)
             if len(mm) < 3:
                 continue
             xx = np.array([m.x for m in mm])
             yy = np.array([m.dy for m in mm])
             v = st.get(f"{sd}_{cls}", {})
+            gate = "" if v.get("gates", True) else ", not gating"
             ax.plot(xx, yy - np.median(yy), ".", ms=2.5, color=col, alpha=0.8,
                     label=f"{sd} {cls} (n={len(mm)}, {v.get('rms_px', float('nan')):.1f} px rms, "
-                          f"{v.get('verdict', '?')})")
+                          f"{v.get('verdict', '?')}{gate})")
     ax.axhline(0.0, color="k", lw=0.6)
     for y in (-opts.straightness_warn_px, opts.straightness_warn_px):
         ax.axhline(y, color="tab:orange", lw=0.6, ls=":")
@@ -1093,7 +1426,7 @@ def plot_mark_ladder(strategy, strip_cols: int = 2600):
             row = (det.get(sd) or {}).get(key)
             if row is None:
                 continue
-            xx = np.sort(np.array([m.x for m in allm if m.side == sd and m.row == row]))
+            xx = np.sort(np.array([m.x for m in _row_marks(sd, row)]))
             if xx.size < 3:
                 continue
             d = np.diff(xx)

@@ -27,6 +27,14 @@ class MixedStrategy(RestitutionStrategy):
     All sub-strategy instances share the same ``PolyStrategy`` (and transitively the same
     ``VerticalDetector``) so common fitting work is done only once. If every strategy
     fails, ``is_failed`` returns True and ``transform`` raises.
+
+    A strategy whose class sets ``cascade_on_failure = False`` (the mark strategies do;
+    review H2, 2026-08-30) is TERMINAL: when it fails, the cascade STOPS instead of
+    falling through to the next strategy, and the whole MixedStrategy reports failure.
+    Falling through would deliver a fallback product at a DIFFERENT canvas width under a
+    name the caller may accept -- a mark refusal silently becoming a collimation product
+    is exactly the failure mode the loud-refusal design exists to prevent. The refusing
+    strategy is kept on ``terminal_failure_`` so the caller can report WHY.
     """
 
     strategies: list[RestitutionStrategy] = field(
@@ -42,6 +50,7 @@ class MixedStrategy(RestitutionStrategy):
             if hasattr(strat, "scan_pitch_um") and self.scan_pitch_um is not None:
                 strat.scan_pitch_um = self.scan_pitch_um
         self.__selected_strategy_: RestitutionStrategy | None = None
+        self.terminal_failure_: RestitutionStrategy | None = None
 
         for i, strat in enumerate(self.strategies):
             if hasattr(strat, "vertical_detector"):
@@ -94,6 +103,9 @@ class MixedStrategy(RestitutionStrategy):
     def _fit(self, raster_filepath: Path) -> "MixedStrategy":
         """Fit the shared VerticalDetector once, then try each strategy in order."""
         self.__selected_strategy_ = None
+        #: the strategy that failed AND declared itself terminal (``cascade_on_failure
+        #: = False``), stopping the cascade -- None on success or an ordinary failure
+        self.terminal_failure_: RestitutionStrategy | None = None
 
         vd = self.poly_strategy.vertical_detector
         if not vd.is_fitted or raster_filepath != vd.raster_filepath_:
@@ -113,9 +125,26 @@ class MixedStrategy(RestitutionStrategy):
                     strat.fit(raster_filepath)
             except Exception:
                 logger.warning("%s failed for %s", type(strat).__name__, raster_filepath.name, exc_info=True)
+                if not getattr(strat, "cascade_on_failure", True):
+                    self.terminal_failure_ = strat
+                    logger.error(
+                        "%s REFUSED %s and is terminal (cascade_on_failure=False) -- NOT falling "
+                        "through to a fallback strategy: a silent fallback would deliver a product "
+                        "at a different canvas width (review H2, 2026-08-30)",
+                        type(strat).__name__, raster_filepath.name)
+                    break
                 continue
             if not strat.is_failed:
                 self.__selected_strategy_ = strat
+                break
+            if not getattr(strat, "cascade_on_failure", True):
+                self.terminal_failure_ = strat
+                logger.error(
+                    "%s REFUSED %s (%s) and is terminal (cascade_on_failure=False) -- NOT falling "
+                    "through to a fallback strategy: a silent fallback would deliver a product at "
+                    "a different canvas width (review H2, 2026-08-30)",
+                    type(strat).__name__, raster_filepath.name,
+                    getattr(strat, "mark_error_", None) or "see the strategy's own log")
                 break
 
         return self

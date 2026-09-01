@@ -38,10 +38,13 @@ from hipp.kh9pc.restitution.mark_geometry import (                              
 )
 from hipp.kh9pc.restitution.mark_strategy import (                              # noqa: E402
     MarkOptions,
+    band_rows_for_side,
     camera_from_filepath,
     detect_angle_ladder,
+    gate_standoff_verdict,
     rectified_rail_strip,
     seam_positions_from_provenance,
+    straightness_verdict,
     strip_is_film_margin,
 )
 from hipp.kh9pc.restitution.timing_marks import (                               # noqa: E402
@@ -187,6 +190,13 @@ def disk_frame(tmp_path_factory):
 def disk_frame_a(tmp_path_factory):
     p = tmp_path_factory.mktemp("diska") / "D3C1210-200323A002.tif"  # the mirrored sensor
     return (p, *build_rail_image(p, camera="A"))
+
+
+@pytest.fixture(scope="module")
+def neighbour_frame(tmp_path_factory):
+    """A scan carrying part of the NEXT frame's rail (ops327 A003 class)."""
+    p = tmp_path_factory.mktemp("nb") / "D3C1210-200323F020.tif"
+    return (p, *build_rail_image(p, neighbour_phase=0.37, decoys=False))
 
 
 @pytest.fixture(scope="module")
@@ -420,14 +430,13 @@ def test_a_dense_train_alone_is_not_promoted_to_the_angle_ladder(tmp_path):
 
 
 # ------------------------------------------------- the next frame's ladder
-def test_a_neighbour_frames_ladder_is_excluded_not_blended(tmp_path):
+def test_a_neighbour_frames_ladder_is_excluded_not_blended(neighbour_frame):
     """A scan can carry part of the next frame, rail marks included (ops327 A003).
 
     Its ladder has the SAME period and its OWN phase, so an unbounded fit could lock
     onto it or blend the two.  The fit must take this frame's, and say so.
     """
-    p = tmp_path / "D3C1210-200323F020.tif"
-    kk, alpha, xs = build_rail_image(p, neighbour_phase=0.37, decoys=False)
+    p, kk, alpha, xs = neighbour_frame
     spec = KH9ImageSpec.from_raster_filepath(p)
     trains, marks, chosen, info = detect_angle_ladder(p, anchors(), spec, options())
     assert trains, info
@@ -453,3 +462,212 @@ def test_the_straightness_check_reports_a_constant_row(disk_frame):
         if "rms_px" in v:
             assert v["verdict"] == "OK", (k, v)
             assert v["rms_px"] < 4.0, (k, v)
+
+
+def test_the_neighbour_ladder_never_carries_this_frames_row_ids(neighbour_frame):
+    """Review M6: "excluded, not blended" has to be true of the FIGURE too.
+
+    The neighbour scan re-clusters the out-of-window marks, which hands out row ids
+    0, 1, ... -- the SAME ids this frame's ladder and dense rows carry.  Every panel
+    that selects marks by row id (straightness, spacing) then plots the next frame's
+    ladder as if it were this frame's.  The scan must work on copies.
+    """
+    p, kk, alpha, xs = neighbour_frame
+    spec = KH9ImageSpec.from_raster_filepath(p)
+    trains, marks, chosen, info = detect_angle_ladder(p, anchors(), spec, options())
+    assert trains, info
+    for side, d in info["detect"].items():
+        assert d.get("outside_frame_extent", 0) > 0, (side, d)   # the fixture is not vacuous
+        lo, hi = d["frame_extent_x"]
+        for key in ("ladder_row", "dense_row"):
+            row = d.get(key)
+            if row is None:
+                continue
+            leaked = [m.x for m in marks if m.side == side and m.row == row
+                      and not (lo <= m.x <= hi)]
+            assert not leaked, f"{side}/{key}: {len(leaked)} neighbour marks carry this row id"
+
+
+# ------------------------------------------ the wide class band + the format edge
+# Review H4/M1 (2026-08-30).  Rail layout in OUTWARD px from the anchor line, at the
+# measured class-band scale: the angle ladder and the DENSE timing train both inside
+# the 380-980 px band, and an edge-artifact pseudo-train hugging the fitted format
+# edge, curving with IT rather than with the anchor.
+WB_W, WB_H = 60000, 3000
+WB_LINE_Y, WB_TILT = 800.0, 0.001
+WB_LADDER_DY, WB_DENSE_DY = 560.0, 780.0
+# The pseudo-train must be DETECTABLE to be dangerous: fully inside the 380-980 read
+# band (rows plus the ~30 px glyph half-height), inside the 150 px standoff zone of
+# the 1000 px edge (>= 850 outward), and with a sagitta under the 45 px row-merge
+# radius of ``cluster_rows`` so the curve stays ONE row.  The first cut of this
+# fixture (dy 930, sag 70) violated all three quietly: the curve ran off the band,
+# only 5 tail marks were detected, and the blind case had nothing to fail on.
+WB_EDGE_DY, WB_PSEUDO_DY = 1000.0, 870.0     # pseudo 130 px inside the edge, gated
+WB_SAG = 40.0                                # the edge's curvature, in px (one row)
+WB_DENSE_P, WB_LADDER_P = 1300.0, 3808.0     # dense class / 1 deg at SCALE
+WB_EDGES = (1000, 59000)
+
+
+def wb_curve(x):
+    """The format edge's deviation from the anchor line: zero at both ends."""
+    u = (np.asarray(x, float) - 0.5 * WB_W) / (0.5 * WB_W)
+    return WB_SAG * (1.0 - u ** 2)
+
+
+def build_wide_band_image(path, good_dense=True, nodata_after=None):
+    """One bottom rail carrying a ladder, a dense train and an edge-adjacent decoy."""
+    rng = np.random.default_rng(7)
+    px_per_mm = 1000.0 / PITCH[0]
+    glyph = make_wheel_template(0.41 * px_per_mm, 0.055 * px_per_mm)
+    lo = int(WB_LINE_Y - 100)
+    hi = int(WB_LINE_Y + WB_TILT * WB_W + WB_EDGE_DY + 200)
+    with rasterio.open(path, "w", driver="GTiff", width=WB_W, height=WB_H, count=1,
+                       dtype="uint8", tiled=True, blockxsize=512, blockysize=512,
+                       compress="LZW", BIGTIFF="IF_SAFER") as dst:
+        for y0 in range(0, WB_H, 256):
+            rows = min(256, WB_H - y0)
+            dst.write(np.full((rows, WB_W), BG, np.uint8), 1,
+                      window=rasterio.windows.Window(0, y0, WB_W, rows))
+        strip = np.clip(np.full((hi - lo, WB_W), BG, np.int16)
+                        + rng.integers(-3, 4, (hi - lo, WB_W), dtype=np.int16),
+                        0, 255).astype(np.uint8)
+        for x in np.arange(4000.0, WB_W - 4000.0, WB_LADDER_P):          # the angle ladder
+            _stamp(strip, glyph, x, line_y(x, WB_LINE_Y) + WB_LADDER_DY - lo)
+        if good_dense:                                                   # the real probe
+            for x in np.arange(6000.0, WB_W - 6000.0, WB_DENSE_P):
+                _stamp(strip, glyph, x, line_y(x, WB_LINE_Y) + WB_DENSE_DY - lo)
+        for x in np.arange(1500.0, WB_W - 1500.0, WB_DENSE_P):           # the edge artifact
+            _stamp(strip, glyph, x,
+                   line_y(x, WB_LINE_Y) + WB_PSEUDO_DY + float(wb_curve(x)) - lo)
+        if nodata_after is not None:                                     # film runs out
+            strip[:, int(nodata_after):] = 0
+        dst.write(strip, 1, window=rasterio.windows.Window(0, lo, WB_W, hi - lo))
+
+
+def wb_spec():
+    """Mission 1216 as a SPEC, not as a raster.
+
+    ``detect_angle_ladder`` reads only the glyph type and the printed pattern per
+    rail from it, so the fixture does not have to be a full-tier-width raster --
+    which keeps these cases at 60 k px instead of 114 k.
+    """
+    return KH9ImageSpec(expected_size=(TIER, 21771), collimation_line=True,
+                        fiducial_type="wagon_wheel",
+                        top_fiducial_patterns=("segmented_mid", "serialized_time_word"),
+                        bottom_fiducial_patterns=("regulare_mid", "regular_dense"))
+
+
+def wb_anchors():
+    return RailAnchors(lambda x: line_y(x, WB_LINE_Y - 1e6),      # top rail unused
+                       lambda x: line_y(x, WB_LINE_Y), WB_EDGES, PITCH, "wide-band synthetic")
+
+
+def wb_options(**kw):
+    """DEFAULTS for the band -- the point of the test is that they cover the class."""
+    o = MarkOptions(sides=("bottom",))
+    for k, v in kw.items():
+        setattr(o, k, v)
+    return o
+
+
+@pytest.fixture(scope="module")
+def wide_band_frame(tmp_path_factory):
+    p = tmp_path_factory.mktemp("wb") / "D3C1216-200533F021.tif"       # 1216: wheels, 1 deg
+    build_wide_band_image(p)
+    return p
+
+
+@pytest.fixture(scope="module")
+def wide_band_frame_no_good_dense(tmp_path_factory):
+    p = tmp_path_factory.mktemp("wbn") / "D3C1216-200533F022.tif"
+    build_wide_band_image(p, good_dense=False)
+    return p
+
+
+@pytest.fixture(scope="module")
+def wide_band_frame_nodata_tail(tmp_path_factory):
+    p = tmp_path_factory.mktemp("wbt") / "D3C1216-200533F023.tif"
+    build_wide_band_image(p, nodata_after=3 * 16384)                   # the 4th block is nodata
+    return p
+
+
+def test_the_default_band_is_the_measured_class_band():
+    """380-980 px outward on both rails, wide enough to hold BOTH trains."""
+    o = MarkOptions()
+    for side in ("top", "bottom"):
+        inner, outer = band_rows_for_side(side, o)
+        assert (inner, outer) == (380.0, 980.0), side
+        assert inner < WB_LADDER_DY < WB_DENSE_DY < WB_PSEUDO_DY < outer
+    # ... and it stops short of the ~1150 px film-frame boundary the marks sit inside
+    assert outer + o.band_fallback_half_px - o.band_half_px < 1150.0
+
+
+def test_the_dense_train_inside_the_wide_band_is_found_and_used(wide_band_frame):
+    """H4: the old +-60 px window straddled the two rows and missed the dense train,
+    which is the only probe with enough samples to judge straightness at all."""
+    spec = wb_spec()
+    trains, marks, chosen, info = detect_angle_ladder(
+        wide_band_frame, wb_anchors(), spec, wb_options(),
+        edge_offsets={"bottom": WB_EDGE_DY})
+    d = info["detect"]["bottom"]
+    assert d.get("ladder_row") is not None, info
+    assert d.get("dense_row") is not None, info
+    st = info["straightness"]
+    dense = st["bottom_dense"]
+    assert dense["n"] >= 30, dense                       # hundreds where the ladder has ~15
+    # the STRAIGHT dense train won the selection, not the curved edge-adjacent one
+    assert abs(dense["dy_median"] - WB_DENSE_DY) < 40.0, dense
+    assert dense["gates"] is True and dense["verdict"] == "OK", dense
+    assert dense["rms_px"] < 4.0, dense
+
+
+def test_an_edge_adjacent_pseudo_train_never_carries_the_straightness_verdict(
+        wide_band_frame_no_good_dense):
+    """M1: the pseudo-train follows the format EDGE, so on a strip rectified against
+    the ANCHOR it curves -- a curvature that is neither a rectification error nor a
+    defect of this frame.  Gating on it would veto a good frame."""
+    spec = wb_spec()
+    # low enough that the ~12 px rms the 40 px sagitta leaves about a line is an
+    # unmistakable FAIL, high enough that the straight ladder (~0.5 px) is far from it
+    opts = wb_options(straightness_fail_px=8.0)
+
+    # (a) WITHOUT the standoff the pseudo-train is the verdict, and it FAILS the frame
+    _, _, _, blind = detect_angle_ladder(wide_band_frame_no_good_dense, wb_anchors(), spec,
+                                         opts, edge_offsets=None)
+    worst, gating, skipped = straightness_verdict(blind["straightness"])
+    assert not skipped
+    assert worst is not None and worst["rms_px"] > opts.straightness_fail_px, worst
+    assert worst["verdict"] == "FAIL", worst
+    assert abs(worst["dy_median"] - (WB_PSEUDO_DY + 2.0 * WB_SAG / 3.0)) < 40.0, worst
+
+    # (b) WITH it the same row is still MEASURED -- evidence is never dropped -- but
+    #     it does not gate, and the frame's verdict comes from the ladder
+    _, _, _, seeing = detect_angle_ladder(wide_band_frame_no_good_dense, wb_anchors(), spec,
+                                          opts, edge_offsets={"bottom": WB_EDGE_DY})
+    worst, gating, skipped = straightness_verdict(seeing["straightness"])
+    assert len(skipped) == 1, seeing["straightness"]
+    assert skipped[0]["rms_px"] > opts.straightness_fail_px      # the same bad number
+    assert "standoff" in skipped[0]["gate_skip"]
+    assert worst is not None and worst["verdict"] == "OK", worst
+    assert worst["label"].endswith("deg ladder"), worst
+    assert not gate_standoff_verdict("bottom", WB_PSEUDO_DY, {"bottom": WB_EDGE_DY}, opts)[0]
+
+
+def test_a_nodata_trailing_block_does_not_veto_the_rail(wide_band_frame_nodata_tail):
+    """M2: ANDing margin_ok over every block let ONE all-nodata block kill a rail.
+
+    A block with no readable pixels is not evidence of terrain -- it is the end of
+    the film.  It is counted apart and does not vote.
+    """
+    spec = wb_spec()
+    trains, marks, chosen, info = detect_angle_ladder(
+        wide_band_frame_nodata_tail, wb_anchors(), spec, wb_options(),
+        edge_offsets={"bottom": WB_EDGE_DY})
+    d = info["detect"]["bottom"]
+    votes = d["margin_votes"]
+    assert votes["unreadable"] >= 1, votes            # the fixture really is blank there
+    assert votes["content"] == 0 and votes["film"] >= 2, votes
+    assert d["margin_ok"] is True, d
+    assert trains, info
+    # and the AND would have said otherwise
+    assert votes["film"] + votes["content"] < d["blocks"]

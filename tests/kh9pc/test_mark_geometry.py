@@ -21,11 +21,13 @@ import pytest
 
 from hipp.kh9pc.restitution.mark_geometry import (
     CAMERA_SIGN,
+    DEFAULT_CANVAS_WIDEN,
     DISTORTION_SHAPE,
     LadderError,
     MarkTrain,
     canvas_px_per_deg,
     deg_per_mark_from_pattern,
+    expected_canvas_width,
     fit_mark_warp,
     load_distortion_shape,
     seam_step_qa,
@@ -91,6 +93,27 @@ def test_unknown_canvas_width_is_refused():
         tier_degrees(345000)
 
 
+def test_expected_canvas_width_is_the_single_width_contract():
+    """Review H1 (2026-08-30): the spec gate and kh9_01 must call THIS function.
+
+    The block_prep spec gate compares the delivered width by EXACT equality; an
+    independent re-derivation of ``tier * 1.015`` that rounds differently would
+    quarantine every mark frame on a 1 px mismatch.  So the number the strategy
+    delivers and the number the gate expects must come from one implementation --
+    asserted here against the fitted model itself, default and strict-tier arms.
+    """
+    train, kk, x = make_ladder()
+    m = fit_mark_warp([train], W90, 0.0, float(truth_x(0.0)))
+    assert m.canvas_width == expected_canvas_width(W90) == expected_canvas_width(W90, None)
+    strict = fit_mark_warp([train], W90, 0.0, float(truth_x(0.0)), canvas_widen=1.0)
+    assert strict.canvas_width == expected_canvas_width(W90, 1.0) == W90
+    for tier in (W90, W30):
+        assert expected_canvas_width(tier) == int(round(tier * DEFAULT_CANVAS_WIDEN))
+    # a widen below 1 would clip the nominal sweep itself -- refused, never delivered
+    with pytest.raises(LadderError, match="factor >= 1"):
+        expected_canvas_width(W90, 0.98)
+
+
 def test_the_calibrated_shape_has_the_measured_amplitude_and_mirror():
     """~-160 px at the sweep edge in the camera frame; mirrored between F and A."""
     a = 45.0
@@ -144,9 +167,52 @@ def test_the_A_shape_is_not_interchangeable_with_the_F_shape():
     assert good.resid_rms_px < 1e-6
     with pytest.raises(LadderError, match="not a clean"):
         fit_mark_warp([train], W90, 0.0, float(truth_x(0.0, "A")), camera="F")
+    # both gates deliberately loosened, to MEASURE what the mix-up costs
     loose = fit_mark_warp([train], W90, 0.0, float(truth_x(0.0, "A")), camera="F",
-                          max_resid_px=1e9)
+                          max_resid_px=1e9, resid_vs_uniform_margin_px=1e9)
     assert loose.resid_rms_px > 2.0 * good.resid_rms_uniform_px
+
+
+@pytest.mark.parametrize("tier,kk_lo,kk_hi,x0,sweep", [(W90, -9, 8, X0, "90 deg"),
+                                                       (W30, -3, 3, 57041.0, "30 deg")])
+@pytest.mark.parametrize("truth_cam,fit_cam", [("A", "F"), ("F", "A")])
+def test_the_wrong_sensor_shape_is_refused_at_every_sweep(tier, kk_lo, kk_hi, x0, sweep,
+                                                          truth_cam, fit_cam):
+    """The absolute residual ceiling is sweep-blind; the uniform-grid gate is not.
+
+    Pinned from the 2026-08-30 review: the wrong sensor's shape leaves ~91 px rms
+    over a 90 deg sweep -- caught by the 40 px ceiling -- but only ~15 px over a
+    30 deg one, which SLIPS THROUGH the ceiling while being twice as wrong as
+    removing no shape at all (uniform grid 7.4 px).  A calibrated shape that does
+    not beat a plain uniform grid has not earned its place.
+    """
+    train, kk, x = make_ladder(kk_lo=kk_lo, kk_hi=kk_hi, camera=truth_cam, x0=x0)
+    prior = float(truth_x(0.0, truth_cam, x0=x0))
+    # the RIGHT shape is recovered exactly at this sweep -- the fixture is not the problem
+    good = fit_mark_warp([train], tier, 0.0, prior, camera=truth_cam)
+    assert good.resid_rms_px < 1e-6, sweep
+    # ... and the wrong one is refused, whichever gate catches it
+    with pytest.raises(LadderError, match="not a clean|WORSE than a plain uniform grid"):
+        fit_mark_warp([train], tier, 0.0, prior, camera=fit_cam)
+    # the relative gate ALONE must be enough: with the ceiling switched off, the
+    # 30 deg case (which the ceiling cannot see) is still refused
+    with pytest.raises(LadderError, match="WORSE than a plain uniform grid"):
+        fit_mark_warp([train], tier, 0.0, prior, camera=fit_cam, max_resid_px=1e9)
+
+
+def test_the_uniform_grid_gate_does_not_refuse_a_frame_with_negligible_distortion():
+    """A short, noisy frame where the shape is genuinely small must still pass.
+
+    The gate compares two residuals that are both at the measurement noise floor
+    there, so it carries a ``noise_px`` margin; without it the gate would refuse
+    frames on sampling noise alone.
+    """
+    for seed in range(8):
+        train, kk, x = make_ladder(kk_lo=-2, kk_hi=2, deg_per_mark=1.0, noise=NOISE_FLOOR,
+                                   seed=seed)
+        m = fit_mark_warp([train], W30, 0.0, float(truth_x(0.0)), min_cover_frac=0.0)
+        # the shape does almost nothing over +-2 deg: the two residuals are twins
+        assert abs(m.resid_rms_px - m.resid_rms_uniform_px) < NOISE_FLOOR, (seed, m.notes)
 
 
 def test_a_seven_mark_thirty_degree_frame_still_solves():
@@ -305,9 +371,17 @@ def test_per_frame_refinement_declines_on_a_frame_that_does_not_need_it():
 
 
 def test_per_frame_refinement_applies_only_when_earned():
-    """A frame with a genuine extra quadratic and enough marks gets the escape."""
-    train, kk, x = make_ladder(kk_lo=-44, kk_hi=44, deg_per_mark=1.0, extra_quad=0.05)
-    prior = float(truth_x(0.0, extra_quad=0.05))
+    """A frame with a genuine extra quadratic and enough marks gets the escape.
+
+    ``extra_quad`` is 0.03 px/deg^2 -- a per-frame deviation of 17.7 px rms, five
+    times the fleet's 3.5 px scatter about the shared shape but still SMALLER than
+    the shared shape itself (which leaves 27.1 px when removed).  That is the
+    regime the escape is for; a per-frame term larger than the shared shape means
+    the shared shape does not belong on the frame at all, and the uniform-grid gate
+    refuses it (review H3, 2026-08-30).
+    """
+    train, kk, x = make_ladder(kk_lo=-44, kk_hi=44, deg_per_mark=1.0, extra_quad=0.03)
+    prior = float(truth_x(0.0, extra_quad=0.03))
     off = fit_mark_warp([train], W90, 0.0, prior)
     on = fit_mark_warp([train], W90, 0.0, prior, per_frame_refine="auto")
     assert off.refine == (0.0, 0.0, 0.0)
@@ -353,8 +427,10 @@ def test_an_unknown_camera_is_refused():
 def test_a_shape_that_folds_the_canvas_is_refused():
     train, kk, x = make_ladder()
     huge = {"F": (-500.0, 0.0, 0.0)}          # 500 px/deg^2 beats the 3808 px/deg scale
-    with pytest.raises(LadderError, match="monotonic|not a clean"):
-        fit_mark_warp([train], W90, 0.0, float(truth_x(0.0)), shape=huge, max_resid_px=1e9)
+    # both residual gates off, so the FOLD is what refuses this one
+    with pytest.raises(LadderError, match="monotonic"):
+        fit_mark_warp([train], W90, 0.0, float(truth_x(0.0)), shape=huge, max_resid_px=1e9,
+                      resid_vs_uniform_margin_px=1e9)
 
 
 def test_a_missing_sensor_in_the_shape_table_is_refused():

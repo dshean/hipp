@@ -164,14 +164,32 @@ def tier_degrees(canvas_width_px: int) -> float:
             f"canvas width {canvas_width_px} is not a sector tier {IMAGE_WIDTHS_PX}") from exc
 
 
+def expected_canvas_width(tier_width_px: int, canvas_widen: float | None = None) -> int:
+    """THE delivered mark-canvas width for a sector tier: ``round(tier * widen)``.
+
+    The single width contract (review H1, 2026-08-30): the strategy sizes its canvas
+    with this function (via :func:`fit_mark_warp`), so the ``block_prep`` spec gate
+    and kh9_01's identity-dims check must call IT rather than re-deriving
+    ``tier * 1.015`` -- an independent re-derivation that rounds differently would
+    quarantine every mark frame on a 1 px mismatch.  ``None`` means
+    ``DEFAULT_CANVAS_WIDEN``; pass ``1.0`` for the strict-tier A/B arm, whose width
+    is exactly the tier.
+    """
+    widen = DEFAULT_CANVAS_WIDEN if canvas_widen is None else float(canvas_widen)
+    if not np.isfinite(widen) or widen < 1.0:
+        raise LadderError(f"canvas_widen {widen!r} is not a finite factor >= 1 -- a canvas "
+                          "narrower than the tier would clip the nominal sweep itself")
+    return int(round(int(tier_width_px) * widen))
+
+
 def canvas_px_per_deg(canvas_width_px: int, sweep_deg: float | None = None) -> float:
     """Canvas columns per degree of scan angle.
 
     Derived from the CANVAS, not from the printed mark pitch, so the canvas edges
     sit at exactly +-sweep/2 -- which is what ``cam_gen`` assumes when it pins the
     USGS footprint corners at the image corners (cam_gen.cc:660-669).  The two
-    canonical constants agree to 3e-5 (SPARSE_SPACING/5 = 3802.8 vs 342247/90 =
-    3802.744 px/deg), so the choice costs 0.3 px on a mark period.
+    canonical constants agree to 1.5e-5 (SPARSE_SPACING/5 = 3802.800 vs 342247/90
+    = 3802.744 px/deg), so the choice costs 0.28 px on a 19014 px mark period.
 
     ``sweep_deg`` overrides the nominal tier width in degrees.  The marks measure
     the EXPOSED sweep at 90.11-90.19 deg (fleet median 2026-08-30) rather than
@@ -256,6 +274,10 @@ class MarkWarpModel:
     unwrap_phase: float = float("nan")
     unwrap_prior_deg: float = float("nan")
     unwrap_half_ambiguity_deg: float = float("nan")
+    #: machine-readable twin of the UNWRAP_MARGINAL note: True when the fitted
+    #: phase sat far enough from a slot that the placement may be one mark out.
+    #: A consumer must not have to grep ``notes`` for it (review LOW, 2026-08-30).
+    unwrap_marginal: bool = False
     sides_used: tuple[str, ...] = ()
     cover_frac: float = float("nan")
     alpha_span_deg: tuple[float, float] = (float("nan"), float("nan"))
@@ -401,6 +423,7 @@ class MarkWarpModel:
             "cover_frac": self.cover_frac, "alpha_span_deg": list(self.alpha_span_deg),
             "unwrap_phase": self.unwrap_phase, "unwrap_prior_deg": self.unwrap_prior_deg,
             "unwrap_half_ambiguity_deg": self.unwrap_half_ambiguity_deg,
+            "unwrap_marginal": bool(self.unwrap_marginal),
             "sides_used": list(self.sides_used), "seam_qa": self.seam_qa,
             "notes": list(self.notes),
         }
@@ -449,6 +472,34 @@ def seam_step_qa(model: MarkWarpModel, k, x, seam_x_src, *, min_marks_per_sectio
     return out
 
 
+def _robust_line(k, x, robust_iters: int = 6, clip_sigma: float = 4.0):
+    """MAD-clipped least squares of ``x ~ p0*k + p1``; returns ``(p0, p1)``.
+
+    The reference train's period/phase line is load-bearing three times over --
+    it aligns the second rail onto the first's index, it converts the prior
+    column into a ladder index for the unwrap, and it scales the coverage gate --
+    so a plain ``polyfit`` lets one levered mark (a text hit, a start-of-frame
+    glyph the guard zone did not reach) move the whole frame's placement by a
+    mark period.  Clipping is the same MAD rule the phase/period fit uses.
+    """
+    k = np.asarray(k, float)
+    x = np.asarray(x, float)
+    A = np.column_stack([k, np.ones_like(k)])
+    keep = np.ones(k.size, bool)
+    sol = np.polyfit(k, x, 1)
+    for _ in range(max(1, robust_iters)):
+        sol, *_ = np.linalg.lstsq(A[keep], x[keep], rcond=None)
+        r = x - A @ sol
+        med = np.median(r[keep])
+        mad = 1.4826 * np.median(np.abs(r[keep] - med))
+        new = np.abs(r - med) <= max(clip_sigma * mad, 3.0)
+        if new.sum() < 3 or np.array_equal(new, keep):
+            break
+        keep = new
+    sol, *_ = np.linalg.lstsq(A[keep], x[keep], rcond=None)
+    return float(sol[0]), float(sol[1])
+
+
 def _fit_phase_and_period(alpha, x, shape_px, robust_iters, clip_sigma):
     """Least squares of ``x ~ x0 + scale*alpha + shape(alpha)`` with MAD clipping."""
     y = np.asarray(x, float) - np.asarray(shape_px, float)
@@ -481,6 +532,7 @@ def fit_mark_warp(
     min_marks: int = 5,
     min_cover_frac: float = 0.3,
     max_resid_px: float = 40.0,
+    resid_vs_uniform_margin_px: float | None = None,
     unwrap_warn_frac: float = 0.35,
     k_ref_override: float | None = None,
     per_frame_refine: str = "off",
@@ -508,6 +560,20 @@ def fit_mark_warp(
         angular scale (``px_per_deg``); the delivered canvas is this widened by
         ``canvas_widen``, symmetrically, so ``cx = canvas_width / 2`` is still
         exactly alpha = 0.
+    max_resid_px, resid_vs_uniform_margin_px:
+        The two residual gates.  ``max_resid_px`` is the ABSOLUTE ceiling and is
+        sweep-blind: a wrong-sensor shape leaves 107 px rms over a 90 deg sweep but
+        only ~12 px over a 30 deg one, so on the short tiers it passes a 40 px
+        ceiling while still being twice as wrong as removing no shape at all.  The
+        RELATIVE gate closes that: the calibrated shape has to EARN its place, so a
+        fit is refused when its residual exceeds what a plain uniform grid leaves
+        (``resid_rms_uniform_px``, already computed) by more than
+        ``resid_vs_uniform_margin_px`` -- ``None`` means ``noise_px``, which keeps a
+        frame whose distortion is genuinely negligible (both residuals at the noise
+        floor, their difference sampling noise) out of the refusal.  Judged on the
+        SHARED-shape residual, before any ``per_frame_refine``: a free quadratic can
+        absorb a wrong shape, and the question this gate asks is whether the shared
+        shape belongs on this frame.
     canvas_widen:
         How much wider than the nominal sweep the delivered canvas is.  The film is
         exposed slightly BEYOND the nominal sector -- the marks measure the exposed
@@ -538,9 +604,10 @@ def fit_mark_warp(
     Raises
     ------
     LadderError
-        Too few marks, too little sweep coverage, a residual above ``max_resid_px``,
-        a folded warp, or trains that cannot be reconciled.  Refusing is the ruling:
-        a silently degraded x geometry is worse than no product.
+        Too few marks, too little sweep coverage, a residual above ``max_resid_px``
+        or above the uniform-grid residual it is supposed to beat, a folded warp, or
+        trains that cannot be reconciled.  Refusing is the ruling: a silently
+        degraded x geometry is worse than no product.
     """
     trains = [t for t in trains if len(t.k) >= 3]
     if not trains:
@@ -554,7 +621,7 @@ def fit_mark_warp(
 
     tier_width = int(tier_width)
     px_per_deg = canvas_px_per_deg(tier_width, sweep_deg)
-    canvas_width = int(round(tier_width * float(canvas_widen)))
+    canvas_width = expected_canvas_width(tier_width, canvas_widen)   # THE width contract (H1)
     period_canvas = deg_per_mark * px_per_deg
     table = DISTORTION_SHAPE if shape is None else shape
     if camera not in table:
@@ -565,7 +632,7 @@ def fit_mark_warp(
     # ---- 1. put every train on ONE relative index --------------------------------
     trains = sorted(trains, key=lambda t: (-len(t.k), t.side))
     ref = trains[0]
-    p_ref = np.polyfit(np.asarray(ref.k, float), np.asarray(ref.x, float), 1)   # x = p0*k + p1
+    p_ref = _robust_line(ref.k, ref.x, robust_iters, clip_sigma)   # x = p0*k + p1
     if not np.isfinite(p_ref).all() or p_ref[0] <= 0:
         raise LadderError(f"{ref.side} train has a non-increasing period")
     aligned: list[tuple[MarkTrain, float]] = [(ref, 0.0)]
@@ -630,6 +697,7 @@ def fit_mark_warp(
     x0u, scu, inu = _fit_phase_and_period(alpha, x_all, np.zeros_like(alpha),
                                           robust_iters, clip_sigma)
     rms_uniform = float(np.sqrt(((x_all - (x0u + scu * alpha))[inu] ** 2).mean()))
+    rms_shared_shape = rms          # before any per-frame refine; the gate below judges THIS
 
     refine = (0.0, 0.0, 0.0)
     if per_frame_refine == "auto":
@@ -657,6 +725,18 @@ def fit_mark_warp(
             f"ladder residual {rms:.1f} px rms (max {rmax:.1f}) over {len(k_all)} marks exceeds "
             f"{max_resid_px:.0f} px against the calibrated {camera} shape -- this is not a clean "
             f"{deg_per_mark:g} deg ladder")
+    # The absolute ceiling above is sweep-blind, so on a 30 deg tier a wrong-sensor
+    # shape (~12 px rms) slips under a 40 px bar while being twice as wrong as
+    # removing NO shape.  The calibrated shape must earn its place: it may not leave
+    # more residual than the uniform grid it replaces (review H3, 2026-08-30).
+    margin = noise_px if resid_vs_uniform_margin_px is None else float(resid_vs_uniform_margin_px)
+    if rms_shared_shape > rms_uniform + margin:
+        raise LadderError(
+            f"the calibrated {camera} shape makes the fit WORSE than a plain uniform grid: "
+            f"{rms_shared_shape:.1f} px rms with it against {rms_uniform:.1f} px without (margin "
+            f"{margin:.1f} px) over {len(k_all)} marks spanning "
+            f"{alpha.max() - alpha.min():.1f} deg -- the wrong sensor's shape, or not this "
+            f"camera's {deg_per_mark:g} deg ladder")
 
     model = MarkWarpModel(
         k_ref=k_ref, deg_per_mark=deg_per_mark, px_per_deg=px_per_deg,
@@ -667,6 +747,7 @@ def fit_mark_warp(
         resid_rms_px=rms, resid_max_px=rmax, resid_rms_uniform_px=rms_uniform,
         scale_ratio_src_per_canvas=float(scale / px_per_deg), unwrap_phase=float(phase),
         unwrap_prior_deg=float(prior_alpha_deg), unwrap_half_ambiguity_deg=float(half_amb),
+        unwrap_marginal=bool(np.isfinite(phase) and abs(phase) > unwrap_warn_frac),
         sides_used=sides, cover_frac=float(cover),
         alpha_span_deg=(float(alpha.min()), float(alpha.max())),
         marks_k=k_all, marks_x=x_all, marks_side=tuple(str(s) for s in side_all),

@@ -513,11 +513,26 @@ def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float 
     # DN-0 canvas of a dark session self-masks through the `!= 0` merge rule, so
     # nothing needs cutting there.  Same test as _part_content_bbox: no bright
     # bed in the outermost rows/cols -> no cuts.
-    border = np.concatenate([a[:8].ravel(), a[-8:].ravel(), a[:, :8].ravel(), a[:, -8:].ravel()])
-    if float((border >= bright_dn).mean()) < 0.05:
+    # PER EDGE (2026-09-02, ops251 / mission 1205 re-merge): a pooled four-edge test
+    # passed every 1205 section -- their SEAM sides carry a bright bed strip (right
+    # edge 72-88 % >= DN 200) while the top/bottom margins are the DN-0 canvas -- and
+    # the top/bottom walks then cut 484-1405 px top / 242-1955 px bottom into the
+    # marks again (all 14 entities).  Each edge is judged on its OWN outer rows/cols:
+    # walked when they carry the bright bed, or -- on a bright-bed session -- when
+    # they are a dark BAND (mean DN >= 10: F013 bottom, DN 17 under the white line)
+    # rather than the DN-0 canvas; a DN-0 margin self-masks through the merge rule.
+    edges = dict(top=a[:8], bottom=a[-8:], left=a[:, :8], right=a[:, -8:])
+    bright = {k: float((v >= bright_dn).mean()) for k, v in edges.items()}
+    session_bright = float(np.concatenate([v.ravel() for v in edges.values()]).__ge__(bright_dn).mean()) >= 0.05
+    walk = {k: bright[k] >= 0.05 or (session_bright and float(np.mean(edges[k])) >= 10.0) for k in edges}
+    if not any(walk.values()):
         logger.info("%s: dark scan background (no pinned-bright bed in the outer rows/cols) "
                     "-- no scanner-border cuts", Path(image_path).name)
         return None
+    if not all(walk.values()):
+        logger.info("%s: per-edge gate: %s dark (no cut); %s walked (bright frac %s)", Path(image_path).name,
+                    ",".join(k for k in edges if not walk[k]), ",".join(k for k in edges if walk[k]),
+                    " ".join(f"{k}={bright[k]:.2f}" for k in edges))
 
     def _walk(prof2d, n_full, f, cut_px):
         # prof2d: (n_edge_axis, n_other) rows ordered edge -> inward
@@ -555,8 +570,8 @@ def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float 
             cuts[j] = k * f
         return cuts
 
-    top = _walk(a, H, fy, max_cut_px)                   # rows from the top, per column
-    bot = H - _walk(a[::-1], H, fy, max_cut_px)          # rows from the bottom, per column
+    top = _walk(a, H, fy, max_cut_px) if walk["top"] else np.zeros(ow, np.float32)            # rows from the top, per column
+    bot = H - _walk(a[::-1], H, fy, max_cut_px) if walk["bottom"] else np.full(ow, H, np.float32)  # rows from the bottom, per column
     # the frame's outer ends (first section's left, last section's right) are not
     # covered by a neighbour: a smooth run there can be uniform content (cloud),
     # so cap them at outer_cut_px; interior section edges lie inside the ~3000-px
@@ -569,8 +584,8 @@ def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float 
     # of every seam on the 2026-08-26 relaunch mosaics) cannot form.
     lcap = outer_cut_px if first else (max_cut_px if left_cut_px is None else int(min(max_cut_px, left_cut_px)))
     rcap = outer_cut_px if last else (max_cut_px if right_cut_px is None else int(min(max_cut_px, right_cut_px)))
-    left = _walk(a.T, W, fx, lcap)
-    right = W - _walk(a.T[::-1], W, fx, rcap)
+    left = _walk(a.T, W, fx, lcap) if walk["left"] else np.zeros(oh, np.float32)
+    right = W - _walk(a.T[::-1], W, fx, rcap) if walk["right"] else np.full(oh, W, np.float32)
     if not (top.any() or (bot < H).any() or left.any() or (right < W).any()):
         return None
     xs = np.arange(W); ys = np.arange(H)

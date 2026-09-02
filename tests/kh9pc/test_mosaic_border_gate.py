@@ -74,3 +74,32 @@ def test_dark_session_marks_survive_the_old_walk_would_not(tmp_path):
     cuts = _section_border_cuts(str(p), dec=256)
     assert cuts is not None
     assert float(np.median(cuts["top"])) >= 250   # the walk goes through the bed (block rounding)
+
+
+def test_side_bright_bed_only_cuts_the_sides(tmp_path):
+    """ops251 / mission 1205 (2026-09-02): the seam SIDES of every section carry a
+    bright bed strip while the top/bottom margins are the DN-0 canvas.  A pooled
+    four-edge gate passed and the top/bottom walks cut 484-1405 px into the marks;
+    the gate is per edge, so only the sides are cut and the margins stay whole."""
+    H, W = 4000, 3000
+    a = _dark_session(H, W)
+    a[:, :50] = 251
+    a[:, W - 50:] = 251
+    p = _write(tmp_path / "sides.tif", a)
+    cuts = _section_border_cuts(str(p), dec=256)
+    assert cuts is not None
+    assert float(np.median(cuts["top"])) == 0
+    assert float(np.median(cuts["bottom"])) == H
+    assert 0 < float(np.median(cuts["left"])) < 300
+    assert W - 300 < float(np.median(cuts["right"])) < W
+
+
+def test_top_bright_bed_only_leaves_the_dark_bottom(tmp_path):
+    H, W = 4000, 3000
+    a = _dark_session(H, W)
+    a[:300, :] = 251
+    p = _write(tmp_path / "top.tif", a)
+    cuts = _section_border_cuts(str(p), dec=256)
+    assert cuts is not None
+    assert float(np.median(cuts["top"])) >= 250
+    assert float(np.median(cuts["bottom"])) == H

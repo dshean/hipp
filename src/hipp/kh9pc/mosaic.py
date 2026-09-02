@@ -500,6 +500,24 @@ def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float 
         # sample, which breaks the smooth-run walk after a few blocks)
         a = s.read(1, out_shape=(oh, ow), resampling=Resampling.average).astype(np.float32)
     fy, fx = H / oh, W / ow
+    # GATE (dshean 2026-09-01, "black/nodata written onto valid exposed pixels"):
+    # these cuts model the PINNED-BRIGHT scanner bed of some sessions (a white
+    # plateau / border line, DN >= bright_dn, hugging the section edge).  On a
+    # DARK-background session there is no such border: the walk from the edge
+    # runs through the smooth dark canvas and film margin until the first bright
+    # thing it meets -- the scan-angle marks, the printed labels, or the
+    # collimation line itself -- and the "thin bright border line" extension then
+    # cuts INTO it.  Measured on every 2026-08-27 block (all dark sessions): top
+    # cuts 435-1129 px mean / up to 1997 px max, bottom 284-964 / 1997, i.e. the
+    # film margins zeroed column by column and the line eaten in places.  The
+    # DN-0 canvas of a dark session self-masks through the `!= 0` merge rule, so
+    # nothing needs cutting there.  Same test as _part_content_bbox: no bright
+    # bed in the outermost rows/cols -> no cuts.
+    border = np.concatenate([a[:8].ravel(), a[-8:].ravel(), a[:, :8].ravel(), a[:, -8:].ravel()])
+    if float((border >= bright_dn).mean()) < 0.05:
+        logger.info("%s: dark scan background (no pinned-bright bed in the outer rows/cols) "
+                    "-- no scanner-border cuts", Path(image_path).name)
+        return None
 
     def _walk(prof2d, n_full, f, cut_px):
         # prof2d: (n_edge_axis, n_other) rows ordered edge -> inward

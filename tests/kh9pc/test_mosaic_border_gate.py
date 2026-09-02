@@ -103,3 +103,22 @@ def test_top_bright_bed_only_leaves_the_dark_bottom(tmp_path):
     assert cuts is not None
     assert float(np.median(cuts["top"])) >= 250
     assert float(np.median(cuts["bottom"])) == H
+
+
+def test_sparse_marks_in_a_dark_margin_do_not_open_the_edge(tmp_path):
+    """ops395 A001_c (2026-09-02): DN-8 canvas at the top with a few bright marks in
+    the outer rows (outer mean 20, median 8, bright fraction 0) and a bright bed on
+    one side.  704002e's dark-band branch walked the top and cut 751 px to the
+    exposure; only a bright edge may be walked."""
+    H, W = 4000, 3000
+    a = _dark_session(H, W)
+    a[:300, :] = 8
+    for x in range(100, W - 100, 300):          # sparse bright marks inside the outer rows
+        a[40:80, x:x + 30] = 235
+    a[:, :50] = 251                              # bright bed on one side
+    p = _write(tmp_path / "sparse.tif", a)
+    cuts = _section_border_cuts(str(p), dec=256)
+    assert cuts is not None
+    assert float(np.median(cuts["top"])) == 0
+    assert float(np.median(cuts["bottom"])) == H
+    assert 0 < float(np.median(cuts["left"])) < 300

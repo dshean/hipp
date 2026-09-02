@@ -517,14 +517,17 @@ def _section_border_cuts(image_path, max_cut_px: int = 2000, smooth_step: float 
     # passed every 1205 section -- their SEAM sides carry a bright bed strip (right
     # edge 72-88 % >= DN 200) while the top/bottom margins are the DN-0 canvas -- and
     # the top/bottom walks then cut 484-1405 px top / 242-1955 px bottom into the
-    # marks again (all 14 entities).  Each edge is judged on its OWN outer rows/cols:
-    # walked when they carry the bright bed, or -- on a bright-bed session -- when
-    # they are a dark BAND (mean DN >= 10: F013 bottom, DN 17 under the white line)
-    # rather than the DN-0 canvas; a DN-0 margin self-masks through the merge rule.
+    # marks again (all 14 entities).  Each edge is judged on its OWN outer rows/cols
+    # and walked ONLY when they carry the bright bed (>= 5 % of the outer 8 decimated
+    # rows/cols >= bright_dn).  A "dark band" branch (walk when the outer mean DN >= 10
+    # on a bright-bed session, meant for the F013 white-line-over-band case) was tried
+    # first (704002e) and cut 751 px off ops395 A001_c (outer median 8, mean 20 from a
+    # few marks in the margin) and 875-1955 px off ops251 A052/A053 sections; the F013
+    # edges are in fact bright (outer median 247 top and bottom), so the bright test
+    # alone covers them.  A dark margin self-masks through the `!= 0` merge rule.
     edges = dict(top=a[:8], bottom=a[-8:], left=a[:, :8], right=a[:, -8:])
     bright = {k: float((v >= bright_dn).mean()) for k, v in edges.items()}
-    session_bright = float(np.concatenate([v.ravel() for v in edges.values()]).__ge__(bright_dn).mean()) >= 0.05
-    walk = {k: bright[k] >= 0.05 or (session_bright and float(np.mean(edges[k])) >= 10.0) for k in edges}
+    walk = {k: bright[k] >= 0.05 for k in edges}
     if not any(walk.values()):
         logger.info("%s: dark scan background (no pinned-bright bed in the outer rows/cols) "
                     "-- no scanner-border cuts", Path(image_path).name)

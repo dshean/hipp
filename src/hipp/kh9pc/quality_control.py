@@ -162,6 +162,15 @@ def plot_poly_edges(detector: PolyStrategy, crop_is_delivered: bool = True) -> F
     delivered crop is the fixed line-offset (2026-07-22 ruling) and the
     envelope is QC/sentinel only."""
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
+    # Resolve the DELIVERED geometry before reading it (2026-09-18). POLY_EDGE_CLASS_POLICY is
+    # applied inside _compute_transformation, so on a strategy whose transformation has not been
+    # built yet, _edge_class_ holds the NATIVE per-side picks and the curve drawn below is a model
+    # the warp never used -- while the legend still calls it "DELIVERED". Touching the cached
+    # property makes the figure agree with the product.
+    try:
+        detector.transformation_      # cached; does not re-fit
+    except Exception:  # noqa: BLE001 - a figure must never take the run down
+        pass
     _cls_all = getattr(detector, "_edge_class_", {})
     if _cls_all:
         _mixed = ("rupture" in _cls_all.values()) and (len(set(_cls_all.values())) > 1)
@@ -315,6 +324,67 @@ def _collimation_context_panel(ax, detector: CollimationStrategy, src, side: str
     ax.legend(handles=handles, loc="best", fontsize=7)
 
 
+def _poly_context_panel(ax, poly: PolyStrategy, src, side: str, crop_rows: tuple | None = None,
+                        context_px: int = 1500, out_cols: int = 1400, out_rows: int = 700) -> None:
+    """One margin of a PolyStrategy frame, the CollimationStrategy panel's counterpart.
+
+    Added 2026-09-18 (dshean: "I need to see both top and bottom on
+    D3C1205-200251A055_restitution_sheet.png indicated to advise further"). Every nepal frame
+    is PolyStrategy, and until now the sheet drew top/bottom margins only for
+    CollimationStrategy -- a PolyStrategy sheet had a blank "no collimation-line fit" box
+    where this evidence belongs, so the ~1000-row A055 datum error was invisible on the one
+    page that gets reviewed.
+
+    Draws, in FULL-RES source rows: the margin from the raster edge inward, nodata shaded,
+    the RANSAC rupture inliers/outliers, the DELIVERED edge model (after
+    POLY_EDGE_CLASS_POLICY, labelled with the class that actually shipped), the rupture
+    model for contrast, and the delivered crop row.
+    """
+    result = poly._results[side] if side in getattr(poly, "_results", {}) else (
+        poly.top_ if side == "top" else poly.bottom_)
+    cmap = plt.get_cmap("gray").copy(); cmap.set_bad("#ffb3b3")
+    w = result.sub_image.window
+    panel_rows = 3600
+    if side == "top":
+        r0, r1 = 0, int(min(src.height, max(w.row_off + w.height, panel_rows)))
+    else:
+        r0, r1 = int(max(0, min(w.row_off, src.height - panel_rows))), int(src.height)
+    win = Window(0, r0, int(src.width), r1 - r0)
+    band = SubImage(src, window=win, out_shape=(1, out_rows, out_cols)).band.astype(np.float32)
+    nod = band <= 0
+    valid = band[~nod]
+    vmin, vmax = (np.percentile(valid, [2, 98]) if valid.size else (0, 255))
+    extent = [0, src.width, win.row_off + win.height, win.row_off]
+    ax.imshow(np.ma.masked_where(nod, band), cmap=cmap, aspect="auto",
+              extent=extent, vmin=vmin, vmax=vmax, interpolation="nearest")
+
+    pts = result.ruptures_global
+    xs = np.linspace(float(pts[:, 0].min()), float(pts[:, 0].max()), 200)
+    inl = result.model.inlier_mask_
+    ax.scatter(pts[~inl, 0], pts[~inl, 1], s=8, c="red", label="rupture outliers")
+    ax.scatter(pts[inl, 0], pts[inl, 1], s=8, c="green", label="rupture inliers")
+    ax.plot(xs, np.asarray(result.model.predict(xs.reshape(-1, 1))).ravel(),
+            color="tab:blue", lw=1.0, ls=":", label="rupture model (detector)")
+    # The DELIVERED model is whatever the live policy resolved -- read the recorded class,
+    # never re-derive it here (a figure that re-picks can name a model the warp never used).
+    cls = getattr(poly, "_edge_class_", {}).get(side)
+    try:
+        delivered, _ = poly._content_edge_model(side)
+        ax.plot(xs, np.asarray(delivered.predict(xs.reshape(-1, 1))).ravel(),
+                color="blue", lw=1.8, label="DELIVERED geometry (%s)" % (cls or "?"))
+    except Exception:  # noqa: BLE001 - a figure must never take the run down
+        pass
+    if crop_rows is not None and crop_rows[0 if side == "top" else 1] is not None:
+        cr = float(crop_rows[0 if side == "top" else 1])
+        ax.axhline(cr, color="red", lw=1.4, ls="--", label="delivered crop row %d (source px)" % int(cr))
+    ax.set_xlim(extent[0], extent[1]); ax.set_ylim(extent[2], extent[3])
+    ax.set_title("%s margin (source rows %d-%d; class %s)" % (side, r0, r1, cls or "?"), fontsize=10)
+    ax.set_xlabel("column (full-res px)"); ax.set_ylabel("row (full-res px)")
+    handles, labels = ax.get_legend_handles_labels()
+    handles.append(patches.Patch(fc="#ffb3b3", ec="none", label="nodata (scan canvas)"))
+    ax.legend(handles=handles, loc="best", fontsize=7)
+
+
 def plot_collimation_edges(detector: CollimationStrategy, context_px: int = 1500,
                            out_cols: int = 1400, out_rows: int = 700) -> Figure:
     """Both margins, full context (see _collimation_context_panel)."""
@@ -392,8 +462,35 @@ def plot_restitution_sheet(fitting_class: FittingClass, entity: str | None = Non
                     axp.plot(med, np.linspace(r0, r1, med.size), color="k", lw=0.8); axp.set_ylim(r1, r0); axp.set_xlabel("median DN", fontsize=8)
                     axp.set_ylabel("row (full-res px)", fontsize=8); axp.tick_params(labelsize=7); axm.tick_params(labelleft=False)
                     axm.set_ylabel("")
+            elif poly is not None and getattr(poly, "is_fitted", False):
+                # PolyStrategy top/bottom margins (2026-09-18). This grid slot used to be a blank
+                # "no collimation-line fit" box, so a PolyStrategy sheet -- every nepal frame --
+                # carried NO top/bottom edge evidence and a ~1000-row datum error (ops251 A055)
+                # was invisible on the page that gets reviewed.
+                _crop_rows = (None, None)
+                try:
+                    from hipp.kh9pc.restitution.base import scan_scale
+                    _tr = poly.transformation_          # cached; does not re-fit
+                    _sy = scan_scale(poly.scan_pitch_um, poly.raster_filepath_)[1]
+                    # crop_offset / output_size are CANVAS px -- source row = canvas px / sy.
+                    # Comparing them to source rows directly biases the bottom edge ~53 px on
+                    # a 7.0/6.984 um scan (caught 2026-09-18).
+                    _crop_rows = (_tr.crop_offset[1] / _sy,
+                                  (_tr.crop_offset[1] + _tr.output_size[1]) / _sy)
+                except Exception:  # noqa: BLE001 - a figure must never take the run down
+                    pass
+                for k, side in enumerate(["top", "bottom"]):
+                    axp = fig.add_subplot(gs[1 + k, 0]); axm = fig.add_subplot(gs[1 + k, 1:], sharey=axp)
+                    _poly_context_panel(axm, poly, src, side, crop_rows=_crop_rows)
+                    r0, r1 = (int(axm.get_ylim()[1]), int(axm.get_ylim()[0]))
+                    prof = _read_decimated(src, Window(0, max(0, r0), W, max(1, r1 - r0)), 512, max(1, r1 - r0))
+                    med = np.array([np.median(row[row > 0]) if (row > 0).any() else np.nan for row in prof])
+                    axp.plot(med, np.linspace(r0, r1, med.size), color="k", lw=0.8)
+                    axp.set_ylim(r1, r0); axp.set_xlabel("median DN", fontsize=8)
+                    axp.set_ylabel("row (full-res px)", fontsize=8); axp.tick_params(labelsize=7)
+                    axm.tick_params(labelleft=False); axm.set_ylabel("")
             else:
-                ax0 = fig.add_subplot(gs[1:3, :]); ax0.axis("off"); ax0.text(0.5, 0.5, f"no collimation-line fit ({name})", ha="center", va="center", fontsize=12)
+                ax0 = fig.add_subplot(gs[1:3, :]); ax0.axis("off"); ax0.text(0.5, 0.5, f"no edge fit ({name})", ha="center", va="center", fontsize=12)
             # ---- 4: vertical edges with column profiles ----
             # ---- 4: left / right exposure edges (dshean 2026-08-26: +-1500 px, not 10 k;
             #         the column-median DN profile BELOW each panel on a shared x axis) ----

@@ -8,6 +8,7 @@ Description: PolyStrategy — polynomial edge fitting for KH-9 PC restitution. S
 
 import logging
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Self
@@ -90,6 +91,10 @@ class PolyStrategy(RestitutionStrategy):
     output_height: int | None = None
     # (x_um, y_um) scanner pitch of this scan session; None -> raster tags or 1:1
     scan_pitch_um: tuple[float, float] | None = None
+    # 2026-09-18: which model class fed each side's delivered geometry -- "oracle" | "content" |
+    # "rupture". Populated by _content_edge_model(); read by _compute_transformation() for the
+    # mixed-class guard and written to the QC record so a datum shift is attributable.
+    _edge_class_: dict = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         super().__init__()
@@ -209,7 +214,7 @@ class PolyStrategy(RestitutionStrategy):
             sub_image=sub_image,
         )
 
-    def _content_edge_model(self, side: str) -> tuple[object, object | None]:
+    def _content_edge_model(self, side: str, skip_oracle: bool = False) -> tuple[object, object | None]:
         """``(smooth_model, crop_model)`` for the DELIVERED no-collimation-line
         output (David r1-3). The SMOOTH poly2 fit to the content-end inliers is
         the ONLY edge that feeds the warp -- geometry must not step (a step in
@@ -238,14 +243,32 @@ class PolyStrategy(RestitutionStrategy):
                 self._edge_oracle_ = {}
             self._edge_oracle_path_ = self.raster_filepath_
         _ef = self._edge_oracle_.get(side)
-        if _ef is not None and _ef.passed:
+        # _force_oracle_ (policy "promote"): accept this side's oracle fit even though its own verdict did
+        # not pass, because the OTHER side's oracle did and a like-for-like midpoint beats a mixed one.
+        _forced = side in getattr(self, "_force_oracle_", set())
+        if _ef is not None and (_ef.passed or _forced) and not skip_oracle:
+            self._edge_class_[side] = "oracle"
             return _ef, None
 
         result = self._results[side]
         band = result.sub_image.band
         edges = detect_content_edges(band, side, black_dn=self.background_threshold)
         if len(edges) < max(10, band.shape[1] // 10):
+            # 2026-09-18: the RUPTURE model is a DIFFERENT physical feature from the oracle/content
+            # frame edge (it sits ~1e3 px further out, in the film border). The delivered datum is
+            # (crop_top+crop_bot)/2, so taking this on ONE side only moves the whole canvas by half
+            # the class separation -- measured on nepal ops251 as ~1000 rows between two runs that
+            # differed only in the source mosaic margins (A056 -1038, A057 -981, F053 +998, F054 +917),
+            # with nothing in any log to attribute it. Record the class so it is attributable, and let
+            # the caller refuse a MIXED pair.
+            self._edge_class_[side] = "rupture"
+            logger.warning(
+                "%s %s edge: content walk found %d edges (< %d needed) -- falling back to the RUPTURE "
+                "model, a different feature from the oracle/content frame edge; the delivered datum is "
+                "only sound if BOTH sides fall back together",
+                getattr(self, "raster_filepath_", "?"), side, len(edges), max(10, band.shape[1] // 10))
             return result.model, None
+        self._edge_class_[side] = "content"
         ruptures_global = result.sub_image.to_global(np.array(edges)).astype(int)
         smooth = fit_ransac_poly(
             ruptures_global[:, 0], ruptures_global[:, 1],
@@ -282,6 +305,82 @@ class PolyStrategy(RestitutionStrategy):
 
         top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
 
+        # ---- EDGE-MODEL CLASS CONSISTENCY (2026-09-18) ----
+        # The delivered vertical datum is (crop_top+crop_bot)/2, so the two sides MUST measure the same
+        # feature. MEASURED on nepal ops251 (14 frames x 2 mosaic generations, analysis/nepal_canvas_
+        # 2026-09-17/edge_class_{cut,nocut}.txt): the "rupture" fallback never fires, but the oracle and
+        # the content walk disagree by 1500-2000 rows -- the oracle finds the FRAME edge, the content walk
+        # the end of CONTENT inside it. Five of 14 frames drew one side from each, and every one of those
+        # five delivered an empty band at exactly one end; the only banded frame with a matched pair is
+        # A055, whose film genuinely ends early. Between two runs differing only in the source margins,
+        # class flips moved the datum by ~900-1000 rows with every gate green.
+        # Policy "consistent" (default): if the sides disagree, DEMOTE the higher-preference side so both
+        # use the same class (oracle > content > rupture); a symmetric error then cancels in the midpoint.
+        # "native" keeps the old per-side choice and REFUSES a mixed pair unless it is accepted knowingly.
+        _policy = os.environ.get("POLY_EDGE_CLASS_POLICY", "promote")
+        if _policy not in ("promote", "consistent", "native"):
+            raise ValueError("POLY_EDGE_CLASS_POLICY must be 'promote'|'consistent'|'native' (got %r)" % _policy)
+        _rank = {"oracle": 0, "content": 1, "rupture": 2}
+        _cls = dict(self._edge_class_)
+        if len(set(_cls.values())) > 1:
+            if _policy in ("consistent", "promote"):
+                # MEASURED nepal ops251 (analysis/nepal_canvas_2026-09-17/edge_policy_ab.txt): the ORACLE
+                # frame-edge separation reproduces the canonical canvas height (detected_height 21138-22055
+                # vs spec 21771, pad_y 14-314 px), while the content walk sits ~1800 px inside it and leaves
+                # pad_y 1840-2966 -- i.e. demoting to "content" makes the empty band WIDER, not narrower.
+                # So "promote" (default) takes the HIGHER-preference class, "consistent" the lower.
+                _target = (min if _policy == "promote" else max)(_cls.values(), key=lambda c: _rank.get(c, 99))
+                logger.warning(
+                    "%s: edge-model classes disagree (top=%s bottom=%s) -- demoting both sides to %r so "
+                    "the delivered datum is a like-for-like midpoint (POLY_EDGE_CLASS_POLICY=native keeps "
+                    "the per-side choice)", getattr(self, "raster_filepath_", "?"),
+                    _cls.get("top"), _cls.get("bottom"), _target)
+                for _side in ("top", "bottom"):
+                    if self._edge_class_.get(_side) != _target:
+                        if _target == "oracle":
+                            _force_prev = getattr(self, "_force_oracle_", set())
+                            self._force_oracle_ = set(_force_prev) | {_side}
+                            _m, _c = self._content_edge_model(_side)
+                        else:
+                            _m, _c = self._content_edge_model(_side, skip_oracle=True)
+                        if self._edge_class_.get(_side) != _target:
+                            raise RuntimeError(
+                                "%s: could not demote %s edge to %r (got %r) -- refusing rather than "
+                                "delivering a mixed-class datum" % (getattr(self, "raster_filepath_", "?"),
+                                _side, _target, self._edge_class_.get(_side)))
+                        if _side == "top":
+                            top_model, top_crop = _m, _c
+                            y_top_src = top_model.predict(x.reshape(-1, 1)).ravel()
+                        else:
+                            bot_model, bot_crop = _m, _c
+                            y_bot_src = bot_model.predict(x.reshape(-1, 1)).ravel()
+                top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
+                _cls = dict(self._edge_class_)
+            else:
+                msg = ("%s: MIXED edge-model classes top=%s bottom=%s -- the two sides measure different "
+                       "features, so the delivered datum is shifted by ~half their separation. Set "
+                       "POLY_ALLOW_MIXED_EDGE_CLASS=1 to accept knowingly.")
+                args = (getattr(self, "raster_filepath_", "?"), _cls.get("top"), _cls.get("bottom"))
+                if os.environ.get("POLY_ALLOW_MIXED_EDGE_CLASS", "0") != "1":
+                    raise RuntimeError(msg % args)
+                logger.warning(msg % args)
+        self._edge_class_mixed_ = len(set(_cls.values())) > 1
+        # PHYSICAL CHECK: the canonical canvas height is the collimation-line separation (152.4 mm at
+        # 7 um = 21771 px). MEASURED: an oracle/oracle pair reproduces it to within ~630 px on 13 of 14
+        # nepal ops251 frames, so a detected height far from spec means an edge is on the wrong feature.
+        _spec_gap = float(np.median(y_bot_src) - np.median(y_top_src)) * float(sy) - float(_spec_h)
+        logger.info("%s edge-model classes: top=%s bottom=%s (rows %.1f / %.1f, policy=%s, "
+                    "edge separation - spec = %+.0f canvas px)",
+                    getattr(self, "raster_filepath_", "?"), _cls.get("top"), _cls.get("bottom"),
+                    float(np.median(y_top_src)), float(np.median(y_bot_src)), _policy, _spec_gap)
+        self._edge_sep_minus_spec_ = _spec_gap
+        if abs(_spec_gap) > float(os.environ.get("POLY_EDGE_SEP_TOL_PX", "1500")):
+            logger.warning(
+                "%s: detected edge separation is %+.0f px from the %d px spec (classes top=%s bottom=%s) -- "
+                "the canvas will carry ~%.0f px of empty pad at EACH end; treat this frame's vertical datum "
+                "as unverified", getattr(self, "raster_filepath_", "?"), _spec_gap, int(_spec_h),
+                _cls.get("top"), _cls.get("bottom"), abs(_spec_gap) / 2.0)
+
         # destination (canvas) coordinates: straightened edges, scaled to the canvas pitch
         y_top_dst = np.full_like(x, top * sy)
         y_bot_dst = np.full_like(x, bot * sy)
@@ -316,6 +415,14 @@ class PolyStrategy(RestitutionStrategy):
 
         pad_x = (output_width - detected_width) / 2
         pad_y = (output_height - detected_height) / 2
+        # 2026-09-18: expose the padding for the class-policy A/B. pad_y is SYMMETRIC -- the canvas
+        # extends pad_y beyond the detected content at BOTH ends -- so a smaller detected_height means
+        # a wider empty band wherever the film does not reach. This is the number that decides whether
+        # a mixed pair should be demoted (content walk, further in) or promoted (oracle frame edge).
+        self._detected_height_ = float(detected_height)
+        self._pad_y_ = float(pad_y)
+        self._crop_top_ = float(crop_top)
+        self._crop_bot_ = float(crop_bot)
 
         # x: strength-weighted crop centre from the vertical detector (== left - pad_x when
         # both edges are equally strong); y: detected height centred in the spec height

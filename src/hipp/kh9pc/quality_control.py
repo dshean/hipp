@@ -162,6 +162,13 @@ def plot_poly_edges(detector: PolyStrategy, crop_is_delivered: bool = True) -> F
     delivered crop is the fixed line-offset (2026-07-22 ruling) and the
     envelope is QC/sentinel only."""
     fig, axes = plt.subplots(1, 2, figsize=(8, 4), constrained_layout=True)
+    _cls_all = getattr(detector, "_edge_class_", {})
+    if _cls_all:
+        _mixed = ("rupture" in _cls_all.values()) and (len(set(_cls_all.values())) > 1)
+        fig.suptitle("edge-model classes: top=%s bottom=%s%s"
+                     % (_cls_all.get("top", "?"), _cls_all.get("bottom", "?"),
+                        "   *** MIXED -- delivered datum shifted ***" if _mixed else ""),
+                     fontsize=9, color=("red" if _mixed else "black"))
 
     for ax, side, result in zip(axes, ["top", "bottom"], [detector.top_, detector.bottom_]):
         # GLOBAL full-res raster coordinates on both axes (diagnostic default:
@@ -177,8 +184,21 @@ def plot_poly_edges(detector: PolyStrategy, crop_is_delivered: bool = True) -> F
 
         order = np.argsort(result.ruptures_global[:, 0].astype(float))
         x_global = result.ruptures_global[order, 0].astype(float)
+        # 2026-09-18: `result.model` is the detector's RUPTURE model. It is the delivered geometry ONLY
+        # when _content_edge_model() fell back to it; normally the warp uses the edge-oracle or the
+        # content-walk model instead. Labelling it "model (geometry)" hid exactly that (nepal ops251:
+        # four frames moved their delivered datum ~1000 rows between runs, every gate green). Draw the
+        # DELIVERED model separately and name the class it came from.
         ax.plot(x_global, result.model.predict(x_global.reshape(-1, 1)).ravel(),
-                color="blue", linewidth=1, label="model (geometry)")
+                color="tab:blue", linewidth=1, linestyle=":", label="rupture model (detector)")
+        _cls = getattr(detector, "_edge_class_", {}).get(side)
+        try:
+            _delivered, _ = detector._content_edge_model(side)
+        except Exception:  # noqa: BLE001 - a figure must never take the run down
+            _delivered = None
+        if _delivered is not None:
+            ax.plot(x_global, np.asarray(_delivered.predict(x_global.reshape(-1, 1))).ravel(),
+                    color="blue", linewidth=1.6, label="DELIVERED geometry (%s)" % (_cls or "?"))
         crop_model = getattr(result, "crop_model", None)
         if crop_model is not None:
             cm = np.asarray(crop_model.predict(x_global.reshape(-1, 1))).ravel()

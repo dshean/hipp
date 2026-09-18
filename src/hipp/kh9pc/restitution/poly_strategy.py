@@ -317,10 +317,57 @@ class PolyStrategy(RestitutionStrategy):
         # Policy "consistent" (default): if the sides disagree, DEMOTE the higher-preference side so both
         # use the same class (oracle > content > rupture); a symmetric error then cancels in the midpoint.
         # "native" keeps the old per-side choice and REFUSES a mixed pair unless it is accepted knowingly.
+        # Policy "oracle": use the edge oracle on BOTH sides whenever a fit exists, even where its own
+        # verdict did not pass -- the content walk is never the delivered geometry. MEASURED on nepal
+        # ops251, 2026-09-18 (analysis/nepal_canvas_2026-09-17/edge_model_audit.txt, all 14 frames, each
+        # side, against an edge measured from the raster alone -- per-row median DN, half-way crossing
+        # between the film-margin plateau and the interior): the CONTENT walk lands 1200-2900 rows INSIDE
+        # the true edge on every frame (top mid-frame 3143-3774 against measured edges of 1002-2056),
+        # while the ORACLE sits within about +-400 rows. A055 is the one frame whose oracle failed its own
+        # verdict on BOTH sides, so it fell to the content walk on both, no mixed pair fired, "promote"
+        # never triggered, and the delivered datum shipped +1041 rows off with every gate green. Its
+        # oracle fit is good (top 1175 vs measured 1159, bottom 23074 vs 22989), so forcing it here moves
+        # A055's datum error from +1041 to roughly +50 and leaves the other 13 frames bit-identical
+        # (they already deliver oracle on both sides). Not the default: this is a per-block ruling until
+        # the oracle verdict itself is re-tuned, and a site whose oracle is genuinely unreliable still
+        # wants the verdict to bite.
         _policy = os.environ.get("POLY_EDGE_CLASS_POLICY", "promote")
-        if _policy not in ("promote", "consistent", "native"):
-            raise ValueError("POLY_EDGE_CLASS_POLICY must be 'promote'|'consistent'|'native' (got %r)" % _policy)
+        if _policy not in ("promote", "consistent", "native", "oracle"):
+            raise ValueError(
+                "POLY_EDGE_CLASS_POLICY must be 'promote'|'consistent'|'native'|'oracle' (got %r)" % _policy)
         _rank = {"oracle": 0, "content": 1, "rupture": 2}
+        if _policy == "oracle":
+            _need = {_s for _s in ("top", "bottom")
+                     if self._edge_class_.get(_s) != "oracle"
+                     and getattr(self, "_edge_oracle_", {}).get(_s) is not None}
+            _noora = {_s for _s in ("top", "bottom")
+                      if getattr(self, "_edge_oracle_", {}).get(_s) is None}
+            if _noora:
+                logger.warning(
+                    "%s: POLY_EDGE_CLASS_POLICY=oracle but no oracle fit on %s -- those sides keep the "
+                    "content/rupture walk and the delivered datum is NOT oracle-consistent",
+                    getattr(self, "raster_filepath_", "?"), sorted(_noora))
+            if _need:
+                logger.warning(
+                    "%s: POLY_EDGE_CLASS_POLICY=oracle -- forcing the oracle on %s (was %s); the oracle "
+                    "verdict did not pass there but the content walk measures a different, deeper feature",
+                    getattr(self, "raster_filepath_", "?"), sorted(_need),
+                    {_s: self._edge_class_.get(_s) for _s in sorted(_need)})
+                self._force_oracle_ = set(getattr(self, "_force_oracle_", set())) | _need
+                for _side in sorted(_need):
+                    _m, _c = self._content_edge_model(_side)
+                    if self._edge_class_.get(_side) != "oracle":
+                        raise RuntimeError(
+                            "%s: POLY_EDGE_CLASS_POLICY=oracle could not force the %s edge to the oracle "
+                            "(got %r) -- refusing rather than delivering the content walk silently"
+                            % (getattr(self, "raster_filepath_", "?"), _side, self._edge_class_.get(_side)))
+                    if _side == "top":
+                        top_model, top_crop = _m, _c
+                        y_top_src = top_model.predict(x.reshape(-1, 1)).ravel()
+                    else:
+                        bot_model, bot_crop = _m, _c
+                        y_bot_src = bot_model.predict(x.reshape(-1, 1)).ravel()
+                top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
         _cls = dict(self._edge_class_)
         if len(set(_cls.values())) > 1:
             if _policy in ("consistent", "promote"):

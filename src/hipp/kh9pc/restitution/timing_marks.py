@@ -67,11 +67,14 @@ PERIOD_CLASS_TOL = 0.20           # +-20 % around a class for the label (hipp DE
 DISK_DIAM_MM = (0.22, 0.28, 0.34, 0.42, 0.50)   # 2026-09-19: +0.22/0.28 -- mission 1205 bottom-rail scan-angle marks are small dots
 WHEEL_DIAM_MM = (0.36, 0.41, 0.46)
 WHEEL_STROKE_MM = 0.055
-TEMPLATE_PAD_PX = 40    # 2026-09-19 (was 10): dshean -- "your template needs to be larger ... marks are
-                        # isolated, single dots with near-black film on all sides". A pad of ~0.8 x the
-                        # dot diameter puts the dark surround INTO the normalised correlation, so a bright
-                        # blob with a neighbour (a glyph stroke, a slate corner) scores low at the match
-                        # stage rather than being caught later by refine_marks() alone.
+TEMPLATE_PAD_PX = 10    # MEASURED 2026-09-19, ops251, 14 frames, pad 10 vs 40 (a dot with ~0.8 diameters of
+                        # black around it, dshean's "larger template"): raw hits halve (~1000 -> ~550) but
+                        # refine_marks() was already rejecting those, so the sparse trains are identical
+                        # (top 156 vs 155 marks block-wide, bottom 132 vs 124) while the padded template LOSES
+                        # dense time-track marks on four frames (A052 248 -> 171, A053 244 -> 160, F053 173 ->
+                        # 143, F057 195 -> 152) -- the wider window is more sensitive to the film-edge glow
+                        # gradient under the bottom rail. Isolation is enforced AFTER matching, at native
+                        # resolution, by refine_marks(); the template stays tight.
 TEMPLATE_BLUR_PX = 1.5
 
 

@@ -363,6 +363,45 @@ def detect_marks(
 # ----------------------------------------------------------------------------
 # Rows and trains
 # ----------------------------------------------------------------------------
+@dataclass
+class Sections:
+    """Scan-section placement from the merge provenance: section i starts at x_start[i]
+    (cumulative seam tx) and carries a cumulative y offset cum_ty[i]. The merged mosaic is a
+    STAIRCASE of sections (dshean 2026-09-19: "spacing between different mark classes is
+    variable due to seam merging"); F056 accumulates 658 px of ty over nine seams in steps
+    of up to 115 px, against a 30-px row tolerance. Rows and lattices are therefore fitted in
+    section-local coordinates, and the per-section offsets that come back ARE the seam
+    errors -- which is what lets the marks check the seams."""
+    x_start: list
+    cum_ty: list
+    source: str = ""
+
+    def index(self, x):
+        xs = np.asarray(x, float)
+        return np.clip(np.searchsorted(np.asarray(self.x_start), xs, side="right") - 1, 0, len(self.x_start) - 1)
+
+    def ty(self, x):
+        return np.asarray(self.cum_ty)[self.index(x)]
+
+
+def load_sections(mosaic):
+    """<stem>_merge_provenance.json beside the mosaic -> Sections, else None (one section)."""
+    mosaic = Path(mosaic)
+    for c in (mosaic.with_name(mosaic.stem + "_merge_provenance.json"), mosaic.with_name(mosaic.stem + ".json")):
+        if c.exists():
+            try:
+                p = json.loads(c.read_text())
+                xs, tys, x, y = [0.0], [0.0], 0.0, 0.0
+                for q in p.get("seams", []):
+                    x += float(q["tx"]); y += float(q["ty"])
+                    xs.append(x); tys.append(y)
+                return Sections(xs, tys, str(c.name))
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("merge provenance %s unreadable (%r) -- one section", c, exc)
+                return None
+    return None
+
+
 def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
                  min_mm: float = 0.15, max_mm: float = 0.75, iso_frac: float = 0.35) -> list[Mark]:
     """Re-measure every template hit at NATIVE resolution and keep only isolated dots.
@@ -418,7 +457,7 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
 
 
 def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4, tol_px: int = 30,
-                       max_rows: int = 6, seed: int = 0) -> dict[int, float]:
+                       max_rows: int = 6, seed: int = 0, sections=None) -> dict[int, float]:
     """Cluster one side's marks into STRAIGHT rows in mosaic (x, y) -- RANSAC lines.
 
     Replaces the dy-histogram clustering (constant offset from the restitution line).
@@ -435,6 +474,8 @@ def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4
         return {}
     rng = np.random.default_rng(seed)
     xs = np.array([m.x for m in ms]); ys = np.array([m.y for m in ms])
+    if sections is not None:
+        ys = ys - sections.ty(xs)          # de-staircase: rows are straight in section-local y
     free = np.ones(len(ms), bool)
     rows: dict[int, float] = {}
     rid = 0
@@ -506,6 +547,7 @@ def cluster_rows(marks: list[Mark], side: str, bin_px: int = 8, min_count: int =
 class Train:
     side: str
     row: int
+    section_dx: dict = field(default_factory=dict)   # {section: median x offset from the global grid} = seam x errors
     dy_px: float
     dy_mm: float
     label: str
@@ -554,7 +596,8 @@ def _period_candidates(d: NDArray, pitch_x: float) -> list[float]:
     return cands
 
 
-def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_iter: int = 8) -> Train | None:
+def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_iter: int = 8,
+              sections=None) -> Train | None:
     ms = sorted([m for m in marks if m.side == side and m.row == row], key=lambda m: m.x)
     if len(ms) < 6:      # 2026-09-19: 3 marks fit any period; a rail row has >= 6 (sparse: 18 slots per 90 deg)
         return None
@@ -629,8 +672,30 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
         x0, P, inl = x0_new, P_new, inl_new
         if converged:
             break
-    k = np.round((xs - x0) / P).astype(int)
-    r = xs - (x0 + P * k)
+    # Per-section phase (2026-09-19): the lattice is uniform on the FILM; in the merged mosaic
+    # each section sits at its own seam tx, so the residual against one global grid steps at
+    # every seam (F056: a +-40 px arc on both rails). Measure a median offset per section from
+    # the current inliers, re-test every mark against its section's shifted grid, and report the
+    # offsets -- they are the seam x errors the marks can check.
+    sec_dx = {}
+    off = np.zeros(len(xs))
+    if sections is not None and inl.sum() >= 4:
+        si = sections.index(xs)
+        k0 = np.round((xs - x0) / P)
+        r0 = xs - (x0 + P * k0)
+        for sidx in np.unique(si):
+            sel = inl & (si == sidx)
+            if sel.sum() >= 2:
+                sec_dx[int(sidx)] = float(np.median(r0[sel]))
+        if sec_dx:
+            off = np.array([sec_dx.get(int(v), 0.0) for v in si])
+            k1 = np.round((xs - off - x0) / P)
+            r1 = xs - off - (x0 + P * k1)
+            mad = 1.4826 * float(np.median(np.abs(r1[inl]))) if inl.sum() > 2 else 0.0
+            tol_s = min(max(3.0 * mad, 12.0), max(60.0, 0.04 * P))
+            inl = np.abs(r1) <= tol_s
+    k = np.round((xs - off - x0) / P).astype(int)
+    r = xs - off - (x0 + P * k)
     for m, ki, ri, ii in zip(ms, k, r, inl):
         m.k, m.resid, m.inlier = int(ki), float(ri), bool(ii)
     ki = k[inl]
@@ -655,7 +720,7 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
     pres = "".join("1" if kk in present else "0" for kk in range(kmin, min(kmax, kmin + 95) + 1))
     rr = r[inl]
     return Train(
-        side=side, row=row, dy_px=dy, dy_mm=dy * anchors.pitch_um[1] / 1000.0, label=cls,
+        side=side, row=row, section_dx={int(a): round(float(b), 1) for a, b in sec_dx.items()}, dy_px=dy, dy_mm=dy * anchors.pitch_um[1] / 1000.0, label=cls,
         period_px=P, period_mm=P_mm, period_deg=math.degrees(P_mm / FOCAL_MM), x0=float(x0),
         n_marks=len(ms), n_inliers=int(inl.sum()), n_outliers=int((~inl).sum()),
         k_min=kmin, k_max=kmax, n_slots=n_slots, n_missing=len(missing), missing_k=missing[:200],
@@ -685,15 +750,36 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
     logger.info("refine_marks: %d template hits -> %d isolated dots (native-res centroid, FWHM size, annulus test)",
                 n_raw, len(marks))
     info["n_template_hits"] = n_raw
+    sections = load_sections(mosaic)
+    if sections is not None:
+        logger.info("sections: %d from %s, cumulative ty %s px", len(sections.x_start), sections.source,
+                    [int(v) for v in sections.cum_ty])
+        info["sections"] = {"x_start": sections.x_start, "cum_ty": sections.cum_ty, "source": sections.source}
     trains: list[Train] = []
     rows_by_side: dict[str, dict[int, float]] = {}
     for side in sides:
-        rows = cluster_rows_lines(marks, side, anchors.line(side))
+        rows = cluster_rows_lines(marks, side, anchors.line(side), sections=sections)
         rows_by_side[side] = rows
         for row in rows:
-            t = fit_train(marks, side, row, anchors)
+            t = fit_train(marks, side, row, anchors, sections=sections)
             if t is not None:
                 trains.append(t)
+    # Class rules (dshean 2026-09-19): the 500-cycle time track is on ONE edge only (NRO TCS-20055/69
+    # p.7), so a "dense" train may stand on one side only -- the side with the fuller one; and a dense
+    # train that fills under half its slots is staircase debris, not a track.
+    for t in trains:
+        if t.label == "dense" and t.n_inliers < 0.5 * max(t.n_slots, 1):
+            t.label = "other"
+    dense_sides = {}
+    for t in trains:
+        if t.label == "dense" and (t.side not in dense_sides or t.n_inliers > dense_sides[t.side].n_inliers):
+            dense_sides[t.side] = t
+    if len(dense_sides) > 1:
+        keep = max(dense_sides.values(), key=lambda t: t.n_inliers).side
+        for t in trains:
+            if t.label == "dense" and t.side != keep:
+                t.label = "other"
+        logger.info("dense time track kept on the %s rail only", keep)
     left, right = anchors.edges
     sweep_px = (right - left)
     summary = {
@@ -756,9 +842,24 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     left, right = anchors.edges
     cx = 0.5 * (left + right)
     n_ov = len(sides)
-    fig = plt.figure(figsize=(24, 4.2 * n_ov + 8.5), dpi=200)
-    gs = fig.add_gridspec(n_ov + 3, 3, height_ratios=[1.6] * n_ov + [1.3, 1.5, 1.2], hspace=0.28, wspace=0.05)
+    from matplotlib.ticker import MultipleLocator
+    sec = info.get("sections")
+    fig = plt.figure(figsize=(24, 4.2 * n_ov + 2.6 * n_ov + 9.5), dpi=200)
+    gs = fig.add_gridspec(2 * n_ov + 3, 3, height_ratios=[1.6] * n_ov + [1.0] * n_ov + [1.3, 1.5, 1.2],
+                          hspace=0.32, wspace=0.05)
     label_of = {(t.side, t.row): t.label for t in trains}
+    wide_axes = []
+
+    def _xaxis(ax):
+        # dshean 2026-09-19: "x axes don't line up ... need more x subticks so I can provide guidance"
+        ax.xaxis.set_major_locator(MultipleLocator(25000)); ax.xaxis.set_minor_locator(MultipleLocator(5000))
+        ax.tick_params(axis="x", which="major", labelsize=7, length=5)
+        ax.tick_params(axis="x", which="minor", length=2.5)
+        ax.grid(axis="x", which="major", alpha=0.25); ax.grid(axis="x", which="minor", alpha=0.10)
+        if sec:
+            for xb in sec["x_start"][1:]:
+                ax.axvline(xb, color="#888888", lw=0.6, alpha=0.7)
+        wide_axes.append(ax)
 
     # --- overview strips (x max-pooled) ---
     for i, side in enumerate(sides):
@@ -785,9 +886,30 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
         ax.set_yticks([])
         ax.set_xlabel("raster x (px)", fontsize=8)
         ax.tick_params(labelsize=7)
-
+        _xaxis(ax)
+    # --- y position vs x per side (dshean 2026-09-19: "you need a y position value plot for each") ---
+    for i, side in enumerate(sides):
+        ax = fig.add_subplot(gs[n_ov + i, :])
+        for m in marks:
+            if m.side != side:
+                continue
+            c = _TRAIN_COLORS.get(label_of.get((side, m.row), ""), "#707070")
+            ax.plot(m.x, m.dy, marker="o" if m.inlier else "x", ms=3.5 if m.inlier else 4.5, mfc="none", mec=c, color=c, lw=0)
+        if sec:
+            xx = np.linspace(0, max(sec["x_start"][-1] * 1.05, right), 600)
+            sidx = np.clip(np.searchsorted(np.asarray(sec["x_start"]), xx, side="right") - 1, 0, len(sec["x_start"]) - 1)
+            base = float(np.median([m.dy for m in marks if m.side == side and m.inlier] or [0.0]))
+            ax.plot(xx, np.asarray(sec["cum_ty"])[sidx] * (-1 if side == "top" else 1) + base,
+                    color="#888888", lw=0.8, ls="--", label="seam ty staircase (merge provenance) + median row dy")
+            ax.legend(fontsize=7, loc="upper right", framealpha=0.85)
+        ax.axvline(left, color="k", ls="--", lw=0.8); ax.axvline(right, color="k", ls="--", lw=0.8)
+        ax.set_ylabel(f"{side}: mark y - line(x) (px)", fontsize=8)
+        ax.set_xlabel("raster x (px)", fontsize=8); ax.tick_params(labelsize=7); ax.grid(axis="y", alpha=0.3)
+        if side == "top":
+            ax.invert_yaxis()
+        _xaxis(ax)
     # --- residuals ---
-    ax = fig.add_subplot(gs[n_ov, :])
+    ax = fig.add_subplot(gs[2 * n_ov, :])
     for t in trains:
         ms = [m for m in marks if m.side == t.side and m.row == t.row]
         c = _TRAIN_COLORS.get(t.label, "#707070")
@@ -803,28 +925,40 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     ax.axhline(0, color="k", lw=0.5)
     ax.set_ylabel("x residual vs uniform grid (px)", fontsize=8); ax.set_xlabel("raster x (px)", fontsize=8)
     ax.tick_params(labelsize=7); ax.grid(alpha=0.3)
+    _xaxis(ax)
     if trains:
-        ax.legend(fontsize=7, loc="upper left", ncol=1, framealpha=0.85)
+        # legend BELOW the axes (dshean 2026-09-19: "the legend ... covers up data")
+        ax.legend(fontsize=7, loc="upper left", bbox_to_anchor=(0.0, -0.22), ncol=2, framealpha=0.95, borderaxespad=0.0)
     else:
         ax.text(0.5, 0.5, "NO TRAIN FITTED", transform=ax.transAxes, ha="center", fontsize=14, color="r")
+    for _a in wide_axes[1:]:
+        _a.sharex(wide_axes[0])
+    if wide_axes:
+        wide_axes[0].set_xlim(-2000, max((sec["x_start"][-1] * 1.08) if sec else 0, right + 8000))
 
     # --- native zooms at left edge / centre / right edge, first side with an overview ---
-    zoom_side = sides[0] if sides else "top"
+    # zooms follow the SPARSE (scan-angle) train where one exists: the marks nearest the left edge,
+    # the sweep centre and the right edge (dshean 2026-09-19: A053's fixed-x windows showed the
+    # start-of-frame slate and an empty centre)
+    t_sp = sorted([t for t in trains if t.label == "sparse"], key=lambda t: -t.n_inliers)
+    zoom_side = t_sp[0].side if t_sp else (sides[0] if sides else "top")
     zx = [left + 2000, cx - zoom_w // 2, right - 2000 - zoom_w]
-    t_dense = next((t for t in trains if t.side == zoom_side and t.label == "dense"), None)
-    if t_dense is not None:   # centre zoom around the mark nearest the sweep centre
-        zx[1] = int(cx + t_dense.nearest_mark_dx - zoom_w // 2)
+    if t_sp:
+        sx = np.array(sorted(m.x for m in marks if m.side == zoom_side and m.row == t_sp[0].row and m.inlier))
+        if sx.size:
+            zx = [int(sx[np.argmin(np.abs(sx - tgt))] - zoom_w // 2) for tgt in (left, cx, right)]
     band_in, band_out = info["band_px"]
     with rasterio.open(mosaic) as src:
         for j, x0 in enumerate(zx):
-            ax = fig.add_subplot(gs[n_ov + 1, j])
+            ax = fig.add_subplot(gs[2 * n_ov + 1, j])
             x0 = int(min(max(0, x0), src.width - zoom_w))
             yl = float(anchors.line(zoom_side)(np.array([x0 + zoom_w / 2]))[0])
             y0 = yl - band_out - 30 if zoom_side == "top" else yl + band_in - 30
             y0 = int(max(0, y0)); h = int(band_out - band_in + 60)
             h = min(h, src.height - y0)
-            if h <= 10:
-                ax.set_visible(False); continue
+            if h <= 10 or x0 < 0:
+                ax.text(0.5, 0.5, f"{zoom_side} zoom {j}: window outside the raster (x0={x0}, y0={y0}, h={h})",
+                        transform=ax.transAxes, ha="center", fontsize=8, color="r"); ax.set_xticks([]); ax.set_yticks([]); continue
             a = src.read(1, window=Window(x0, y0, zoom_w, h))
             lo, hi = np.percentile(a, (2, 98))
             ax.imshow(a, cmap="gray", vmin=lo, vmax=max(hi, lo + 1), aspect="equal",
@@ -834,14 +968,14 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
                     c = _TRAIN_COLORS.get(label_of.get((zoom_side, m.row), ""), "#707070")
                     ax.add_patch(plt.Circle((m.x, m.y), 45, fill=False, ec=c, lw=1.0, ls="-" if m.inlier else ":"))
                     ax.text(m.x, m.y - 50, f"{m.kind[0]}{m.score:.2f} k{m.k}", color=c, fontsize=6, ha="center")
-            ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['left edge', 'sweep centre', 'right edge'][j]})",
+            ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['nearest left edge', 'nearest sweep centre', 'nearest right edge'][j]}{' sparse mark' if t_sp else ''})",
                     transform=ax.transAxes, va="top", fontsize=7, color="w", bbox=dict(facecolor="k", alpha=0.5, lw=0))
             ax.tick_params(labelsize=6)
             if j == 1:
                 ax.axvline(cx, color="yellow", ls=":", lw=1)
 
     # --- spacing histogram + mean patch per train ---
-    ax = fig.add_subplot(gs[n_ov + 2, 0])
+    ax = fig.add_subplot(gs[2 * n_ov + 2, 0])
     for t in trains:
         xs = np.sort([m.x for m in marks if m.side == t.side and m.row == t.row and m.inlier])
         if len(xs) > 2:
@@ -851,7 +985,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     ax.set_xlabel("consecutive spacing / fitted period", fontsize=8); ax.set_ylabel("count", fontsize=8)
     ax.tick_params(labelsize=7); ax.legend(fontsize=7)
     for j, t in enumerate(trains[:2]):
-        ax = fig.add_subplot(gs[n_ov + 2, 1 + j])
+        ax = fig.add_subplot(gs[2 * n_ov + 2, 1 + j])
         ms = [m for m in marks if m.side == t.side and m.row == t.row and m.inlier]
         patch = _mean_patch(mosaic, ms[:40], 120)
         if patch is not None:

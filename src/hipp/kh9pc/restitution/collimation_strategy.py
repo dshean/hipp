@@ -1055,6 +1055,12 @@ class CollimationStrategy(RestitutionStrategy):
         crop_bot = crop_top + eh
         output_height = eh
         output_width = self.output_width or ew
+        # canvas-space geometry for RestitutionStrategy.extended_window() (2026-09-19): on this
+        # strategy the dst rows ARE the median line rows (the line pair sets the y scale)
+        self._top_dst_ = float(top)
+        self._bot_dst_ = float(bot)
+        self._left_dst_ = float(left)
+        self._right_dst_ = float(left + detected_width)
 
         # Black-leak sentinel (non-fatal): the per-column content envelope no
         # longer drives the crop, but wherever it detects content ending

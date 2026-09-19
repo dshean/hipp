@@ -64,7 +64,7 @@ BAND_TILT_PAD_PX = 64             # line tilt inside one block (A010: 0.0027 px/
 PERIOD_CLASSES_MM = {"dense": 9.08, "mid": 26.62, "sparse": 133.10}
 PERIOD_CLASS_TOL = 0.20           # +-20 % around a class for the label (hipp DENSE_MAX 0.41 in = 10.4 mm)
 # glyph sizes (mm) for the synthetic template bank
-DISK_DIAM_MM = (0.34, 0.42, 0.50)
+DISK_DIAM_MM = (0.22, 0.28, 0.34, 0.42, 0.50)   # 2026-09-19: +0.22/0.28 -- mission 1205 bottom-rail scan-angle marks are small dots
 WHEEL_DIAM_MM = (0.36, 0.41, 0.46)
 WHEEL_STROKE_MM = 0.055
 TEMPLATE_PAD_PX = 10
@@ -356,6 +356,110 @@ def detect_marks(
 # ----------------------------------------------------------------------------
 # Rows and trains
 # ----------------------------------------------------------------------------
+def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
+                 min_mm: float = 0.15, max_mm: float = 0.75, iso_frac: float = 0.35) -> list[Mark]:
+    """Re-measure every template hit at NATIVE resolution and keep only isolated dots.
+
+    dshean 2026-09-19: the template hits included fragments of the label text; real
+    scan-angle and timing marks are "isolated, single dot with near-black film on all
+    sides", and their size differs by rail and by mission (large timing dots, large
+    top-rail angle dots, small bottom-rail angle dots on 1205; wagon wheels elsewhere).
+    So: centre -> brightness centroid; size -> measured FWHM diameter (stored in
+    size_mm, replacing the template's nominal); reject when the annulus 1.4-2.6 R
+    around the dot carries anything brighter than bg + iso_frac x (peak - bg), or the
+    diameter is outside [min_mm, max_mm]."""
+    import rasterio
+    from rasterio.windows import Window
+    out: list[Mark] = []
+    px_mm = 1000.0 / pitch_um[0]
+    with rasterio.open(mosaic) as d:
+        W, H = d.width, d.height
+        for m in marks:
+            h = int(max(60, round(max_mm * px_mm * 1.6)))
+            x0, y0 = int(round(m.x)) - h, int(round(m.y)) - h
+            if x0 < 0 or y0 < 0 or x0 + 2 * h > W or y0 + 2 * h > H:
+                continue
+            a = d.read(1, window=Window(x0, y0, 2 * h, 2 * h)).astype(np.float32)
+            bg = float(np.median(a))
+            pk = float(a[h - 4:h + 5, h - 4:h + 5].max())
+            if pk - bg < 25:
+                continue
+            yy, xx = np.mgrid[0:2 * h, 0:2 * h]
+            bright = a > bg + 0.5 * (pk - bg)
+            # connected blob at the centre only (flood from the peak)
+            lbl = np.zeros_like(bright, dtype=np.uint8)
+            n, cc = cv2.connectedComponents(bright.astype(np.uint8), lbl, connectivity=8)
+            cid = cc[h, h]
+            if cid == 0:
+                continue
+            blob = cc == cid
+            area = int(blob.sum())
+            diam = 2.0 * math.sqrt(area / math.pi)
+            if not (min_mm * px_mm <= diam <= max_mm * px_mm):
+                continue
+            wgt = np.where(blob, a - bg, 0.0)
+            cx = float((wgt * xx).sum() / wgt.sum()); cy = float((wgt * yy).sum() / wgt.sum())
+            R = diam / 2.0
+            rr = np.hypot(xx - cx, yy - cy)
+            ann = a[(rr >= 1.4 * R) & (rr <= 2.6 * R)]
+            if ann.size == 0 or ann.max() > bg + iso_frac * (pk - bg):
+                continue          # something bright next to it: a glyph, a box, a neighbour
+            m.x, m.y = x0 + cx, y0 + cy
+            m.size_mm = round(diam / px_mm, 3)
+            out.append(m)
+    return out
+
+
+def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4, tol_px: int = 30,
+                       max_rows: int = 6, seed: int = 0) -> dict[int, float]:
+    """Cluster one side's marks into STRAIGHT rows in mosaic (x, y) -- RANSAC lines.
+
+    Replaces the dy-histogram clustering (constant offset from the restitution line).
+    2026-09-19, ops251 A052: the dense train is straight on the film but the rupture
+    line diverges from it by 332 px across the frame, so a constant-dy row lost every
+    mark near the ends (pink on the rail sheets) and the sparse train never formed.
+    A row of marks is a physically straight line relative to the camera; the line
+    model is the thing allowed to be wrong. Returns {row_id: median dy} and sets
+    m.row; m.dy stays y - line(x) at the mark, for reporting."""
+    ms = [m for m in marks if m.side == side]
+    for m in ms:
+        m.row = -1
+    if len(ms) < min_count:
+        return {}
+    rng = np.random.default_rng(seed)
+    xs = np.array([m.x for m in ms]); ys = np.array([m.y for m in ms])
+    free = np.ones(len(ms), bool)
+    rows: dict[int, float] = {}
+    rid = 0
+    while free.sum() >= min_count and rid < max_rows:
+        idx = np.flatnonzero(free)
+        best, best_in = None, None
+        for _ in range(min(400, len(idx) * 4)):
+            i, j = rng.choice(idx, 2, replace=False)
+            if abs(xs[i] - xs[j]) < 500:
+                continue
+            b = (ys[j] - ys[i]) / (xs[j] - xs[i]); a = ys[i] - b * xs[i]
+            if abs(b) > 0.05:          # > ~3 deg: not a rail row
+                continue
+            r = np.abs(ys[idx] - (a + b * xs[idx]))
+            inl = idx[r <= tol_px]
+            if best is None or inl.size > best_in.size:
+                best, best_in = (a, b), inl
+        if best is None or best_in.size < min_count:
+            break
+        # refine with a least-squares line on the inliers, re-select
+        A = np.vstack([np.ones(best_in.size), xs[best_in]]).T
+        a, b = np.linalg.lstsq(A, ys[best_in], rcond=None)[0]
+        r = np.abs(ys[idx] - (a + b * xs[idx]))
+        inl = idx[r <= tol_px]
+        for k in inl:
+            ms[k].row = rid
+        free[inl] = False
+        rows[rid] = float(np.median([ms[k].dy for k in inl]))
+        rid += 1
+    return rows
+
+
 def cluster_rows(marks: list[Mark], side: str, bin_px: int = 8, min_count: int = 3, assign_px: int = 45) -> dict[int, float]:
     """Cluster the signed line offset dy of one side's marks into rows (histogram
     peaks). Returns {row_id: dy_centre}; marks get .row set (-1 = unassigned)."""
@@ -445,7 +549,7 @@ def _period_candidates(d: NDArray, pitch_x: float) -> list[float]:
 
 def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_iter: int = 8) -> Train | None:
     ms = sorted([m for m in marks if m.side == side and m.row == row], key=lambda m: m.x)
-    if len(ms) < 3:
+    if len(ms) < 6:      # 2026-09-19: 3 marks fit any period; a rail row has >= 6 (sparse: 18 slots per 90 deg)
         return None
     xs = np.array([m.x for m in ms])
     sc = np.array([m.score for m in ms])
@@ -461,7 +565,13 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
         if P <= 20:
             continue
         mult = d / P
-        ok = np.abs(mult - np.round(mult)) <= 0.08 * np.maximum(1, np.round(mult))
+        # 2026-09-19: the residual test is ABSOLUTE px, not a fraction that grows with the
+        # multiple. With 0.08 x k, a 5-mark scan-angle row (spacing 19 k px) "supported" a
+        # 1301-px dense period at k = 14 with a 1.1-period tolerance, and won the ranking on
+        # A053's top rail. A row is on lattice P when every gap is within a few tens of px of
+        # an integer multiple of P, whatever k is.
+        tol = max(60.0, 0.04 * P)
+        ok = np.abs(d - np.round(mult) * P) <= tol
         ok &= np.round(mult) >= 1
         support = int(ok.sum())
         # Every sub-multiple of the true period also has full integer support, so
@@ -563,10 +673,15 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
     t0 = time.time()
     marks, info = detect_marks(mosaic, anchors, sides=sides, kinds=kinds, block_w=block_w,
                                score_min=score_min, x_range=x_range)
+    n_raw = len(marks)
+    marks = refine_marks(mosaic, marks, anchors.pitch_um)
+    logger.info("refine_marks: %d template hits -> %d isolated dots (native-res centroid, FWHM size, annulus test)",
+                n_raw, len(marks))
+    info["n_template_hits"] = n_raw
     trains: list[Train] = []
     rows_by_side: dict[str, dict[int, float]] = {}
     for side in sides:
-        rows = cluster_rows(marks, side)
+        rows = cluster_rows_lines(marks, side, anchors.line(side))
         rows_by_side[side] = rows
         for row in rows:
             t = fit_train(marks, side, row, anchors)

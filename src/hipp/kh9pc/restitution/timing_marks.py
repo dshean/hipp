@@ -437,14 +437,30 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
             n, cc = cv2.connectedComponents(bright.astype(np.uint8), lbl, connectivity=8)
             cid = cc[h, h]
             if cid == 0:
-                continue
+                # a WAGON WHEEL (missions 1214-1219: open ring + cross, dark hub -- cg A006 measured
+                # ~50 px outer diameter, ~6 px stroke, hub 24-50 DN on a 250 peak) has no bright
+                # pixel at the template centre; take the component nearest the centre instead
+                near = cc[h - 12:h + 13, h - 12:h + 13]
+                ids, cnt = np.unique(near[near > 0], return_counts=True)
+                if ids.size == 0:
+                    continue
+                cid = int(ids[np.argmax(cnt)])
             blob = cc == cid
             area = int(blob.sum())
-            diam = 2.0 * math.sqrt(area / math.pi)
+            ys_, xs_ = np.nonzero(blob)
+            bw, bh = xs_.max() - xs_.min() + 1, ys_.max() - ys_.min() + 1
+            fill = area / float(bw * bh)
+            # a filled disk fills ~pi/4 = 0.79 of its box; a ring + cross fills ~0.4. Size a wheel by
+            # its box, a disk by its area, so the isolation annulus sits outside the glyph either way.
+            is_wheel = fill < 0.6 and max(bw, bh) >= 0.15 * px_mm
+            diam = float(max(bw, bh)) if is_wheel else 2.0 * math.sqrt(area / math.pi)
             if not (min_mm * px_mm <= diam <= max_mm * px_mm):
                 continue
+            if is_wheel and abs(bw - bh) > 0.35 * max(bw, bh):
+                continue          # a ring is round; a text stroke is not
             wgt = np.where(blob, a - bg, 0.0)
             cx = float((wgt * xx).sum() / wgt.sum()); cy = float((wgt * yy).sum() / wgt.sum())
+            m.kind = "wheel" if is_wheel else "disk"
             R = diam / 2.0
             rr = np.hypot(xx - cx, yy - cy)
             ann = a[(rr >= 1.4 * R) & (rr <= 2.6 * R)]

@@ -1067,6 +1067,9 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--score-min", type=float, default=0.45)
     ap.add_argument("--block-w", type=int, default=16384)
     ap.add_argument("--x-range", help="restrict to 'x0,x1' raster px (cheap centre probe: e.g. centre +- 10000)")
+    ap.add_argument("--exact-rows", action="store_true",
+                    help="with --top-row/--bottom-row: the rows are exact (e.g. from a rectified-canvas sidecar) -- "
+                         "no per-block line probe, no widened band (2026-09-19)")
     ap.add_argument("--no-figure", action="store_true")
     ap.add_argument("--threads", type=int, default=4, help="cv2 threads")
     ap.add_argument("-v", "--verbose", action="count", default=1)
@@ -1085,7 +1088,7 @@ def main(argv: list[str] | None = None) -> int:
         if not (a.edges and a.pitch):
             ap.error("--top-row/--bottom-row need --edges and --pitch")
         anchors = RailAnchors(_const(a.top_row), _const(a.bottom_row), _parse_pair(a.edges, int), _parse_pair(a.pitch),
-                              "manual rows", constant_rows=True)
+                              "manual rows" + (" (exact)" if a.exact_rows else ""), constant_rows=not a.exact_rows)
     else:
         ap.error("one of --joblib, --qc-json, or --top-row/--bottom-row is required")
     if a.edges:

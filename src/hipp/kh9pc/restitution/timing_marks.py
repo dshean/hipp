@@ -95,8 +95,13 @@ def _const(row: float) -> Callable[[NDArray], NDArray]:
 
 
 def anchors_from_joblib(path: str | Path) -> tuple[RailAnchors, Path | None]:
-    """Line models / edges / pitch from a fitted restitution joblib
-    (MixedStrategy or CollimationStrategy). Returns (anchors, raster path)."""
+    """Line models / edges / pitch from a fitted restitution joblib (MixedStrategy,
+    CollimationStrategy or a bare PolyStrategy). Returns (anchors, raster path).
+
+    The per-side models taken here are ``_results[side].model`` -- the RANSAC RUPTURE
+    models. On a no-collimation-line block those are also the delivered geometry
+    (POLY_EDGE_CLASS_POLICY=rupture, 2026-09-18), so the rails are placed off the same
+    feature the product is cut on.""",
     import joblib
 
     s = joblib.load(path)
@@ -108,13 +113,19 @@ def anchors_from_joblib(path: str | Path) -> tuple[RailAnchors, Path | None]:
             sel = s
     res = getattr(sel, "_results", None)
     if not res or "top" not in res or "bottom" not in res or not hasattr(res["top"], "model"):
-        raise ValueError(f"{path}: no top/bottom line models ({type(sel).__name__}) -- need a CollimationStrategy fit")
+        raise ValueError(f"{path}: no top/bottom line models ({type(sel).__name__}) -- need a Collimation or Poly fit")
     top_m, bot_m = res["top"].model, res["bottom"].model
 
     def _mk(m):
         return lambda x: np.asarray(m.predict(np.asarray(x, dtype=float).reshape(-1, 1)), dtype=float).ravel()
 
-    vd = sel.poly_strategy.vertical_detector
+    # 2026-09-18: the prototype assumed a Mixed/Collimation wrapper that carries a
+    # .poly_strategy. A block with no collimation lines (nepal ops251, mission 1205) selects a
+    # bare PolyStrategy, which IS the poly strategy and has the detector directly.
+    _poly = getattr(sel, "poly_strategy", None) or sel
+    vd = getattr(_poly, "vertical_detector", None)
+    if vd is None:
+        raise ValueError(f"{path}: {type(sel).__name__} carries no vertical_detector -- cannot place the rails")
     edges = tuple(int(v) for v in vd.edges_)
     pitch = getattr(sel, "scan_pitch_um", None)
     if pitch is None:

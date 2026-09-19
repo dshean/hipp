@@ -547,7 +547,6 @@ def cluster_rows(marks: list[Mark], side: str, bin_px: int = 8, min_count: int =
 class Train:
     side: str
     row: int
-    section_dx: dict = field(default_factory=dict)   # {section: median x offset from the global grid} = seam x errors
     dy_px: float
     dy_mm: float
     label: str
@@ -579,6 +578,7 @@ class Train:
     coded: bool                  # gappy train starting near the centre = serialized time word
     kind_majority: str
     presence_from_first: str     # '1'/'0' per slot from the first mark (<= 96 slots)
+    section_dx: dict = field(default_factory=dict)   # {section: median x offset from the global grid} = seam x errors
 
 
 def _period_candidates(d: NDArray, pitch_x: float) -> list[float]:

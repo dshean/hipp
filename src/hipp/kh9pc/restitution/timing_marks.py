@@ -67,7 +67,11 @@ PERIOD_CLASS_TOL = 0.20           # +-20 % around a class for the label (hipp DE
 DISK_DIAM_MM = (0.22, 0.28, 0.34, 0.42, 0.50)   # 2026-09-19: +0.22/0.28 -- mission 1205 bottom-rail scan-angle marks are small dots
 WHEEL_DIAM_MM = (0.36, 0.41, 0.46)
 WHEEL_STROKE_MM = 0.055
-TEMPLATE_PAD_PX = 10
+TEMPLATE_PAD_PX = 40    # 2026-09-19 (was 10): dshean -- "your template needs to be larger ... marks are
+                        # isolated, single dots with near-black film on all sides". A pad of ~0.8 x the
+                        # dot diameter puts the dark surround INTO the normalised correlation, so a bright
+                        # blob with a neighbour (a glyph stroke, a slate corner) scores low at the match
+                        # stage rather than being caught later by refine_marks() alone.
 TEMPLATE_BLUR_PX = 1.5
 
 

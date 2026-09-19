@@ -692,7 +692,12 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
             k1 = np.round((xs - off - x0) / P)
             r1 = xs - off - (x0 + P * k1)
             mad = 1.4826 * float(np.median(np.abs(r1[inl]))) if inl.sum() > 2 else 0.0
-            tol_s = min(max(3.0 * mad, 12.0), max(60.0, 0.04 * P))
+            # the 500-cycle time track is variable-spacing BY DESIGN (NRO TCS-20055/69 p.7), so a
+            # tight lattice tolerance throws away real marks: >= 60 px for a dense-class period,
+            # >= 40 px for the scan-angle lattice, and never tighter than 3 x MAD.
+            P_mm_here = P * pitch_x / 1000.0
+            floor = 60.0 if abs(P_mm_here - PERIOD_CLASSES_MM["dense"]) <= PERIOD_CLASS_TOL * PERIOD_CLASSES_MM["dense"] else 40.0
+            tol_s = max(3.0 * mad, floor)
             inl = np.abs(r1) <= tol_s
     k = np.round((xs - off - x0) / P).astype(int)
     r = xs - off - (x0 + P * k)
@@ -768,7 +773,11 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
     # p.7), so a "dense" train may stand on one side only -- the side with the fuller one; and a dense
     # train that fills under half its slots is staircase debris, not a track.
     for t in trains:
-        if t.label == "dense" and t.n_inliers < 0.5 * max(t.n_slots, 1):
+        # demote a dense row only when a much fuller dense row (>= 3x) exists on the same rail --
+        # a half-filled row is staircase debris only if the real track is also there
+        fuller = [u for u in trains if u is not t and u.side == t.side and u.label == "dense"
+                  and u.n_inliers >= 3 * max(t.n_inliers, 1)]
+        if t.label == "dense" and fuller:
             t.label = "other"
     dense_sides = {}
     for t in trains:

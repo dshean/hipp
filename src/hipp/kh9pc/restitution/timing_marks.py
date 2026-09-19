@@ -579,6 +579,8 @@ class Train:
     kind_majority: str
     presence_from_first: str     # '1'/'0' per slot from the first mark (<= 96 slots)
     section_dx: dict = field(default_factory=dict)   # {section: median x offset from the global grid} = seam x errors
+    x_curve_coeffs: list = field(default_factory=list)   # poly(k) -> x, highest power first; the along-scan curve used for the inlier test
+    x_curve_pp_px: float = 0.0                          # peak-to-peak of (curve - uniform grid) over the observed k: the physical dx curve
 
 
 def _period_candidates(d: NDArray, pitch_x: float) -> list[float]:
@@ -699,8 +701,40 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
             floor = 60.0 if abs(P_mm_here - PERIOD_CLASSES_MM["dense"]) <= PERIOD_CLASS_TOL * PERIOD_CLASSES_MM["dense"] else 40.0
             tol_s = max(3.0 * mad, floor)
             inl = np.abs(r1) <= tol_s
+    # Smooth along-scan curve (dshean 2026-09-19: "make sure you are not cutting off marks near the
+    # left and right edges, now that we know about the parabolic dx spacing"). On F056 rectified the
+    # residual against the uniform grid is a -100..+55 px parabola shared by both rails and the time
+    # track; a fixed tolerance rejected 8 of the 33 dense marks nearest the edges. So the INLIER test
+    # uses a low-order polynomial x(k) = poly(k) (degree 2, 3 with >= 12 marks) fitted to the
+    # inliers, while m.resid stays the residual against the UNIFORM grid -- that curve is the
+    # physical measurement (film stretch or canvas scale) and is reported on the train.
     k = np.round((xs - off - x0) / P).astype(int)
     r = xs - off - (x0 + P * k)
+    curve_coef, curve_pp = None, 0.0
+    if inl.sum() >= 6:
+        P_mm_c = P * pitch_x / 1000.0
+        floor_c = 60.0 if abs(P_mm_c - PERIOD_CLASSES_MM["dense"]) <= PERIOD_CLASS_TOL * PERIOD_CLASSES_MM["dense"] else 40.0
+        kk = k.astype(float)
+        for _ in range(4):
+            deg = 3 if inl.sum() >= 12 else 2
+            coef = np.polyfit(kk[inl], (xs - off)[inl], deg)
+            rp = (xs - off) - np.polyval(coef, kk)
+            # a mark a whole period off the curve is mis-indexed, not an outlier: re-index it
+            far = np.abs(rp) > 0.5 * P
+            if far.any():
+                kk[far] = kk[far] + np.round(rp[far] / P)
+                rp = (xs - off) - np.polyval(coef, kk)
+            mad = 1.4826 * float(np.median(np.abs(rp[inl] - np.median(rp[inl])))) if inl.sum() > 2 else 0.0
+            new_inl = np.abs(rp) <= max(3.0 * mad, floor_c)
+            if np.array_equal(new_inl, inl):
+                break
+            inl = new_inl
+        curve_coef = [float(c) for c in coef]
+        k = kk.astype(int)
+        r = xs - off - (x0 + P * k)                      # residual vs the UNIFORM grid (physics)
+        kr = np.arange(k[inl].min(), k[inl].max() + 1, dtype=float)
+        dev = np.polyval(coef, kr) - (x0 + P * kr)
+        curve_pp = float(dev.max() - dev.min())
     for m, ki, ri, ii in zip(ms, k, r, inl):
         m.k, m.resid, m.inlier = int(ki), float(ri), bool(ii)
     ki = k[inl]
@@ -725,7 +759,8 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
     pres = "".join("1" if kk in present else "0" for kk in range(kmin, min(kmax, kmin + 95) + 1))
     rr = r[inl]
     return Train(
-        side=side, row=row, section_dx={int(a): round(float(b), 1) for a, b in sec_dx.items()}, dy_px=dy, dy_mm=dy * anchors.pitch_um[1] / 1000.0, label=cls,
+        side=side, row=row, section_dx={int(a): round(float(b), 1) for a, b in sec_dx.items()},
+        x_curve_coeffs=curve_coef or [], x_curve_pp_px=round(curve_pp, 1), dy_px=dy, dy_mm=dy * anchors.pitch_um[1] / 1000.0, label=cls,
         period_px=P, period_mm=P_mm, period_deg=math.degrees(P_mm / FOCAL_MM), x0=float(x0),
         n_marks=len(ms), n_inliers=int(inl.sum()), n_outliers=int((~inl).sum()),
         k_min=kmin, k_max=kmax, n_slots=n_slots, n_missing=len(missing), missing_k=missing[:200],
@@ -824,10 +859,10 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
         except Exception:
             logger.exception("figure failed (non-fatal)")
     for t in trains:
-        logger.info("TRAIN %s row%d dy=%+.0f px (%.2f mm) %s P=%.2f px = %.3f mm = %.4f deg n=%d/%d slots missing=%d rms=%.2f px "
+        logger.info("TRAIN %s row%d dy=%+.0f px (%.2f mm) %s P=%.2f px = %.3f mm = %.4f deg n=%d/%d slots missing=%d rms=%.2f px curve_pp=%.0f px "
                     "first-left=%.0f right-last=%.0f nearest-to-center dx=%+.0f px (%+.3f deg) coded=%s kind=%s",
                     t.side, t.row, t.dy_px, t.dy_mm, t.label, t.period_px, t.period_mm, t.period_deg, t.n_inliers,
-                    t.n_slots, t.n_missing, t.resid_rms_px, t.first_minus_left_edge, t.right_edge_minus_last,
+                    t.n_slots, t.n_missing, t.resid_rms_px, t.x_curve_pp_px, t.first_minus_left_edge, t.right_edge_minus_last,
                     t.nearest_mark_dx, t.nearest_mark_dx_deg, t.coded, t.kind_majority)
     return summary
 
@@ -940,6 +975,12 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
                       f"nearest-to-center {t.nearest_mark_dx:+.0f} px{' CODED' if t.coded else ''}")
         xo = [m.x for m in ms if not m.inlier]
         ax.plot(xo, [0] * len(xo), "x", ms=4, color=c, alpha=0.6)
+        if t.x_curve_coeffs:
+            kk = np.array(sorted(m.k for m in ms if m.inlier), dtype=float)
+            if kk.size > 1:
+                kr = np.linspace(kk.min(), kk.max(), 200)
+                xr = np.polyval(t.x_curve_coeffs, kr)
+                ax.plot(xr, xr - (t.x0 + t.period_px * kr), color=c, lw=0.6, alpha=0.5)
     ax.axvline(left, color="k", ls="--", lw=0.8); ax.axvline(right, color="k", ls="--", lw=0.8); ax.axvline(cx, color="orange", ls=":", lw=1)
     ax.axhline(0, color="k", lw=0.5)
     ax.set_ylabel("x residual vs uniform grid (px)", fontsize=8); ax.set_xlabel("raster x (px)", fontsize=8)

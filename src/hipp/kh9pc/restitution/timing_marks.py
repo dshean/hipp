@@ -16,7 +16,7 @@ Description: PROTOTYPE (kh9pc, 2026-08-26) -- detection of the periodic mark
       * a DENSE train, one mark every ~9.1 mm (~1300 px at 7 um): regular on
         the time-track edge (500-cycle pulse), gappy = serialized TIME WORD on
         the titling edge, starting at the centre of format (first mark seen
-        400-490 px past the detector's sweep centre on F013 and A010);
+        400-490 px past the detector's sweep center on F013 and A010);
       * a MID (1.048 in, 3803 px at 7 um; missions >= 1214) or SPARSE (5.24 in,
         19014 px; missions <= 1213) scan-angle train in a second row;
       * glyphs: plain disks ~0.42 mm (D3C1210), wagon wheels ~0.40 mm
@@ -571,7 +571,7 @@ class Train:
     n_beyond_left: int
     n_beyond_right: int
     centre_x: float              # (left + right) / 2 exposure edges
-    k_at_centre: float           # fractional grid index of the sweep centre
+    k_at_centre: float           # fractional grid index of the sweep center
     nearest_mark_dx: float       # x(nearest mark) - centre_x  (px)
     nearest_mark_dx_mm: float
     nearest_mark_dx_deg: float
@@ -825,7 +825,7 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
             logger.exception("figure failed (non-fatal)")
     for t in trains:
         logger.info("TRAIN %s row%d dy=%+.0f px (%.2f mm) %s P=%.2f px = %.3f mm = %.4f deg n=%d/%d slots missing=%d rms=%.2f px "
-                    "first-left=%.0f right-last=%.0f nearest-to-centre dx=%+.0f px (%+.3f deg) coded=%s kind=%s",
+                    "first-left=%.0f right-last=%.0f nearest-to-center dx=%+.0f px (%+.3f deg) coded=%s kind=%s",
                     t.side, t.row, t.dy_px, t.dy_mm, t.label, t.period_px, t.period_mm, t.period_deg, t.n_inliers,
                     t.n_slots, t.n_missing, t.resid_rms_px, t.first_minus_left_edge, t.right_edge_minus_last,
                     t.nearest_mark_dx, t.nearest_mark_dx_deg, t.coded, t.kind_majority)
@@ -889,7 +889,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
             ax.axvline(xe, color="w", ls="--", lw=0.8)
         ax.axvline(cx, color="yellow", ls=":", lw=1.0)
         ax.text(0.005, 0.95, f"{side} rail band, x max-pooled {f}:1 (marks survive), rows = line {['-', '+'][side == 'bottom']}"
-                f"[{BAND_INNER_MM}, {BAND_OUTER_MM}] mm; white dashed = exposure edges, yellow = sweep centre",
+                f"[{BAND_INNER_MM}, {BAND_OUTER_MM}] mm; white dashed = exposure edges, yellow = sweep center",
                 transform=ax.transAxes, va="top", ha="left", fontsize=8, color="w",
                 bbox=dict(facecolor="k", alpha=0.5, lw=0))
         ax.set_yticks([])
@@ -899,20 +899,30 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     # --- y position vs x per side (dshean 2026-09-19: "you need a y position value plot for each") ---
     for i, side in enumerate(sides):
         ax = fig.add_subplot(gs[n_ov + i, :])
+        row_mean = {}
         for m in marks:
-            if m.side != side:
-                continue
+            if m.side == side and m.row >= 0 and m.inlier:
+                row_mean.setdefault(m.row, []).append(m.dy)
+        row_mean = {r: float(np.mean(v)) for r, v in row_mean.items()}
+        for m in marks:
+            if m.side != side or m.row < 0 or m.row not in row_mean:
+                continue        # unassigned hits are not marks; they stay off the y panels
             c = _TRAIN_COLORS.get(label_of.get((side, m.row), ""), "#707070")
-            ax.plot(m.x, m.dy, marker="o" if m.inlier else "x", ms=3.5 if m.inlier else 4.5, mfc="none", mec=c, color=c, lw=0)
+            ax.plot(m.x, m.dy - row_mean[m.row], marker="o" if m.inlier else "x", ms=3.5 if m.inlier else 4.5,
+                    mfc="none", mec=c, color=c, lw=0)
+        for r, mu in row_mean.items():
+            ax.text(0.005, 0.95 - 0.1 * list(row_mean).index(r), f"row {r} ({label_of.get((side, r), '?')}): mean dy {mu:+.0f} px",
+                    transform=ax.transAxes, fontsize=7, va="top")
+        ax.axhline(0, color="k", lw=0.5)
         if sec:
             xx = np.linspace(0, max(sec["x_start"][-1] * 1.05, right), 600)
             sidx = np.clip(np.searchsorted(np.asarray(sec["x_start"]), xx, side="right") - 1, 0, len(sec["x_start"]) - 1)
-            base = float(np.median([m.dy for m in marks if m.side == side and m.inlier] or [0.0]))
-            ax.plot(xx, np.asarray(sec["cum_ty"])[sidx] * (-1 if side == "top" else 1) + base,
-                    color="#888888", lw=0.8, ls="--", label="seam ty staircase (merge provenance) + median row dy")
+            st = np.asarray(sec["cum_ty"])[sidx] * (-1 if side == "top" else 1)
+            ax.plot(xx, st - float(np.mean(st)), color="#888888", lw=0.8, ls="--",
+                    label="seam ty staircase (merge provenance), mean removed")
             ax.legend(fontsize=7, loc="upper right", framealpha=0.85)
         ax.axvline(left, color="k", ls="--", lw=0.8); ax.axvline(right, color="k", ls="--", lw=0.8)
-        ax.set_ylabel(f"{side}: mark y - line(x) (px)", fontsize=8)
+        ax.set_ylabel(f"{side}: mark y - row mean (px)", fontsize=8)
         ax.set_xlabel("raster x (px)", fontsize=8); ax.tick_params(labelsize=7); ax.grid(axis="y", alpha=0.3)
         if side == "top":
             ax.invert_yaxis()
@@ -927,7 +937,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
         ax.plot(xi, ri, ".", ms=3, color=c, ls="-" if t.side == "top" else "--", lw=0.4,
                 label=f"{t.side} {t.label} P={t.period_px:.2f} px ({t.period_mm:.3f} mm, {t.period_deg:.4f} deg) "
                       f"n={t.n_inliers}/{t.n_slots} missing={t.n_missing} rms={t.resid_rms_px:.2f} px "
-                      f"nearest-to-centre {t.nearest_mark_dx:+.0f} px{' CODED' if t.coded else ''}")
+                      f"nearest-to-center {t.nearest_mark_dx:+.0f} px{' CODED' if t.coded else ''}")
         xo = [m.x for m in ms if not m.inlier]
         ax.plot(xo, [0] * len(xo), "x", ms=4, color=c, alpha=0.6)
     ax.axvline(left, color="k", ls="--", lw=0.8); ax.axvline(right, color="k", ls="--", lw=0.8); ax.axvline(cx, color="orange", ls=":", lw=1)
@@ -947,7 +957,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
 
     # --- native zooms at left edge / centre / right edge, first side with an overview ---
     # zooms follow the SPARSE (scan-angle) train where one exists: the marks nearest the left edge,
-    # the sweep centre and the right edge (dshean 2026-09-19: A053's fixed-x windows showed the
+    # the sweep center and the right edge (dshean 2026-09-19: A053's fixed-x windows showed the
     # start-of-frame slate and an empty centre)
     t_sp = sorted([t for t in trains if t.label == "sparse"], key=lambda t: -t.n_inliers)
     zoom_side = t_sp[0].side if t_sp else (sides[0] if sides else "top")
@@ -977,7 +987,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
                     c = _TRAIN_COLORS.get(label_of.get((zoom_side, m.row), ""), "#707070")
                     ax.add_patch(plt.Circle((m.x, m.y), 45, fill=False, ec=c, lw=1.0, ls="-" if m.inlier else ":"))
                     ax.text(m.x, m.y - 50, f"{m.kind[0]}{m.score:.2f} k{m.k}", color=c, fontsize=6, ha="center")
-            ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['nearest left edge', 'nearest sweep centre', 'nearest right edge'][j]}{' sparse mark' if t_sp else ''})",
+            ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['nearest left edge', 'nearest sweep center', 'nearest right edge'][j]}{' sparse mark' if t_sp else ''})",
                     transform=ax.transAxes, va="top", fontsize=7, color="w", bbox=dict(facecolor="k", alpha=0.5, lw=0))
             ax.tick_params(labelsize=6)
             if j == 1:

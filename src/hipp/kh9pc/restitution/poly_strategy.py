@@ -507,6 +507,12 @@ class PolyStrategy(RestitutionStrategy):
         # a mixed pair should be demoted (content walk, further in) or promoted (oracle frame edge).
         self._detected_height_ = float(detected_height)
         self._pad_y_ = float(pad_y)
+        # canvas-space geometry for transform_extended(): the straightened line rows and the
+        # exposure edges, all in canvas px BEFORE the crop offset is applied (2026-09-19)
+        self._top_dst_ = float(top * sy)
+        self._bot_dst_ = float(bot * sy)
+        self._left_dst_ = float(left)
+        self._right_dst_ = float(left + detected_width)
         self._crop_top_ = float(crop_top)
         self._crop_bot_ = float(crop_bot)
 
@@ -535,3 +541,53 @@ class PolyStrategy(RestitutionStrategy):
             block_size=2**13,
             lowres_step=100,
         )
+
+
+    def transform_extended(self, output_path: str | Path, rail_px: int = 1600) -> dict:
+        """Write the SAME warp over a window extended by ``rail_px`` rows above and below the
+        delivered canvas, so the film margins -- scan-angle marks, time track, titling data --
+        are rectified too. Split of "restitution" and "crop" (dshean 2026-09-19): the crop is
+        already only a translation inside ``Transformation.inverse_remap`` (coords + crop_offset),
+        so the delivered product is the integer sub-window rows [rail_px, rail_px + H) of this
+        file, bit-identical -- no second warp. The marks are then straight rows at known canvas
+        rows with a uniform period, which is both an easier detection and a check on the
+        restitution itself (a bent row or a stepped period = a bad seam or edge model).
+
+        Returns the sidecar dict that is also written as ``<output>.json``: rect_offset /
+        rect_size (canvas px), the delivered window inside it, the straightened line rows and
+        exposure edges in rect-canvas px, and the canvas pitch.
+        """
+        import dataclasses
+        import json as _json
+        tf = self.transformation_
+        rail_px = int(rail_px)
+        ext = dataclasses.replace(
+            tf,
+            crop_offset=(tf.crop_offset[0], tf.crop_offset[1] - rail_px),
+            output_size=(tf.output_size[0], tf.output_size[1] + 2 * rail_px),
+        )
+        remap_tif_blockwise(
+            ext.raster_filepath,
+            output_path,
+            ext.inverse_remap,
+            ext.output_size,
+            block_size=2**13,
+            lowres_step=100,
+        )
+        from hipp.kh9pc.kh9_image_spec import CANVAS_PITCH_UM
+        ox, oy = ext.crop_offset
+        side = {
+            "rail_px": rail_px,
+            "rect_offset": [int(ox), int(oy)],
+            "rect_size": [int(ext.output_size[0]), int(ext.output_size[1])],
+            "delivered_window": {"col_off": 0, "row_off": rail_px,
+                                 "width": int(tf.output_size[0]), "height": int(tf.output_size[1])},
+            "delivered_crop_offset": [int(tf.crop_offset[0]), int(tf.crop_offset[1])],
+            "line_rows_rect": {"top": self._top_dst_ - oy, "bottom": self._bot_dst_ - oy},
+            "edges_rect": [self._left_dst_ - ox, self._right_dst_ - ox],
+            "canvas_pitch_um": [CANVAS_PITCH_UM, CANVAS_PITCH_UM],
+            "edge_classes": dict(getattr(self, "_edge_class_", {})),
+            "source_raster": str(tf.raster_filepath),
+        }
+        Path(str(output_path) + ".json").write_text(_json.dumps(side, indent=2) + "\n")
+        return side

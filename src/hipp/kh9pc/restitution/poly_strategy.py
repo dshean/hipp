@@ -332,10 +332,49 @@ class PolyStrategy(RestitutionStrategy):
         # the oracle verdict itself is re-tuned, and a site whose oracle is genuinely unreliable still
         # wants the verdict to bite.
         _policy = os.environ.get("POLY_EDGE_CLASS_POLICY", "promote")
-        if _policy not in ("promote", "consistent", "native", "oracle"):
-            raise ValueError(
-                "POLY_EDGE_CLASS_POLICY must be 'promote'|'consistent'|'native'|'oracle' (got %r)" % _policy)
+        if _policy not in ("promote", "consistent", "native", "oracle", "rupture"):
+            raise ValueError("POLY_EDGE_CLASS_POLICY must be "
+                             "'promote'|'consistent'|'native'|'oracle'|'rupture' (got %r)" % _policy)
         _rank = {"oracle": 0, "content": 1, "rupture": 2}
+        # Policy "rupture": deliver the RANSAC rupture model on both sides. dshean 2026-09-18,
+        # from the restitution sheets: "the green dots and the dashed light blue rupture model are
+        # the correct edges of the exposed area of the frame".
+        #
+        # The test he set is consistency, not agreement with a nominal -- the exposed frame must map
+        # to a CONSTANT rectangle. MEASURED on ops251, all 14 frames, separation in canvas px
+        # (analysis/nepal_canvas_2026-09-17/rupture_width_profile.txt):
+        #
+        #                 across frames              within a frame
+        #   rupture   median 22059, spread 148 px    median spread  96 px, worst  181, tilt <= +-161
+        #   oracle    median 21596, spread 745 px    median spread 615 px, worst 1328, tilt <= +-1188
+        #
+        # The rupture lines hold the separation to 0.67 % across the block and 0.44 % within a
+        # frame; the oracle is 5x and 6x worse. A055 -- the frame with the real exposure gap -- is
+        # the BEST of the block by this measure (15 px, 0.07 %), so the gap is nodata inside a
+        # correctly measured frame, exactly as the 2026-08-28 edge ruling says it should be.
+        #
+        # The rupture separation is 22059 px = 154.4 mm, not the 21771 px / 152.4 mm collimation
+        # pair -- about 1 mm outside the printed line on each side, which is where a film-frame
+        # edge belongs. So a block delivered on this model MUST also set KH9_IMAGE_HEIGHT_PX to
+        # that separation, or 154.4 mm of film is squeezed into a 152.4 mm canvas and every camera
+        # carries a 1.32 % along-track scale error.
+        if _policy == "rupture":
+            for _side in ("top", "bottom"):
+                _m = self._results[_side].model
+                self._edge_class_[_side] = "rupture"
+                if _side == "top":
+                    top_model, top_crop = _m, None
+                    y_top_src = top_model.predict(x.reshape(-1, 1)).ravel()
+                else:
+                    bot_model, bot_crop = _m, None
+                    y_bot_src = bot_model.predict(x.reshape(-1, 1)).ravel()
+            top, bot = int(np.median(y_top_src)), int(np.median(y_bot_src))
+            logger.warning(
+                "%s: POLY_EDGE_CLASS_POLICY=rupture -- delivering the rupture model on both sides "
+                "(rows %.1f / %.1f, separation %d src px); the canvas height must measure THIS "
+                "feature (KH9_IMAGE_HEIGHT_PX), not the collimation pair",
+                getattr(self, "raster_filepath_", "?"), float(np.median(y_top_src)),
+                float(np.median(y_bot_src)), int(bot - top))
         if _policy == "oracle":
             _need = {_s for _s in ("top", "bottom")
                      if self._edge_class_.get(_s) != "oracle"

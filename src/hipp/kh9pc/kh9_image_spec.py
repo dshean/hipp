@@ -17,6 +17,15 @@ from hipp.kh9pc.fiducial_patterns import Patterns
 # Nominal widths for 1, 2, 3, and 4-frame scans at 0.007 mm/px resolution.
 IMAGE_WIDTHS_PX: list[int] = [114082, 228165, 342247, 456329]
 IMAGE_HEIGHT_PX: int = 21771
+# ... but which FEATURE the canvas height measures is a per-mission ruling, so it is
+# overridable by KH9_IMAGE_HEIGHT_PX the same way the sector width is by
+# KH9_SECTOR_WIDTH_PX. 21771 px = 152.4 mm = the printed COLLIMATION LINE pair. If a
+# block is restituted to a different feature -- e.g. nepal ops251, where the delivered
+# geometry is the RUPTURE (film frame) edge and its separation measures 22059 px =
+# 154.4 mm, ~1 mm outside the line on each side -- the canvas MUST be that feature's
+# separation. Cutting at one feature while declaring the other's height bakes a
+# (22059/21771 - 1) = 1.32 % along-track scale error into every camera (dshean
+# 2026-09-18). MEASURED separations always belong in the block's own ruling, never here.
 # Physical pitch of the canvas: the collimation lines are 152.4 mm (6.000 in)
 # apart = 21770 px, and a 90 deg sector = f * pi/2 = 2394 mm = 342247 px, i.e.
 # the canonical dims are defined at 7.000 um/px. Scanner sessions run at
@@ -133,6 +142,19 @@ class KH9ImageSpec:
         # (prep wrapper TIER); pass it as KH9_SECTOR_WIDTH_PX. Without it, fall back to
         # the nearest tier in log space and warn when the raster is > 1.3x the tier.
         import logging, os
+        height = IMAGE_HEIGHT_PX
+        henv = os.environ.get("KH9_IMAGE_HEIGHT_PX")
+        if henv:
+            height = int(henv)
+            if not (0.9 * IMAGE_HEIGHT_PX <= height <= 1.1 * IMAGE_HEIGHT_PX):
+                raise ValueError(
+                    f"KH9_IMAGE_HEIGHT_PX={height} is more than 10 % from the collimation-line "
+                    f"canvas {IMAGE_HEIGHT_PX}; that is a different film format, not a ruling")
+            logging.getLogger(__name__).warning(
+                "KH9ImageSpec: canvas height overridden to %d px (%.1f mm at %.3f um) from the "
+                "default %d (%.1f mm) -- the delivered edge feature must be the one this measures",
+                height, height * CANVAS_PITCH_UM / 1000.0, CANVAS_PITCH_UM,
+                IMAGE_HEIGHT_PX, IMAGE_HEIGHT_PX * CANVAS_PITCH_UM / 1000.0)
         env = os.environ.get("KH9_SECTOR_WIDTH_PX")
         if env:
             tier = int(env)
@@ -140,11 +162,11 @@ class KH9ImageSpec:
                 raise ValueError(f"KH9_SECTOR_WIDTH_PX={tier} is not a known sector width {sorted(IMAGE_WIDTHS_PX)}")
             if width < 0.95 * tier or width > 2.0 * tier:
                 raise ValueError(f"Image width {width} is not plausible for the declared sector width {tier} (0.95..2.0x).")
-            return (tier, IMAGE_HEIGHT_PX)
+            return (tier, height)
         import math
         nearest = min(IMAGE_WIDTHS_PX, key=lambda w: abs(math.log(width / w)))
         if width > 1.3 * nearest or width < 0.95 * nearest:
             logging.getLogger(__name__).warning(
                 "KH9ImageSpec: raster width %d is %.2fx the nearest sector width %d -- set KH9_SECTOR_WIDTH_PX from the block tier",
                 width, width / nearest, nearest)
-        return (nearest, IMAGE_HEIGHT_PX)
+        return (nearest, height)

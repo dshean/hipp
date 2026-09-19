@@ -229,6 +229,7 @@ class Mark:
     k: int = -999999          # index on the fitted grid
     resid: float = float("nan")
     inlier: bool = False
+    recovered: bool = False   # found by the lattice-guided second pass (recover_slots)
 
 
 def _match_block(block: NDArray[np.uint8], bank: list[Template], score_min: float, nms_px: int
@@ -403,7 +404,8 @@ def load_sections(mosaic):
 
 
 def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
-                 min_mm: float = 0.15, max_mm: float = 0.75, iso_frac: float = 0.35) -> list[Mark]:
+                 min_mm: float = 0.15, max_mm: float = 0.75, iso_frac: float = 0.35,
+                 min_contrast: float = 25.0) -> list[Mark]:
     """Re-measure every template hit at NATIVE resolution and keep only isolated dots.
 
     dshean 2026-09-19: the template hits included fragments of the label text; real
@@ -428,7 +430,7 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
             a = d.read(1, window=Window(x0, y0, 2 * h, 2 * h)).astype(np.float32)
             bg = float(np.median(a))
             pk = float(a[h - 4:h + 5, h - 4:h + 5].max())
-            if pk - bg < 25:
+            if pk - bg < min_contrast:
                 continue
             yy, xx = np.mgrid[0:2 * h, 0:2 * h]
             bright = a > bg + 0.5 * (pk - bg)
@@ -472,17 +474,28 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
     return out
 
 
-def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4, tol_px: int = 30,
-                       max_rows: int = 6, seed: int = 0, sections=None) -> dict[int, float]:
-    """Cluster one side's marks into STRAIGHT rows in mosaic (x, y) -- RANSAC lines.
+def _fit_row_curve(x: NDArray, y: NDArray) -> NDArray:
+    """Low-order y(x) for one rail row; x scaled by 1e5 for conditioning. Degree grows with support."""
+    deg = 3 if x.size >= 12 else (2 if x.size >= 6 else 1)
+    return np.polyfit(x / 1e5, y, deg)
 
-    Replaces the dy-histogram clustering (constant offset from the restitution line).
-    2026-09-19, ops251 A052: the dense train is straight on the film but the rupture
-    line diverges from it by 332 px across the frame, so a constant-dy row lost every
-    mark near the ends (pink on the rail sheets) and the sparse train never formed.
-    A row of marks is a physically straight line relative to the camera; the line
-    model is the thing allowed to be wrong. Returns {row_id: median dy} and sets
-    m.row; m.dy stays y - line(x) at the mark, for reporting."""
+
+def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4, tol_px: int = 30,
+                       max_rows: int = 6, seed: int = 0, sections=None, curve_tol_px: int = 40,
+                       curves: dict | None = None) -> dict[int, float]:
+    """Cluster one side's marks into rows: RANSAC STRAIGHT-line seeds, then each row grown as a
+    smooth CURVE y(x) (degree 1-3 by support), rows merged when one curve fits both, free marks
+    assigned to the nearest curve.
+
+    2026-09-19 (ops251 A052): the dense train is straight on the film but the rupture line diverges
+    from it by 332 px across the frame, so a constant-dy row lost every mark near the ends.
+    2026-09-19 later (rectified canvas, dshean: "misclassifying 4 left marks on top", "3 valid marks
+    on the left edge", "gaps along the right side"): even on the rectified canvas a rail row is
+    NOT straight -- it curves +-40..70 px across the frame (the film margin vs the edge model), so
+    a straight row at tol 30 px split the ends off into "other" rows and the lattice fit never saw
+    them. Rows are smooth, not straight; the line model is the thing allowed to be wrong.
+    Returns {row_id: median dy} and sets m.row; m.dy stays y - line(x) at the mark. When `curves`
+    is given it receives {row_id: polyfit coefficients of y(x/1e5)} (raw-y only, i.e. no sections)."""
     ms = [m for m in marks if m.side == side]
     for m in ms:
         m.row = -1
@@ -493,7 +506,8 @@ def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4
     if sections is not None:
         ys = ys - sections.ty(xs)          # de-staircase: rows are straight in section-local y
     free = np.ones(len(ms), bool)
-    rows: dict[int, float] = {}
+    rows_inl: dict[int, NDArray] = {}
+    rows_coef: dict[int, NDArray] = {}
     rid = 0
     while free.sum() >= min_count and rid < max_rows:
         idx = np.flatnonzero(free)
@@ -511,18 +525,62 @@ def cluster_rows_lines(marks: list[Mark], side: str, line_fn, min_count: int = 4
                 best, best_in = (a, b), inl
         if best is None or best_in.size < min_count:
             break
-        # refine with a least-squares line on the inliers, re-select
-        A = np.vstack([np.ones(best_in.size), xs[best_in]]).T
-        a, b = np.linalg.lstsq(A, ys[best_in], rcond=None)[0]
-        r = np.abs(ys[idx] - (a + b * xs[idx]))
-        inl = idx[r <= tol_px]
-        for k in inl:
-            ms[k].row = rid
+        # grow the seed as a smooth curve: refit, re-select among the FREE marks, until stable
+        inl = best_in
+        coef = None
+        for _ in range(8):
+            coef = _fit_row_curve(xs[inl], ys[inl])
+            r = np.abs(ys[idx] - np.polyval(coef, xs[idx] / 1e5))
+            new = idx[r <= curve_tol_px]
+            if new.size < min_count or np.array_equal(np.sort(new), np.sort(inl)):
+                break
+            inl = new
+        rows_inl[rid] = inl; rows_coef[rid] = coef
         free[inl] = False
-        rows[rid] = float(np.median([ms[k].dy for k in inl]))
         rid += 1
+    # merge rows one curve explains (median |r| <= tol/2 and >= 90 % within tol on the union)
+    changed = True
+    while changed and len(rows_inl) > 1:
+        changed = False
+        ids = sorted(rows_inl)
+        for a_ in ids:
+            for b_ in ids:
+                if b_ <= a_:
+                    continue
+                u = np.concatenate([rows_inl[a_], rows_inl[b_]])
+                coef = _fit_row_curve(xs[u], ys[u])
+                # EACH row must fit the joint curve on its own: judged on the union, a 10-mark scan-angle
+                # row 200 px from a 228-mark time track "merged" because the union's median was the
+                # track's (F050 bottom, 2026-09-19) -- and the sparse row vanished into it
+                fits = [(np.median(np.abs(ys[g] - np.polyval(coef, xs[g] / 1e5))) <= 0.5 * curve_tol_px
+                         and np.mean(np.abs(ys[g] - np.polyval(coef, xs[g] / 1e5)) <= curve_tol_px) >= 0.9)
+                        for g in (rows_inl[a_], rows_inl[b_])]
+                if all(fits):
+                    rows_inl[a_] = u; rows_coef[a_] = coef
+                    del rows_inl[b_]; del rows_coef[b_]
+                    changed = True
+                    break
+            if changed:
+                break
+    # free marks near a row curve (within its span +- 30 k px) belong to it
+    for r_ in sorted(rows_inl):
+        xi = xs[rows_inl[r_]]
+        idx = np.flatnonzero(free & (xs >= xi.min() - 30000) & (xs <= xi.max() + 30000))
+        if idx.size:
+            r = np.abs(ys[idx] - np.polyval(rows_coef[r_], xs[idx] / 1e5))
+            take = idx[r <= curve_tol_px]
+            if take.size:
+                rows_inl[r_] = np.concatenate([rows_inl[r_], take]); free[take] = False
+                rows_coef[r_] = _fit_row_curve(xs[rows_inl[r_]], ys[rows_inl[r_]])
+    rows: dict[int, float] = {}
+    for new_id, old_id in enumerate(sorted(rows_inl, key=lambda k: -rows_inl[k].size)):
+        inl = rows_inl[old_id]
+        for k in inl:
+            ms[k].row = new_id
+        rows[new_id] = float(np.median([ms[k].dy for k in inl]))
+        if curves is not None and sections is None:
+            curves[new_id] = rows_coef[old_id]
     return rows
-
 
 def cluster_rows(marks: list[Mark], side: str, bin_px: int = 8, min_count: int = 3, assign_px: int = 45) -> dict[int, float]:
     """Cluster the signed line offset dy of one side's marks into rows (histogram
@@ -596,6 +654,7 @@ class Train:
     presence_from_first: str     # '1'/'0' per slot from the first mark (<= 96 slots)
     section_dx: dict = field(default_factory=dict)   # {section: median x offset from the global grid} = seam x errors
     x_curve_coeffs: list = field(default_factory=list)   # poly(k) -> x, highest power first; the along-scan curve used for the inlier test
+    n_recovered: int = 0                                # marks added by recover_slots() at predicted lattice slots
     x_curve_pp_px: float = 0.0                          # peak-to-peak of (curve - uniform grid) over the observed k: the physical dx curve
 
 
@@ -791,13 +850,89 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
     )
 
 
+def recover_slots(mosaic: Path, marks: list[Mark], trains: list[Train], anchors: RailAnchors,
+                  row_curves: dict[tuple[str, int], NDArray], score_min: float = 0.30, min_mm: float = 0.10,
+                  min_contrast: float = 15.0, y_tol: float = 110.0, max_extend: int = 12) -> list[Mark]:
+    """Lattice-guided second pass over the scan-angle trains.
+
+    dshean 2026-09-19 (F050/F051 rect): "missing finding candidates on bottom near centerline",
+    "missing several ... between valid detections". Native crops at the predicted slots showed the
+    marks are THERE but tiny and faint (15-20 px, 40-70 DN over the base) -- below the 0.45 template
+    score and the 25-DN contrast floor of the blind pass. Once a lattice is fitted a missing slot is
+    a prediction, so search a small native window around it with lower thresholds and keep the
+    isolated dot nearest the prediction (tagged recovered; the train is refitted afterwards). The
+    slots one beyond each end are tried too, walking outward while marks keep appearing -- the ends
+    are where a straight-row split used to lose them. An existing mark from ANOTHER row at a predicted
+    slot is re-assigned to this row instead of duplicated. Only sparse/mid trains: a dense gap is
+    usually nodata (F051 bottom ~104-137 k px, verified) or the coded time word."""
+    import rasterio
+    from rasterio.windows import Window
+    # smaller disks than the blind bank: the faint bottom-rail scan-angle dots on F050/F051 are ~0.10-0.15 mm
+    px = lambda mm: mm * 1000.0 / anchors.pitch_um[0]
+    bank = [Template("disk", d, make_disk_template(px(d))) for d in (0.12, 0.16, 0.22, 0.28, 0.34)]
+    nms_px = int(0.6 * min(t.image.shape[0] for t in bank))
+    added: list[Mark] = []
+    with rasterio.open(mosaic) as src:
+        W, H = src.width, src.height
+        for t in trains:
+            if t.label not in ("sparse", "mid") or not t.x_curve_coeffs or t.section_dx:
+                continue
+            xt = min(400.0, 0.02 * t.period_px + 100.0)
+            curve = row_curves.get((t.side, t.row))
+            line = anchors.line(t.side)
+            same_side = [m for m in marks if m.side == t.side]
+
+            def _try(k: int) -> bool:
+                xp = float(np.polyval(t.x_curve_coeffs, k))
+                yp = float(np.polyval(curve, xp / 1e5)) if curve is not None else float(line(np.array([xp]))[0]) + t.dy_px
+                near = [m for m in same_side if abs(m.x - xp) <= xt and abs(m.y - yp) <= y_tol]
+                if near:                      # already detected, just not in this row
+                    m = min(near, key=lambda m: abs(m.x - xp))
+                    if m.row != t.row:
+                        m.row = t.row; m.recovered = True; added.append(m)
+                        return True
+                    return False
+                x0, y0 = int(xp - xt), int(yp - y_tol)
+                w, h = int(2 * xt), int(2 * y_tol)
+                if x0 < 0 or y0 < 0 or x0 + w > W or y0 + h > H:
+                    return False
+                block = src.read(1, window=Window(x0, y0, w, h))
+                if not block.any():
+                    return False              # nodata
+                if block.dtype != np.uint8:
+                    block = cv2.normalize(block.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                cand = [Mark(x0 + xl, y0 + yl, t.side, sc, bank[tid].kind, bank[tid].size_mm,
+                             y0 + yl - float(line(np.array([x0 + xl]))[0]), row=t.row, recovered=True)
+                        for xl, yl, sc, tid in _match_block(block, bank, score_min, nms_px)]
+                cand = refine_marks(mosaic, cand, anchors.pitch_um, min_mm=min_mm, min_contrast=min_contrast)
+                cand = [m for m in cand if abs(m.x - xp) <= xt and abs(m.y - yp) <= y_tol]
+                if not cand:
+                    return False
+                m = min(cand, key=lambda m: math.hypot((m.x - xp) / xt, (m.y - yp) / y_tol))
+                m.dy = m.y - float(line(np.array([m.x]))[0])
+                marks.append(m); same_side.append(m); added.append(m)
+                return True
+
+            n0 = len(added)
+            for k in list(t.missing_k):
+                _try(k)
+            for k in range(t.k_min - 1, t.k_min - 1 - max_extend, -1):
+                if not _try(k):
+                    break
+            for k in range(t.k_max + 1, t.k_max + 1 + max_extend):
+                if not _try(k):
+                    break
+            t.n_recovered = len(added) - n0
+    return added
+
+
 # ----------------------------------------------------------------------------
 # Driver
 # ----------------------------------------------------------------------------
 def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag: str = "",
             sides=("top", "bottom"), kinds=("disk", "wheel"), score_min: float = 0.45,
             x_range: tuple[int, int] | None = None, block_w: int = 16384, figure: bool = True,
-            tier_px: int | None = None, expected_kind: str | None = None) -> dict:
+            tier_px: int | None = None, expected_kind: str | None = None, scan_class: str | None = None) -> dict:
     t0 = time.time()
     marks, info = detect_marks(mosaic, anchors, sides=sides, kinds=kinds, block_w=block_w,
                                score_min=score_min, x_range=x_range)
@@ -813,13 +948,41 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
         info["sections"] = {"x_start": sections.x_start, "cum_ty": sections.cum_ty, "source": sections.source}
     trains: list[Train] = []
     rows_by_side: dict[str, dict[int, float]] = {}
+    row_curves: dict[tuple[str, int], NDArray] = {}
     for side in sides:
-        rows = cluster_rows_lines(marks, side, anchors.line(side), sections=sections)
+        cv: dict = {}
+        rows = cluster_rows_lines(marks, side, anchors.line(side), sections=sections, curves=cv)
         rows_by_side[side] = rows
+        row_curves.update({(side, r): c for r, c in cv.items()})
         for row in rows:
             t = fit_train(marks, side, row, anchors, sections=sections)
             if t is not None:
                 trains.append(t)
+    # lattice-guided recovery of faint / end marks on the scan-angle trains, then refit those trains
+    added = recover_slots(mosaic, marks, trains, anchors, row_curves)
+    if added:
+        for i_t, t in enumerate(trains):
+            if t.n_recovered:
+                t2 = fit_train(marks, t.side, t.row, anchors, sections=sections)
+                if t2 is not None:
+                    t2.n_recovered = t.n_recovered
+                    trains[i_t] = t2
+        logger.info("recover_slots: %d marks recovered/re-assigned at predicted lattice slots (%s)", len(added),
+                    ", ".join(f"{t.side} row{t.row} +{t.n_recovered}" for t in trains if t.n_recovered))
+    # ONE scan-angle train per rail (dshean 2026-09-19, F054: "incorrectly labeling pink x along another set
+    # above the actual timing marks" -- label-glyph debris fitted a 3/11 "sparse" row): the fullest keeps
+    # the class, the rest are "other"
+    for cls_ in ("sparse", "mid"):
+        for side in sides:
+            same = sorted([t for t in trains if t.side == side and t.label == cls_], key=lambda t: -t.n_inliers)
+            for t in same[1:]:
+                t.label = "other"
+    # the scan-angle class is per MISSION (5 deg "sparse" <= 1213, 1 deg "mid" >= 1214; fleet 2026-08-30): the other
+    # class on this mission is debris (F054 bottom: a 16/81 "mid" on a 1205 frame), never a second lattice
+    if scan_class is not None:
+        for t in trains:
+            if t.label in ("sparse", "mid") and t.label != scan_class:
+                t.label = "other"
     # Class rules (dshean 2026-09-19): the 500-cycle time track is on ONE edge only (NRO TCS-20055/69
     # p.7), so a "dense" train may stand on one side only -- the side with the fuller one; and a dense
     # train that fills under half its slots is staircase debris, not a track.
@@ -864,11 +1027,11 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
     (out_dir / f"{entity}_timing_marks.json").write_text(json.dumps(summary, indent=2, default=float) + "\n")
     with open(out_dir / f"{entity}_timing_marks.csv", "w", newline="") as fh:
         w = csv.writer(fh)
-        w.writerow(["x", "y", "side", "row", "train", "kind", "size_mm", "score", "dy", "k", "resid", "inlier"])
+        w.writerow(["x", "y", "side", "row", "train", "kind", "size_mm", "score", "dy", "k", "resid", "inlier", "recovered"])
         for m in sorted(marks, key=lambda m: (m.side, m.row, m.x)):
             t_label = next((t.label for t in trains if t.side == m.side and t.row == m.row), "")
             w.writerow([f"{m.x:.2f}", f"{m.y:.1f}", m.side, m.row, t_label, m.kind, m.size_mm, f"{m.score:.3f}",
-                        f"{m.dy:.1f}", m.k, f"{m.resid:.2f}", int(m.inlier)])
+                        f"{m.dy:.1f}", m.k, f"{m.resid:.2f}", int(m.inlier), int(m.recovered)])
     if figure:
         try:
             plot_timing_marks(mosaic, anchors, marks, trains, info, summary, out_dir / f"{entity}_timing_marks.png")
@@ -904,8 +1067,8 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     n_ov = len(sides)
     from matplotlib.ticker import MultipleLocator
     sec = info.get("sections")
-    fig = plt.figure(figsize=(24, 4.2 * n_ov + 2.6 * n_ov + 9.5), dpi=200)
-    gs = fig.add_gridspec(2 * n_ov + 3, 3, height_ratios=[1.6] * n_ov + [1.0] * n_ov + [1.3, 1.5, 1.2],
+    fig = plt.figure(figsize=(24, 4.2 * n_ov + 2.6 * n_ov + 3.4 * n_ov + 6.5), dpi=200)
+    gs = fig.add_gridspec(3 * n_ov + 2, 3, height_ratios=[1.6] * n_ov + [1.0] * n_ov + [1.3] + [1.5] * n_ov + [1.2],
                           hspace=0.32, wspace=0.05)
     label_of = {(t.side, t.row): t.label for t in trains}
     wide_axes = []
@@ -935,12 +1098,12 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
             blk = next((b for b in ov["y0_per_block"] if b[0] <= m.x < b[0] + b[1]), None)
             y_loc = m.y - blk[2] if blk else np.nan
             c = _TRAIN_COLORS.get(label_of.get((side, m.row), ""), "#707070")
-            ax.plot(m.x, y_loc, marker="o" if m.inlier else "x", ms=4 if m.inlier else 5, mfc="none", mec=c, color=c, lw=0.8)
+            ax.plot(m.x, y_loc, marker=("D" if m.recovered else "o") if m.inlier else "x", ms=4 if m.inlier else 5, mfc="none", mec=c, color=c, lw=0.8)
         for xe, lab in ((left, "left edge"), (right, "right edge")):
             ax.axvline(xe, color="w", ls="--", lw=0.8)
         ax.axvline(cx, color="yellow", ls=":", lw=1.0)
         ax.text(0.005, 0.95, f"{side} rail band, x max-pooled {f}:1 (marks survive), rows = line {['-', '+'][side == 'bottom']}"
-                f"[{BAND_INNER_MM}, {BAND_OUTER_MM}] mm; white dashed = exposure edges, yellow = sweep center",
+                f"[{BAND_INNER_MM}, {BAND_OUTER_MM}] mm; white dashed = exposure edges, yellow = exposure MIDPOINT (not the 00 mark); diamonds = recovered at a predicted slot",
                 transform=ax.transAxes, va="top", ha="left", fontsize=8, color="w",
                 bbox=dict(facecolor="k", alpha=0.5, lw=0))
         ax.set_yticks([])
@@ -959,7 +1122,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
             if m.side != side or m.row < 0 or m.row not in row_mean:
                 continue        # unassigned hits are not marks; they stay off the y panels
             c = _TRAIN_COLORS.get(label_of.get((side, m.row), ""), "#707070")
-            ax.plot(m.x, m.dy - row_mean[m.row], marker="o" if m.inlier else "x", ms=3.5 if m.inlier else 4.5,
+            ax.plot(m.x, m.dy - row_mean[m.row], marker=("D" if m.recovered else "o") if m.inlier else "x", ms=3.5 if m.inlier else 4.5,
                     mfc="none", mec=c, color=c, lw=0)
         for r, mu in row_mean.items():
             ax.text(0.005, 0.95 - 0.1 * list(row_mean).index(r), f"row {r} ({label_of.get((side, r), '?')}): mean dy {mu:+.0f} px",
@@ -1012,46 +1175,48 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     if wide_axes:
         wide_axes[0].set_xlim(-2000, max((sec["x_start"][-1] * 1.08) if sec else 0, right + 8000))
 
-    # --- native zooms at left edge / centre / right edge, first side with an overview ---
-    # zooms follow the SPARSE (scan-angle) train where one exists: the marks nearest the left edge,
-    # the sweep center and the right edge (dshean 2026-09-19: A053's fixed-x windows showed the
-    # start-of-frame slate and an empty centre)
-    t_sp = sorted([t for t in trains if t.label == "sparse"], key=lambda t: -t.n_inliers)
-    zoom_side = t_sp[0].side if t_sp else (sides[0] if sides else "top")
-    zx = [left + 2000, cx - zoom_w // 2, right - 2000 - zoom_w]
-    if t_sp:
-        sx = np.array(sorted(m.x for m in marks if m.side == zoom_side and m.row == t_sp[0].row and m.inlier))
-        if sx.size:
-            zx = [int(sx[np.argmin(np.abs(sx - tgt))] - zoom_w // 2) for tgt in (left, cx, right)]
+    # --- native zooms, BOTH rails (dshean 2026-09-19: "should include both the top and bottom native"):
+    # left edge / sweep centre / right edge, following each rail's fullest scan-angle train ---
     band_in, band_out = info["band_px"]
     with rasterio.open(mosaic) as src:
-        for j, x0 in enumerate(zx):
-            ax = fig.add_subplot(gs[2 * n_ov + 1, j])
-            x0 = int(min(max(0, x0), src.width - zoom_w))
-            yl = float(anchors.line(zoom_side)(np.array([x0 + zoom_w / 2]))[0])
-            y0 = yl - band_out - 30 if zoom_side == "top" else yl + band_in - 30
-            y0 = int(max(0, y0)); h = int(band_out - band_in + 60)
-            h = min(h, src.height - y0)
-            if h <= 10 or x0 < 0:
-                ax.text(0.5, 0.5, f"{zoom_side} zoom {j}: window outside the raster (x0={x0}, y0={y0}, h={h})",
-                        transform=ax.transAxes, ha="center", fontsize=8, color="r"); ax.set_xticks([]); ax.set_yticks([]); continue
-            a = src.read(1, window=Window(x0, y0, zoom_w, h))
-            lo, hi = np.percentile(a, (2, 98))
-            ax.imshow(a, cmap="gray", vmin=lo, vmax=max(hi, lo + 1), aspect="equal",
-                      extent=[x0, x0 + zoom_w, y0 + h, y0], interpolation="nearest")
-            for m in marks:
-                if m.side == zoom_side and x0 <= m.x < x0 + zoom_w:
-                    c = _TRAIN_COLORS.get(label_of.get((zoom_side, m.row), ""), "#707070")
-                    ax.add_patch(plt.Circle((m.x, m.y), 45, fill=False, ec=c, lw=1.0, ls="-" if m.inlier else ":"))
-                    ax.text(m.x, m.y - 50, f"{m.kind[0]}{m.score:.2f} k{m.k}", color=c, fontsize=6, ha="center")
-            ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['nearest left edge', 'nearest sweep center', 'nearest right edge'][j]}{' sparse mark' if t_sp else ''})",
-                    transform=ax.transAxes, va="top", fontsize=7, color="w", bbox=dict(facecolor="k", alpha=0.5, lw=0))
-            ax.tick_params(labelsize=6)
-            if j == 1:
-                ax.axvline(cx, color="yellow", ls=":", lw=1)
+        for i, zoom_side in enumerate(sides):
+            t_sp = sorted([t for t in trains if t.side == zoom_side and t.label in ("sparse", "mid")], key=lambda t: -t.n_inliers)
+            zx = [left + 2000, cx - zoom_w // 2, right - 2000 - zoom_w]
+            if t_sp:
+                sx = np.array(sorted(m.x for m in marks if m.side == zoom_side and m.row == t_sp[0].row and m.inlier))
+                if sx.size:
+                    zx = [int(sx[np.argmin(np.abs(sx - tgt))] - zoom_w // 2) for tgt in (left, cx, right)]
+            for j, x0 in enumerate(zx):
+                ax = fig.add_subplot(gs[2 * n_ov + 1 + i, j])
+                x0 = int(min(max(0, x0), src.width - zoom_w))
+                yl = float(anchors.line(zoom_side)(np.array([x0 + zoom_w / 2]))[0])
+                y0 = yl - band_out - 30 if zoom_side == "top" else yl + band_in - 30
+                y0 = int(max(0, y0)); h = int(band_out - band_in + 60)
+                h = min(h, src.height - y0)
+                if h <= 10 or x0 < 0:
+                    ax.text(0.5, 0.5, f"{zoom_side} zoom {j}: window outside the raster (x0={x0}, y0={y0}, h={h})",
+                            transform=ax.transAxes, ha="center", fontsize=8, color="r"); ax.set_xticks([]); ax.set_yticks([]); continue
+                a = src.read(1, window=Window(x0, y0, zoom_w, h))
+                # stretch on the NON-ZERO pixels: a window that is mostly nodata gave lo = hi = 0 and rendered
+                # the film base as a white box (dshean 2026-09-19, A052 "marks appearing in white box")
+                nz = a[a > 0]
+                lo, hi = (np.percentile(nz, (1, 99.7)) if nz.size > 100 else (0.0, 1.0))
+                ax.imshow(a, cmap="gray", vmin=lo, vmax=max(hi, lo + 20), aspect="equal",
+                          extent=[x0, x0 + zoom_w, y0 + h, y0], interpolation="nearest")
+                for m in marks:
+                    if m.side == zoom_side and x0 <= m.x < x0 + zoom_w:
+                        c = _TRAIN_COLORS.get(label_of.get((zoom_side, m.row), ""), "#707070")
+                        ax.add_patch(plt.Circle((m.x, m.y), 45, fill=False, ec=c, lw=1.4 if m.recovered else 1.0,
+                                                ls="--" if m.recovered else ("-" if m.inlier else ":")))
+                        ax.text(m.x, m.y - 50, f"{'r' if m.recovered else ''}{m.kind[0]}{m.score:.2f} k{m.k}", color=c, fontsize=6, ha="center")
+                ax.text(0.01, 0.97, f"{zoom_side} native 1:1 x {x0}..{x0 + zoom_w} ({['nearest left edge', 'nearest sweep center', 'nearest right edge'][j]}{' scan-angle mark' if t_sp else ''})",
+                        transform=ax.transAxes, va="top", fontsize=7, color="w", bbox=dict(facecolor="k", alpha=0.5, lw=0))
+                ax.tick_params(labelsize=6)
+                if j == 1:
+                    ax.axvline(cx, color="yellow", ls=":", lw=1)
 
     # --- spacing histogram + mean patch per train ---
-    ax = fig.add_subplot(gs[2 * n_ov + 2, 0])
+    ax = fig.add_subplot(gs[3 * n_ov + 1, 0])
     for t in trains:
         xs = np.sort([m.x for m in marks if m.side == t.side and m.row == t.row and m.inlier])
         if len(xs) > 2:
@@ -1061,7 +1226,7 @@ def plot_timing_marks(mosaic: Path, anchors: RailAnchors, marks: list[Mark], tra
     ax.set_xlabel("consecutive spacing / fitted period", fontsize=8); ax.set_ylabel("count", fontsize=8)
     ax.tick_params(labelsize=7); ax.legend(fontsize=7)
     for j, t in enumerate(trains[:2]):
-        ax = fig.add_subplot(gs[2 * n_ov + 2, 1 + j])
+        ax = fig.add_subplot(gs[3 * n_ov + 1, 1 + j])
         ms = [m for m in marks if m.side == t.side and m.row == t.row and m.inlier]
         patch = _mean_patch(mosaic, ms[:40], 120)
         if patch is not None:
@@ -1156,11 +1321,13 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"mosaic not found: {raster}")
     raster = Path(raster)
     entity = a.entity or raster.stem
-    tier_px = expected_kind = None
+    tier_px = expected_kind = scan_class = None
     try:
         from hipp.kh9pc.kh9_image_spec import KH9ImageSpec
         tier_px = KH9ImageSpec.expected_size_from_file(raster)[0]
-        expected_kind = {"disk": "disk", "wagon_wheel": "wheel"}[KH9ImageSpec.fiducial_type_from_mission(KH9ImageSpec.mission_from_filepath(raster))]
+        _mission = KH9ImageSpec.mission_from_filepath(raster)
+        expected_kind = {"disk": "disk", "wagon_wheel": "wheel"}[KH9ImageSpec.fiducial_type_from_mission(_mission)]
+        scan_class = "sparse" if _mission <= 1213 else "mid"
     except Exception as e:  # non-KH9 names (synthetic tests) are fine
         logger.info("no KH9ImageSpec tier/kind for %s (%s)", raster.name, e)
     x_range = _parse_pair(a.x_range, int) if a.x_range else None
@@ -1168,7 +1335,7 @@ def main(argv: list[str] | None = None) -> int:
                 entity, anchors.source, anchors.edges, anchors.pitch_um, tier_px, expected_kind, x_range)
     summary = analyse(raster, anchors, a.out, entity, tag=a.tag, sides=tuple(a.sides.split(",")),
                       kinds=tuple(a.kinds.split(",")), score_min=a.score_min, x_range=x_range, block_w=a.block_w,
-                      figure=not a.no_figure, tier_px=tier_px, expected_kind=expected_kind)
+                      figure=not a.no_figure, tier_px=tier_px, expected_kind=expected_kind, scan_class=scan_class)
     n_tr = len(summary["trains"])
     print(f"TIMING_MARKS_{'OK' if n_tr else 'NONE'}: {entity} marks={summary['n_marks']} trains={n_tr} "
           f"seconds={summary['seconds']} out={a.out}")

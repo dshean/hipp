@@ -474,7 +474,11 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
             R = diam / 2.0
             rr = np.hypot(xx - cx, yy - cy)
             ann = a[(rr >= 1.4 * R) & (rr <= 2.6 * R)]
-            if ann.size == 0 or ann.max() > bg + iso_frac * (pk - bg):
+            # 2026-09-20 (ops323 F026: 1702 hits -> 0 dots): on a bright GRAINY film base (bg ~55-80 DN) the annulus
+            # MAX is a grain spike (110-170 DN) over the 35 % threshold (~107) at every mark; the 98th percentile
+            # (73-107) keeps the 9 disks of a test window and still trips on a glyph or a neighbour, which covers
+            # far more than 2 % of the annulus
+            if ann.size == 0 or float(np.percentile(ann, 98)) > bg + iso_frac * (pk - bg):
                 continue          # something bright next to it: a glyph, a box, a neighbour
             m.x, m.y = x0 + cx, y0 + cy
             m.size_mm = round(diam / px_mm, 3)

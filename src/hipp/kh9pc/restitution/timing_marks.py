@@ -438,10 +438,18 @@ def refine_marks(mosaic: Path, marks: list[Mark], pitch_um: tuple[float, float],
             lbl = np.zeros_like(bright, dtype=np.uint8)
             n, cc = cv2.connectedComponents(bright.astype(np.uint8), lbl, connectivity=8)
             cid = cc[h, h]
-            if cid == 0:
+            if cid == 0 or m.kind == "wheel":
                 # a WAGON WHEEL (missions 1214-1219: open ring + cross, dark hub -- cg A006 measured
                 # ~50 px outer diameter, ~6 px stroke, hub 24-50 DN on a 250 peak) has no bright
-                # pixel at the template centre; take the component nearest the centre instead
+                # pixel at the template centre; take the component nearest the centre instead.
+                # 2026-09-20 (cg A007, 4 of ~81 top wheels kept; A006 25 and the lattice recovered the
+                # rest): at 50 % of the peak the RING fragments into arcs (ring ~160 DN against 240 on
+                # the cross arms), the arc's centroid sits off the hub, its box is not round and the
+                # isolation annulus lands on the far side of the ring. Threshold the wheel at 25 % so
+                # the ring connects, then the centroid, box and annulus are the wheel's own.
+                bright = a > bg + 0.25 * (pk - bg)
+                lbl = np.zeros_like(bright, dtype=np.uint8)
+                n, cc = cv2.connectedComponents(bright.astype(np.uint8), lbl, connectivity=8)
                 near = cc[h - 12:h + 13, h - 12:h + 13]
                 ids, cnt = np.unique(near[near > 0], return_counts=True)
                 if ids.size == 0:

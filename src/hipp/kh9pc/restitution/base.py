@@ -175,7 +175,8 @@ class RestitutionStrategy(FittingClass):
         }
         return ext, side
 
-    def transform_extended(self, output_path: str | Path, rail_px: int = 1600) -> dict:
+    def transform_extended(self, output_path: str | Path, rail_px: int = 1600,
+                           source_raster: "str | Path | None" = None) -> dict:
         """Write the SAME warp over a window extended by ``rail_px`` rows above and below the
         delivered canvas, so the film margins -- scan-angle marks, time track, titling data --
         are rectified too. Split of "restitution" and "crop" (dshean 2026-09-19): the crop is
@@ -188,7 +189,12 @@ class RestitutionStrategy(FittingClass):
         import json as _json
         ext, side = self.extended_window(rail_px)
         from hipp.image import remap_tif_blockwise
-        remap_tif_blockwise(ext.raster_filepath, output_path, ext.inverse_remap, ext.output_size,
+        # source_raster: the SAME frame from another merge (merged_v2_nocut/ instead of merged/, whose film
+        # margins are zeroed by the old border cut -- dshean 2026-09-19: "encroaching black nodata" truncated the
+        # labels on every block but nepal). The geometry is identical; only the margin pixels differ.
+        src = str(source_raster) if source_raster else str(ext.raster_filepath)
+        side["source_raster"] = src
+        remap_tif_blockwise(src, output_path, ext.inverse_remap, ext.output_size,
                             block_size=2**13, lowres_step=100)
         from pathlib import Path as _P
         _P(str(output_path) + ".json").write_text(_json.dumps(side, indent=2) + "\n")

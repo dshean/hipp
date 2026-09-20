@@ -688,7 +688,12 @@ def _period_candidates(d: NDArray, pitch_x: float) -> list[float]:
 def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_iter: int = 8,
               sections=None) -> Train | None:
     ms = sorted([m for m in marks if m.side == side and m.row == row], key=lambda m: m.x)
-    if len(ms) < 6:      # 2026-09-19: 3 marks fit any period; a rail row has >= 6 (sparse: 18 slots per 90 deg)
+    # 2026-09-19: 3 marks fit any period; a rail row has >= 6 (sparse: 18 slots per 90 deg).
+    # 2026-09-20 (ops196 A001/F001): a FIRST frame of a 30-deg block starts ~7 deg before the sector and the marks are
+    # printed only at the sector angles, so it carries 5 scan-angle marks per rail (00..-20 / -30..-10), all detected,
+    # none fitted. A 5-mark row is accepted only when its period is the scan-angle class (mid/sparse, +-20 %) and
+    # EVERY gap is on that lattice (full support): four 19 k-px gaps within 60 px are not a chance fit of debris.
+    if len(ms) < 5:
         return None
     xs = np.array([m.x for m in ms])
     sc = np.array([m.score for m in ms])
@@ -721,6 +726,11 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
         if best is None or key > best[0]:
             best = (key, P)
     P = best[1]
+    if len(ms) < 6:
+        mm_ = P * pitch_x / 1000.0
+        scan_cls = any(abs(mm_ - PERIOD_CLASSES_MM[c]) <= PERIOD_CLASS_TOL * PERIOD_CLASSES_MM[c] for c in ("mid", "sparse"))
+        if not (scan_cls and best[0][0] == len(d)):
+            return None
     ref = int(np.argmax(sc))
     x0 = xs[ref]
 
@@ -798,7 +808,7 @@ def fit_train(marks: list[Mark], side: str, row: int, anchors: RailAnchors, max_
     k = np.round((xs - off - x0) / P).astype(int)
     r = xs - off - (x0 + P * k)
     curve_coef, curve_pp = None, 0.0
-    if inl.sum() >= 6:
+    if inl.sum() >= 5:       # 5 since 2026-09-20 (a first-frame 5-mark train needs the curve for recover_slots)
         P_mm_c = P * pitch_x / 1000.0
         floor_c = 60.0 if abs(P_mm_c - PERIOD_CLASSES_MM["dense"]) <= PERIOD_CLASS_TOL * PERIOD_CLASSES_MM["dense"] else 40.0
         kk = k.astype(float)
@@ -934,8 +944,129 @@ def recover_slots(mosaic: Path, marks: list[Mark], trains: list[Train], anchors:
             for k in range(t.k_max + 1, t.k_max + 1 + max_extend):
                 if not _try(k):
                     break
-            t.n_recovered = len(added) - n0
+            t.n_recovered += len(added) - n0      # += : a recover_missing_rail train already counts its own marks
     return added
+
+
+def recover_missing_rail(mosaic: Path, marks: list[Mark], trains: list[Train], anchors: RailAnchors,
+                         rows_by_side: dict[str, dict[int, float]], row_curves: dict[tuple[str, int], NDArray],
+                         sides: tuple[str, ...] = ("top", "bottom"), sections=None, score_min: float = 0.30,
+                         min_contrast: float = 15.0, band_mm: tuple[float, float] = (BAND_INNER_MM, BAND_OUTER_MM),
+                         min_marks: int = 6, min_frac: float = 0.25, row_tol_px: float = 40.0) -> list[Train]:
+    """Cross-rail recovery of a scan-angle train the blind pass missed on ONE rail.
+
+    2026-09-20 (cg A006/A007/A008): the bottom-rail wagon wheels are printed at every slot but only 30-45 DN over a
+    17 DN base (the top ones ~240), so none of them passed the blind 0.45 template score, the rail got no row, no
+    train, and recover_slots (which needs a train on that rail) had nothing to extend; the frame was placed on the
+    top rail alone with sigma 1 px and no rail-difference check. When one rail carries the mission's scan-angle
+    train and the other has none, the other rail's marks are PREDICTED: at every slot x(k) of the fitted curve the
+    whole search band (BAND_INNER..BAND_OUTER mm outward from that rail's line, +-xt in x for the ~-65..-90 px
+    per-camera rail offset) is matched with the disk + wheel bank at the recovery thresholds; the hits must form
+    ONE row (mode of dy within row_tol_px, >= min_marks and >= min_frac of the slots) clear of the rail's existing
+    rows (the time track sits 160 px away on cg). The row is added, its train fitted by fit_train like any other,
+    and every mark of it is tagged recovered (the CSV / figure show it). Returns the new trains."""
+    import rasterio
+    from rasterio.windows import Window
+    new: list[Train] = []
+    px = lambda mm: mm * 1000.0 / anchors.pitch_um[0]
+    px_y = 1000.0 / anchors.pitch_um[1]
+    inner, outer = band_mm[0] * px_y, band_mm[1] * px_y
+    bank = template_bank(anchors.pitch_um[0], ("disk", "wheel")) + \
+        [Template("disk", d, make_disk_template(px(d))) for d in (0.12, 0.16, 0.22)]
+    nms_px = int(0.6 * min(t.image.shape[0] for t in bank))
+    for cls_ in ("sparse", "mid"):
+        have = [t for t in trains if t.label == cls_ and t.x_curve_coeffs]
+        if not have:
+            continue
+        ref = max(have, key=lambda t: t.n_inliers)
+        for side in sides:
+            if side == ref.side:
+                continue
+            same = [t for t in trains if t.side == side and t.label == cls_]
+            if any(t.n_inliers >= 0.5 * ref.n_inliers for t in same):
+                continue
+            # a WEAK same-class train (cg A007: 5 blind-pass wheels of 90 became a 5/52 "mid" row once 5-mark rows
+            # fit) is replaced: its marks stay and are re-found through the dedupe below, its row id is retired
+            weak_rows = {t.row for t in same}
+            for t in same:
+                trains.remove(t)
+            line = anchors.line(side)
+            sgn = -1.0 if side == "top" else 1.0
+            xt = min(400.0, max(250.0, 0.02 * ref.period_px + 100.0))
+            existing = [m for m in marks if m.side == side]
+            cands: list[Mark] = []
+            with rasterio.open(mosaic) as src:
+                W, H = src.width, src.height
+                for k in range(ref.k_min - 2, ref.k_max + 3):
+                    xp = float(np.polyval(ref.x_curve_coeffs, k))
+                    yl = float(line(np.array([xp]))[0])
+                    y_lo, y_hi = sorted((yl + sgn * inner, yl + sgn * outer))
+                    x0, y0 = int(xp - xt), int(y_lo) - 40
+                    w, h = int(2 * xt), int(y_hi - y_lo) + 80
+                    if x0 < 0 or y0 < 0 or x0 + w > W or y0 + h > H:
+                        continue
+                    block = src.read(1, window=Window(x0, y0, w, h))
+                    if not block.any():
+                        continue
+                    if block.dtype != np.uint8:
+                        block = cv2.normalize(block.astype(np.float32), None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+                    for xl, yl_, sc, tid in _match_block(block, bank, score_min, nms_px):
+                        cands.append(Mark(x0 + xl, y0 + yl_, side, sc, bank[tid].kind, bank[tid].size_mm,
+                                          y0 + yl_ - yl, recovered=True))
+            n_hits = len(cands)
+            cands = refine_marks(mosaic, cands, anchors.pitch_um, min_mm=0.10, min_contrast=min_contrast)
+            # a hit on a mark the blind pass already found is that mark (no duplicate); a weak-row mark counts too
+            dedup: list[Mark] = []
+            for m in cands:
+                m.dy = m.y - float(line(np.array([m.x]))[0])
+                near = [e for e in existing if abs(e.x - m.x) <= 30 and abs(e.y - m.y) <= 30]
+                e = min(near, key=lambda e: math.hypot(e.x - m.x, e.y - m.y)) if near else m
+                if all(e is not d for d in dedup):
+                    dedup.append(e)
+            cands = dedup
+            # clear of the rail's existing rows (the time track / titling debris rows already clustered)
+            taken = [dy0 for rid0, dy0 in rows_by_side.get(side, {}).items() if rid0 not in weak_rows]
+            cands = [m for m in cands if all(abs(m.dy - dy0) > 1.5 * row_tol_px for dy0 in taken)]
+            n_slots = ref.k_max - ref.k_min + 1
+            if len(cands) < min_marks:
+                logger.info("recover_missing_rail: %s %s: %d hits -> %d isolated marks clear of existing rows -- no row",
+                            side, cls_, n_hits, len(cands))
+                continue
+            dys = np.array([m.dy for m in cands])
+            hist, edges = np.histogram(dys, bins=np.arange(dys.min() - 10, dys.max() + 30, 20))
+            i = int(np.argmax(hist)); mode = 0.5 * (edges[i] + edges[i + 1])
+            sel = [m for m in cands if abs(m.dy - mode) <= row_tol_px]
+            mode = float(np.median([m.dy for m in sel]))
+            sel = [m for m in cands if abs(m.dy - mode) <= row_tol_px]
+            if len(sel) < min_marks or len(sel) < min_frac * n_slots:
+                logger.info("recover_missing_rail: %s %s: %d hits -> %d marks, %d in the densest row (dy %+.0f) of %d slots -- no row",
+                            side, cls_, n_hits, len(cands), len(sel), mode, n_slots)
+                continue
+            rid = (max(rows_by_side.get(side, {}).keys()) + 1) if rows_by_side.get(side) else 0
+            for w_rid in weak_rows:                      # retire the weak row: its marks not re-found go unassigned
+                rows_by_side.get(side, {}).pop(w_rid, None); row_curves.pop((side, w_rid), None)
+                for m in existing:
+                    if m.row == w_rid:
+                        m.row = -1
+            for m in sel:
+                m.row = rid
+                if all(m is not e for e in existing):
+                    marks.append(m)
+                else:
+                    m.recovered = True
+            rows_by_side.setdefault(side, {})[rid] = mode
+            xs_ = np.array([m.x for m in sel]); ys_ = np.array([m.y for m in sel])
+            row_curves[(side, rid)] = _fit_row_curve(xs_, ys_)
+            t = fit_train(marks, side, rid, anchors, sections=sections)
+            if t is None:
+                logger.info("recover_missing_rail: %s %s: row of %d marks (dy %+.0f) did not fit a train", side, cls_, len(sel), mode)
+                continue
+            t.n_recovered = len(sel)
+            trains.append(t); new.append(t)
+            logger.info("recover_missing_rail: %s %s train from the %s lattice: %d hits -> %d marks in row%d (dy %+.0f px), "
+                        "P=%.2f px n=%d/%d rms=%.2f px", side, cls_, ref.side, n_hits, len(sel), rid, mode, t.period_px,
+                        t.n_inliers, t.n_slots, t.resid_rms_px)
+    return new
 
 
 # ----------------------------------------------------------------------------
@@ -970,6 +1101,8 @@ def analyse(mosaic: Path, anchors: RailAnchors, out_dir: Path, entity: str, tag:
             t = fit_train(marks, side, row, anchors, sections=sections)
             if t is not None:
                 trains.append(t)
+    # a scan-angle train on one rail only: predict the other rail's marks from it (2026-09-20, cg A006-A008)
+    recover_missing_rail(mosaic, marks, trains, anchors, rows_by_side, row_curves, sides=sides, sections=sections)
     # lattice-guided recovery of faint / end marks on the scan-angle trains, then refit those trains
     added = recover_slots(mosaic, marks, trains, anchors, row_curves)
     if added:

@@ -375,6 +375,26 @@ def write_mosaic(
             # interior cut budget from the measured overlaps (see _section_border_cuts)
             ovl_prev = (widths[i - 1] - alignments[i].tx) if i > 0 else None
             ovl_next = (widths[i] - alignments[i + 1].tx) if i + 1 < len(alignments) else None
+            if bbox is not None:
+                # 2026-09-19 (nepal A055): saturated snow reaching a section's seam edges passed the bright-bed vintage
+                # test and the column-median content test then cropped 35 k px of real content out of the frame.
+                # A seam-side crop deeper than the neighbour overlap is a content loss on ANY vintage: clamp it to the
+                # same cap the border cuts use, and say what was cut.
+                x0, y0, x1, y1 = bbox
+                w_part = int(widths[i])
+                cap_prev = None if ovl_prev is None else max(64, 0.35 * ovl_prev)
+                cap_next = None if ovl_next is None else max(64, 0.35 * ovl_next)
+                x0c = x0 if cap_prev is None else min(x0, cap_prev)
+                x1c = x1 if cap_next is None else max(x1, w_part - cap_next)
+                if (x0c, x1c) != (x0, x1):
+                    logger.warning("%s: part-content bbox seam-side crop CLAMPED: left %d -> %d px, right %d -> %d px "
+                                   "(overlap caps %s / %s) -- content reached the seam edge (saturated?)",
+                                   alignment.image_path.name, int(x0), int(x0c), int(w_part - x1), int(w_part - x1c),
+                                   None if cap_prev is None else int(cap_prev), None if cap_next is None else int(cap_next))
+                bbox = (x0c, y0, x1c, y1)
+                logger.info("%s: part-content bbox cols [%d, %d) rows [%d, %d) of %d px (cut left %d right %d top %d bottom %d)",
+                            alignment.image_path.name, int(x0c), int(x1c), int(y0), int(y1), w_part,
+                            int(x0c), int(w_part - x1c), int(y0), int(y1))
             cuts = _section_border_cuts(alignment.image_path, first=(i == 0), last=(i == len(alignments) - 1),
                                         left_cut_px=None if ovl_prev is None else max(64, 0.35 * ovl_prev),
                                         right_cut_px=None if ovl_next is None else max(64, 0.35 * ovl_next))

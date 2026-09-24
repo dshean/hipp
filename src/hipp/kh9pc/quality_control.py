@@ -1035,6 +1035,11 @@ def get_figures(
         yield "vertical_edges", plot_vertical_edges(fitting_class)
         yield "vertical_ruptures", plot_vertical_ruptures(fitting_class)
         return
+    # mark placement first: MarkStrategy IS a CollimationStrategy, and the branches
+    # below return, so the ladder panel has to be yielded before them
+    from hipp.kh9pc.restitution.mark_strategy import _MarkPlacementMixin, plot_mark_ladder
+    if isinstance(fitting_class, _MarkPlacementMixin):
+        yield "mark_ladder", _safe_fig(plot_mark_ladder, fitting_class)
     if isinstance(fitting_class, (FlatStrategy, PolyStrategy, FiducialStrategy)) and not isinstance(fitting_class, CollimationStrategy):
         yield "sheet", _safe_fig(plot_restitution_sheet, fitting_class)   # audit M-5: every strategy gets the one-page sheet
     if isinstance(fitting_class, FlatStrategy):
